@@ -129,6 +129,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hub-cli"
+version = "0.0.0"
+dependencies = [
+ "hub-core",
+ "proptest",
+ "sha2",
+]
+
+[[package]]
 name = "hub-core"
 version = "0.0.0"
 dependencies = [
