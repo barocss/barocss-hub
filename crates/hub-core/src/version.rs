@@ -4,7 +4,7 @@
 //! that needs deps (closure checks, frontier, down-closure) takes the op
 //! store (`OpId -> Op`) explicitly: a version is meaningful only relative to a
 //! store that can resolve its ids (§3.1). Checkpoints / user commits (§3.4)
-//! are out of scope.
+//! live in `checkpoint`.
 //!
 //! Identity is the frontier (§3.1). The version vector is a derived summary;
 //! it determines the version only when the store satisfies §2.6 #7
