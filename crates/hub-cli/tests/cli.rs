@@ -364,6 +364,7 @@ fn status_renders_content_conflicts() {
         "{s}"
     );
     assert!(s.contains("overwritten by"), "{s}");
-    assert!(s.contains("edit-deleted: content edit"), "{s}");
-    assert!(s.contains("kept on trashed node"), "{s}");
+    assert!(s.contains("edit-revived: content edit"), "{s}");
+    assert!(s.contains("despite delete"), "{s}");
+    assert!(s.contains(" revived "), "{s}");
 }

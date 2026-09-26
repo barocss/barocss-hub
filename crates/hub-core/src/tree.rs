@@ -201,10 +201,11 @@ pub enum Conflict {
         winner_blob: BlobId,
         loser_blob: BlobId,
     },
-    /// Informational (Issue #18): `edit` set content of `node`, but `node` is
-    /// not live because the concurrent `delete` trashed it or an ancestor.
-    /// The content is kept on the trashed record; `edit` is not a loser.
-    EditDeleted {
+    /// Informational (D-014, Issue #20): `edit` set content of `node` while
+    /// `delete` (not causally after `edit`) had trashed `node` or an ancestor;
+    /// the edit revived the deleted node to its pre-delete parent. `delete`
+    /// is not a loser; the conflict keeps its intent visible.
+    EditRevived {
         node: NodeId,
         edit: OpId,
         delete: OpId,
@@ -500,8 +501,58 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
             }
         }
     }
-    // Revived (Issue #5 trigger): D ∥ M, some d strict ancestor of x just
-    // before min(D, M), x live finally, and d's winning op is D.
+    // Content (§2.3, Issue #18): winner = greatest Applied SetContent of a
+    // node; every other one without a causally later SetContent of the same
+    // node is a loser with exactly one `content` conflict.
+    let mut sets: BTreeMap<NodeId, Vec<(OpId, BlobId)>> = BTreeMap::new();
+    for (id, op) in &ops {
+        if let (Payload::SetContent { node, blob }, Outcome::Applied) = (&op.payload, &outcomes[id])
+        {
+            sets.entry(*node).or_default().push((*id, *blob));
+        }
+    }
+    for (n, es) in &sets {
+        let (winner, winner_blob) = *es.last().unwrap();
+        for &(e, loser_blob) in &es[..es.len() - 1] {
+            if !es.iter().any(|&(e2, _)| past[&e2].contains(&e)) {
+                conflicts.insert(Conflict::Content {
+                    node: *n,
+                    winner,
+                    loser: e,
+                    winner_blob,
+                    loser_blob,
+                });
+            }
+        }
+    }
+    // Edit revives (D-014, Issue #20): post-fold, order-independent.
+    let mut edits: Vec<(OpId, NodeId)> = sets
+        .iter()
+        .flat_map(|(n, es)| es.iter().map(move |&(e, _)| (e, *n)))
+        .collect();
+    edits.sort();
+    let mut pre = BTreeMap::new();
+    for (id, st) in &before {
+        if let (Payload::Delete { node }, Outcome::Applied) = (&ops[id].payload, &outcomes[id]) {
+            let ms = &applied[node];
+            let prev = ms
+                .iter()
+                .position(|m| m == id)
+                .and_then(|i| i.checked_sub(1));
+            let prev = prev.map(|i| ms[i]);
+            let parent = st[node].parent.expect("non-reserved node has parent");
+            pre.insert(*id, pre_delete_parent(parent, prev, &pre));
+        }
+    }
+    for (x, e, d) in revive_by_edits(&mut w.state, &ops, &w.setter, &pre, &past, &edits) {
+        conflicts.insert(Conflict::EditRevived {
+            node: x,
+            edit: e,
+            delete: d,
+        });
+    }
+    // Revived (D-001) liveness condition (f) is evaluated on the final
+    // (post-revive) state.
     for (&did, dop) in &ops {
         let Payload::Delete { node: d } = dop.payload else {
             continue;
@@ -527,62 +578,86 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
         }
     }
 
-    // Content (§2.3, Issue #18): winner = greatest Applied SetContent of a
-    // node; every other one without a causally later SetContent of the same
-    // node is a loser with exactly one `content` conflict.
-    let mut sets: BTreeMap<NodeId, Vec<(OpId, BlobId)>> = BTreeMap::new();
-    for (id, op) in &ops {
-        if let (Payload::SetContent { node, blob }, Outcome::Applied) = (&op.payload, &outcomes[id])
-        {
-            sets.entry(*node).or_default().push((*id, *blob));
-        }
-    }
-    for (n, es) in &sets {
-        let (winner, winner_blob) = *es.last().unwrap();
-        for &(e, loser_blob) in &es[..es.len() - 1] {
-            if !es.iter().any(|&(e2, _)| past[&e2].contains(&e)) {
-                conflicts.insert(Conflict::Content {
-                    node: *n,
-                    winner,
-                    loser: e,
-                    winner_blob,
-                    loser_blob,
-                });
-            }
-        }
-    }
-    // Edit vs delete (Issue #18): an Applied SetContent E of x, x not live
-    // finally, and an Applied Delete D of d with D ∥ E, D the winner for d,
-    // d ancestor-or-self of x in the final state.
-    for es in sets.values() {
-        for &(eid, _) in es {
-            let x = ops[&eid].content_node().unwrap();
-            if is_live(&w.state, x) {
-                continue;
-            }
-            for (&did, dop) in &ops {
-                let Payload::Delete { node: d } = dop.payload else {
-                    continue;
-                };
-                if outcomes[&did] == Outcome::Applied
-                    && applied[&d].last() == Some(&did)
-                    && concurrent(did, eid)
-                    && is_ancestor_or_self(&w.state, d, x)
-                {
-                    conflicts.insert(Conflict::EditDeleted {
-                        node: x,
-                        edit: eid,
-                        delete: did,
-                    });
-                }
-            }
-        }
-    }
-
     Evaluation {
         state: w.state,
         conflicts,
         outcomes,
+    }
+}
+
+/// Pre-delete parent of a Delete whose node had `parent` just before it and
+/// whose previous parent-setting op was `prev`: a re-delete of an already
+/// deleted node (parent TRASH, `prev` a Delete) inherits `prev`'s pre-delete
+/// parent, so a run of deletes restores to where the node was before the
+/// first one. Deletes must be visited in ascending `<` order.
+fn pre_delete_parent(parent: NodeId, prev: Option<OpId>, pre: &BTreeMap<OpId, NodeId>) -> NodeId {
+    match prev.and_then(|p| pre.get(&p)) {
+        Some(&pp) if parent == TRASH => pp,
+        _ => parent,
+    }
+}
+
+/// D-014 edit revive (Issue #20), shared by [`evaluate`] and [`Replica`].
+///
+/// Input: the sorted-fold `state`, `setter` (op that last set each node's
+/// parent), `pre` (pre-delete parent per Applied Delete), causal `past`, and
+/// the Applied SetContent ops `edits` as `(edit, node)`. For each edit `E` of
+/// `x` with `x` not live: walk `x`'s chain to the node `d` whose parent is
+/// TRASH; if `d`'s winning op is a `Delete` `D` with `E ∉ deps*(D)` (the
+/// delete did not see the edit: concurrent, or `E` causally after `D`),
+/// restore `d` under its pre-delete parent (name is unchanged by Delete) and
+/// record `(x, E, D)`. Repeat until no change (a restored parent may itself
+/// be deleted). A restore that would form a cycle, or whose pre-delete
+/// parent is TRASH itself, is skipped. Deterministic
+/// given the op set.
+fn revive_by_edits(
+    state: &mut State,
+    ops: &BTreeMap<OpId, Op>,
+    setter: &BTreeMap<NodeId, OpId>,
+    pre: &BTreeMap<OpId, NodeId>,
+    past: &BTreeMap<OpId, BTreeSet<OpId>>,
+    edits: &[(OpId, NodeId)],
+) -> BTreeSet<(NodeId, OpId, OpId)> {
+    let mut out = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for &(e, x) in edits {
+            if is_live(state, x) {
+                continue;
+            }
+            let mut top = x;
+            let mut steps = 0;
+            while let Some(p) = state[&top].parent {
+                if p == TRASH || steps > state.len() {
+                    break;
+                }
+                top = p;
+                steps += 1;
+            }
+            if state[&top].parent != Some(TRASH) {
+                continue;
+            }
+            let Some(&d) = setter.get(&top) else { continue };
+            if !matches!(
+                ops.get(&d).map(|o| &o.payload),
+                Some(Payload::Delete { .. })
+            ) || past[&d].contains(&e)
+            {
+                continue;
+            }
+            let Some(&p) = pre.get(&d) else { continue };
+            // Pre-delete parent TRASH (node was already directly in TRASH,
+            // e.g. created or moved there): nothing to restore.
+            if p == TRASH || is_ancestor_or_self(state, top, p) {
+                continue;
+            }
+            state.get_mut(&top).unwrap().parent = Some(p);
+            out.insert((x, e, d));
+            changed = true;
+        }
+        if !changed {
+            return out;
+        }
     }
 }
 
@@ -595,6 +670,9 @@ pub struct Replica {
     log: Vec<(Op, Undo)>,
     known: BTreeSet<OpId>,
     pending: BTreeMap<OpId, Op>,
+    /// Fold state plus the D-014 edit revive (what [`Replica::state`]
+    /// shows); `None` when the revive changes nothing (the common case).
+    view: Option<State>,
 }
 
 impl Default for Replica {
@@ -610,11 +688,47 @@ impl Replica {
             log: Vec::new(),
             known: BTreeSet::new(),
             pending: BTreeMap::new(),
+            view: None,
         }
     }
 
     pub fn state(&self) -> &State {
-        &self.work.state
+        self.view.as_ref().unwrap_or(&self.work.state)
+    }
+
+    /// Recompute the view: the fold state with the D-014 revive applied
+    /// (same function as [`evaluate`], inputs taken from the undo log).
+    fn refresh_view(&mut self) {
+        self.view = None;
+        // Fast path: no Applied SetContent of a non-live file, nothing to do.
+        let st = &self.work.state;
+        let needed = self.log.iter().any(|(o, u)| {
+            matches!((&o.payload, u), (Payload::SetContent { node, .. }, Undo::Content { .. }) if !is_live(st, *node))
+        });
+        if !needed {
+            return;
+        }
+        let ops: BTreeMap<OpId, Op> = self.log.iter().map(|(o, _)| (o.id, o.clone())).collect();
+        let past = causal_past(&ops);
+        let mut pre = BTreeMap::new();
+        let mut edits = Vec::new();
+        for (o, u) in &self.log {
+            match (&o.payload, u) {
+                (Payload::Delete { .. }, Undo::Restore { parent, setter, .. }) => {
+                    let parent = parent.expect("non-reserved node has parent");
+                    let p = pre_delete_parent(parent, Some(*setter), &pre);
+                    pre.insert(o.id, p);
+                }
+                (Payload::SetContent { node, .. }, Undo::Content { .. }) => {
+                    edits.push((o.id, *node));
+                }
+                _ => {}
+            }
+        }
+        edits.sort();
+        let mut view = self.work.state.clone();
+        revive_by_edits(&mut view, &ops, &self.work.setter, &pre, &past, &edits);
+        self.view = Some(view);
     }
 
     pub fn ops(&self) -> impl Iterator<Item = &Op> {
@@ -641,6 +755,7 @@ impl Replica {
             let op = self.pending.remove(&id).unwrap();
             self.integrate(op);
         }
+        self.refresh_view();
     }
 
     fn integrate(&mut self, op: Op) {

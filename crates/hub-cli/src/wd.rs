@@ -11,7 +11,11 @@
 //! base <frontier ids, comma-joined, or ->
 //! d <esc path> <node id>
 //! f <esc path> <node id> <blob hex> <size> <mtime ns>
+//! u <esc path> <node id>
 //! ```
+//! A `u` entry is a head path deliberately **not materialized** because of a
+//! case clash on a case-insensitive filesystem (D-019, Issue #20): it is not
+//! on disk, is never reported as deleted, and is listed by `hub status`.
 //! `esc`/ids are the op-log encodings (`store::esc`, `store::fmt_id`). `base`
 //! is the frontier of the version last materialized. Size/mtime are the stat
 //! of the file as hub last wrote or read it; `0 0` means "unknown, rehash".
@@ -52,6 +56,8 @@ pub enum Entry {
         size: u64,
         mtime: u128,
     },
+    /// Skipped at checkout because of a case clash (D-019).
+    Unmaterialized,
 }
 
 impl Entry {
@@ -61,7 +67,7 @@ impl Entry {
     fn blob(&self) -> Option<BlobId> {
         match self {
             Entry::File { blob, .. } => Some(*blob),
-            Entry::Dir => None,
+            Entry::Dir | Entry::Unmaterialized => None,
         }
     }
     /// Same kind and (for files) same bytes.
@@ -150,6 +156,7 @@ impl Index {
             let t: Vec<&str> = l.split(' ').collect();
             let r: Result<(String, NodeId, Entry), String> = (|| match t.as_slice() {
                 ["d", p, n] => Ok((unesc(p)?, parse_id(n)?, Entry::Dir)),
+                ["u", p, n] => Ok((unesc(p)?, parse_id(n)?, Entry::Unmaterialized)),
                 ["f", p, n, b, s, m] => Ok((
                     unesc(p)?,
                     parse_id(n)?,
@@ -193,6 +200,7 @@ impl Index {
         for (p, (n, e)) in &self.entries {
             match e {
                 Entry::Dir => s.push_str(&format!("d {} {}\n", esc(p), fmt_id(*n))),
+                Entry::Unmaterialized => s.push_str(&format!("u {} {}\n", esc(p), fmt_id(*n))),
                 Entry::File { blob, size, mtime } => {
                     let (size, mtime) = if mtime.saturating_add(RACY_NS) >= now {
                         (&0, &0)
@@ -290,6 +298,9 @@ pub fn diff(idx: &Index, w: &Scan) -> Vec<Change> {
     let mut deleted = Vec::new();
     let mut out = Vec::new();
     for (p, (_, ie)) in &idx.entries {
+        if *ie == Entry::Unmaterialized {
+            continue;
+        }
         match w.get(p) {
             None => deleted.push(p.clone()),
             Some(we) if we.is_dir() != ie.is_dir() => {
@@ -365,8 +376,17 @@ pub fn render_changes(changes: &[Change], idx: &Index, w: &Scan) -> Vec<String> 
         .collect()
 }
 
+/// Test-only hook: when set, [`case_insensitive`] reports `true` without
+/// probing, so case-clash handling (D-019) can be tested on a case-sensitive
+/// filesystem. Clash detection is purely name-based, so the only difference
+/// from a real case-insensitive filesystem is that both names could exist.
+pub const FORCE_CI_ENV: &str = "HUB_TEST_FORCE_CASE_INSENSITIVE";
+
 /// Probe whether the filesystem holding `hub_dir` folds ASCII case.
 pub fn case_insensitive(hub_dir: &Path) -> io::Result<bool> {
+    if std::env::var_os(FORCE_CI_ENV).is_some() {
+        return Ok(true);
+    }
     let lower = hub_dir.join(".case-probe");
     let upper = hub_dir.join(".CASE-PROBE");
     fs::write(&lower, b"")?;
@@ -379,6 +399,38 @@ pub fn case_insensitive(hub_dir: &Path) -> io::Result<bool> {
 /// normalization is not modeled, see open questions on Issue #19).
 fn fold(s: &str) -> String {
     s.to_lowercase()
+}
+
+/// D-019: the paths of `paths` that cannot be materialized on a
+/// case-insensitive filesystem: every member of a group of paths equal under
+/// [`fold`] (no member is privileged), plus everything under such a member.
+/// Empty when `case_insensitive` is false.
+pub fn clashing<'a>(
+    paths: impl IntoIterator<Item = &'a String> + Clone,
+    case_insensitive: bool,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if !case_insensitive {
+        return out;
+    }
+    let mut groups: BTreeMap<String, Vec<&String>> = BTreeMap::new();
+    for p in paths.clone() {
+        groups.entry(fold(p)).or_default().push(p);
+    }
+    let roots: BTreeSet<&str> = groups
+        .values()
+        .filter(|g| g.len() > 1)
+        .flatten()
+        .map(|p| p.as_str())
+        .collect();
+    for p in paths {
+        let hit = roots.contains(p.as_str())
+            || p.match_indices('/').any(|(i, _)| roots.contains(&p[..i]));
+        if hit {
+            out.insert(p.clone());
+        }
+    }
+    out
 }
 
 /// What a checkout must do, computed before touching anything.
@@ -422,8 +474,9 @@ pub struct PlanOpts {
 }
 
 /// Plan materializing `t` over the working directory `w` last written as
-/// `idx`. Refuses (Err) on case clashes and, unless `force`, on unrecorded
-/// changes that would be overwritten or deleted.
+/// `idx`. Case-clashing paths are skipped and indexed as unmaterialized
+/// (D-019); refuses (Err), unless `force`, on unrecorded changes that would
+/// be overwritten or deleted.
 pub fn plan(
     t: &Target,
     idx: &Index,
@@ -457,22 +510,14 @@ pub fn plan(
         };
         tgt.insert(path.clone(), (*node, blob));
     }
-    // D-003: byte-exact names; on a case-insensitive FS a clash is refused.
-    if opts.case_insensitive {
-        let mut seen: BTreeMap<String, &str> = BTreeMap::new();
-        let mut clashes = Vec::new();
-        for path in tgt.keys() {
-            if let Some(prev) = seen.insert(fold(path), path) {
-                clashes.push(format!("'{prev}' and '{path}'"));
-            }
-        }
-        if !clashes.is_empty() {
-            return Err(Error(format!(
-                "case clash on a case-insensitive filesystem: {} (hub names are byte-exact, D-003; \
-                 rename one with `hub mv` in a case-sensitive checkout or edit the log)",
-                clashes.join(", ")
-            )));
-        }
+    // D-019 (refines D-003): on a case-insensitive FS, skip only the
+    // clashing paths, index them as unmaterialized, materialize the rest.
+    for path in clashing(tgt.keys(), opts.case_insensitive) {
+        let (node, _) = tgt.remove(&path).expect("clash path is a target path");
+        p.warnings.push(format!(
+            "not materialized (case clash on a case-insensitive filesystem, D-019): '{path}'"
+        ));
+        p.index.insert(path, (node, Entry::Unmaterialized, false));
     }
     let t_entry_matches = |path: &str, e: &Entry| -> bool {
         match (tgt.get(path), e) {
@@ -492,6 +537,9 @@ pub fn plan(
     let mut removing: BTreeSet<String> = BTreeSet::new();
     // 1. Tracked paths no longer in the target (or changing kind).
     for (path, (_, ie)) in &idx.entries {
+        if *ie == Entry::Unmaterialized {
+            continue;
+        }
         let stays = match tgt.get(path) {
             Some((_, b)) => b.is_none() == ie.is_dir(),
             None => false,

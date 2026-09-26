@@ -426,8 +426,8 @@ fn render_conflicts(proj: &Projection, conflicts: &BTreeSet<Conflict>) -> Vec<St
                 short_id(*winner),
                 &winner_blob.hex()[..8]
             ),
-            Conflict::EditDeleted { node, edit, delete } => format!(
-                "edit-deleted: content edit {} of {} kept on trashed node (delete {})",
+            Conflict::EditRevived { node, edit, delete } => format!(
+                "edit-revived: content edit {} revived {} despite delete {}",
                 short_id(*edit),
                 name(*node),
                 short_id(*delete)
@@ -650,8 +650,16 @@ fn record(
         base: repo.head_frontier(),
         ..Index::default()
     };
+    let unmat = wd::clashing(
+        proj.entries.keys().filter(|p| !p.is_empty()),
+        wd::case_insensitive(&repo.dir)?,
+    );
     for (p, n) in &proj.entries {
         if p.is_empty() {
+            continue;
+        }
+        if unmat.contains(p) {
+            nidx.entries.insert(p.clone(), (*n, Entry::Unmaterialized));
             continue;
         }
         let e = match (state[n].kind, w.get(p)) {
@@ -957,6 +965,21 @@ pub fn run(
             let w = wd::scan(&repo.root(), &idx, &mut ws)?;
             print_warnings(warn, &ws)?;
             let changes = wd::diff(&idx, &w);
+            let unmat: Vec<&String> = idx
+                .entries
+                .iter()
+                .filter(|(_, (_, e))| *e == Entry::Unmaterialized)
+                .map(|(p, _)| p)
+                .collect();
+            if !unmat.is_empty() {
+                writeln!(
+                    out,
+                    "unmaterialized (case clash on a case-insensitive filesystem, D-019):"
+                )?;
+                for p in unmat {
+                    writeln!(out, "  {p}")?;
+                }
+            }
             if changes.is_empty() {
                 writeln!(out, "working directory: clean")?;
             } else {
