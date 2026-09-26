@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use hub_core::checkpoint::Checkpoint;
-use hub_core::tree::{Kind, NodeId, Op, Payload, ReplicaId};
+use hub_core::tree::{BlobId, Kind, NodeId, Op, Payload, ReplicaId};
 use hub_core::version::Store;
 
 pub const OPLOG_HEADER: &str = "barocss-hub/oplog/v0";
@@ -136,6 +136,17 @@ fn parse_ids(t: &str) -> Result<Vec<NodeId>, String> {
     t.split(',').map(parse_id).collect()
 }
 
+fn parse_blob(t: &str) -> Result<BlobId, String> {
+    if t.len() != 64 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("bad blob".into());
+    }
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(&t[2 * i..2 * i + 2], 16).map_err(|_| "bad blob")?;
+    }
+    Ok(BlobId(out))
+}
+
 pub fn encode_op(op: &Op) -> String {
     let p = match &op.payload {
         Payload::Create { kind, parent, name } => {
@@ -156,6 +167,7 @@ pub fn encode_op(op: &Op) -> String {
             esc(new_name)
         ),
         Payload::Delete { node } => format!("D {}", fmt_id(*node)),
+        Payload::SetContent { node, blob } => format!("S {} {}", fmt_id(*node), blob.hex()),
     };
     format!(
         "O {} {} {p}",
@@ -187,6 +199,10 @@ pub fn decode_op(body: &str) -> Result<Op, String> {
         },
         ["D", node] => Payload::Delete {
             node: parse_id(node)?,
+        },
+        ["S", node, blob] => Payload::SetContent {
+            node: parse_id(node)?,
+            blob: parse_blob(blob)?,
         },
         _ => return Err("bad payload".into()),
     };
@@ -367,5 +383,30 @@ impl RepoLock {
         #[cfg(not(unix))]
         let _ = mode;
         Ok(RepoLock { _file: file })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_content_round_trip() {
+        let op = Op {
+            id: NodeId::new(7, 0xabc),
+            deps: [NodeId::new(3, 0xabc)].into_iter().collect(),
+            payload: Payload::SetContent {
+                node: NodeId::new(3, 0xabc),
+                blob: BlobId::of(b"hello"),
+            },
+        };
+        let line = encode_op(&op);
+        assert!(line.contains(&format!(
+            " S 3.{:032x} {}",
+            0xabc,
+            BlobId::of(b"hello").hex()
+        )));
+        assert_eq!(decode_op(&line).unwrap(), op);
+        assert!(decode_op(&line.replace(&BlobId::of(b"hello").hex(), "zz")).is_err());
     }
 }

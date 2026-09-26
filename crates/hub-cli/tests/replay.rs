@@ -53,3 +53,29 @@ fn string_escaping_round_trips() {
         assert_eq!(hub_cli::store::unesc(&hub_cli::store::esc(s)).unwrap(), s);
     }
 }
+
+/// Issue #18: the shared generator must exercise SetContent, so the replay
+/// property above covers the `S` op-log record.
+#[test]
+fn generator_emits_set_content() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strat = script_strategy();
+    let (mut scripts, mut with) = (0, 0);
+    for _ in 0..256 {
+        let (nrep, script, _) = strat.new_tree(&mut runner).unwrap().current();
+        let ops = simulate(nrep, &script);
+        scripts += 1;
+        if ops
+            .iter()
+            .any(|o| matches!(o.payload, Payload::SetContent { .. }))
+        {
+            with += 1;
+        }
+    }
+    assert!(
+        with * 4 >= scripts,
+        "only {with}/{scripts} scripts had SetContent"
+    );
+}
