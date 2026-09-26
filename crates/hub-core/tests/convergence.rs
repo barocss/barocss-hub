@@ -67,7 +67,7 @@ fn simulate(nrep: usize, script: &[(u8, u8, u8, u8)]) -> Vec<Op> {
             .collect();
         let pick = |v: &Vec<NodeId>, i: u8| v[i as usize % v.len()];
         let name = NAMES[b as usize % NAMES.len()].to_string();
-        match act % 10 {
+        match act % 12 {
             0 | 1 => {
                 let kind = if b % 3 == 0 {
                     Kind::File
@@ -122,6 +122,73 @@ fn simulate(nrep: usize, script: &[(u8, u8, u8, u8)]) -> Vec<Op> {
                     new_parent,
                     new_name,
                 });
+            }
+            10 if nrep > 1 => {
+                // Concurrent cross-move of two directories (cycle candidate):
+                // r moves u under v while r' (unsynced) moves v under u.
+                let o = (r + 1) % nrep;
+                let sto = reps[o].state();
+                let ud: Vec<NodeId> = dirs
+                    .iter()
+                    .copied()
+                    .filter(|n| !n.is_reserved() && sto.contains_key(n))
+                    .collect();
+                if ud.len() >= 2 {
+                    let u = pick(&ud, a);
+                    let v = pick(&ud, a / 2 + 1);
+                    if u != v && !is_ancestor_or_self(&st, u, v) && !is_ancestor_or_self(&sto, v, u)
+                    {
+                        reps[r].mint(Payload::Move {
+                            node: u,
+                            new_parent: v,
+                            new_name: name.clone(),
+                        });
+                        reps[o].mint(Payload::Move {
+                            node: v,
+                            new_parent: u,
+                            new_name: name,
+                        });
+                    }
+                }
+            }
+            11 if nrep > 1 => {
+                // Delete of a directory concurrent with moving one of its
+                // strict descendants elsewhere (revived candidate).
+                let o = (r + 1) % nrep;
+                let sto = reps[o].state();
+                let pairs: Vec<(NodeId, NodeId)> = nodes
+                    .iter()
+                    .flat_map(|&x| dirs.iter().map(move |&d| (d, x)))
+                    .filter(|&(d, x)| {
+                        !d.is_reserved()
+                            && d != x
+                            && is_ancestor_or_self(&st, d, x)
+                            && is_live(&st, x)
+                            && sto.contains_key(&x)
+                    })
+                    .collect();
+                if !pairs.is_empty() {
+                    let (d, x) = pairs[a as usize % pairs.len()];
+                    let dests: Vec<NodeId> = sto
+                        .values()
+                        .filter(|n| {
+                            n.kind != Kind::File
+                                && is_live(&sto, n.id)
+                                && !is_ancestor_or_self(&sto, x, n.id)
+                                && !is_ancestor_or_self(&sto, d, n.id)
+                        })
+                        .map(|n| n.id)
+                        .collect();
+                    if !dests.is_empty() {
+                        reps[r].mint(Payload::Delete { node: d });
+                        let np = dests[b as usize / 4 % dests.len()];
+                        reps[o].mint(Payload::Move {
+                            node: x,
+                            new_parent: np,
+                            new_name: name,
+                        });
+                    }
+                }
             }
             _ => {}
         }
@@ -510,4 +577,105 @@ fn invalid_op_is_noop_and_recorded() {
     let ev = run_all_orders(std::slice::from_ref(&bad));
     assert_eq!(parent(&ev, a), ROOT);
     assert_eq!(ev.conflicts, [Conflict::InvalidOp { op: bad.id }].into());
+}
+
+// ---------- negative `revived` tests (Issue #5 review repair) ----------
+
+fn has_revived(ev: &Evaluation) -> bool {
+    ev.conflicts
+        .iter()
+        .any(|c| matches!(c, Conflict::Revived { .. }))
+}
+
+#[test]
+fn revived_not_for_causal_restore() {
+    // M causally after D: explicit restore of x out of the trash.
+    let (_, a, b, x) = base();
+    let d = op(5, A, &[x], Payload::Delete { node: a });
+    let m = op(6, B, &[d.id], mv(x, b, "x"));
+    let ev = run_all_orders(&[d, m]);
+    assert_eq!(parent(&ev, a), TRASH);
+    assert_eq!(parent(&ev, x), b);
+    assert!(is_live(&ev.state, x));
+    assert!(!has_revived(&ev));
+    assert!(ev.conflicts.is_empty());
+}
+
+#[test]
+fn revived_not_when_delete_is_overridden() {
+    // d's winning op is B's move, not A's delete.
+    let (_, a, b, x) = base();
+    let d = op(5, A, &[x], Payload::Delete { node: a });
+    let ma = op(5, B, &[x], mv(a, b, "a"));
+    let mx = op(5, C, &[x], mv(x, b, "x"));
+    let ev = run_all_orders(&[d.clone(), ma.clone(), mx]);
+    assert_eq!(parent(&ev, a), b);
+    assert_eq!(parent(&ev, x), b);
+    assert!(is_live(&ev.state, x));
+    assert!(!has_revived(&ev));
+    assert_eq!(
+        ev.conflicts,
+        [Conflict::SameNodeMove {
+            winner: ma.id,
+            loser: d.id,
+            node: a
+        }]
+        .into()
+    );
+}
+
+#[test]
+fn revived_not_when_x_stays_in_trash() {
+    // x moves to /a/y/x, still inside the trashed subtree.
+    let (_, a, _, x) = base();
+    let y = op(
+        5,
+        A,
+        &[x],
+        Payload::Create {
+            kind: Kind::Directory,
+            parent: a,
+            name: "y".into(),
+        },
+    );
+    let d = op(6, A, &[y.id], Payload::Delete { node: a });
+    let m = op(6, B, &[y.id], mv(x, y.id, "x"));
+    let ev = run_all_orders(&[y.clone(), d, m]);
+    assert_eq!(parent(&ev, a), TRASH);
+    assert_eq!(parent(&ev, x), y.id);
+    assert!(!is_live(&ev.state, x));
+    assert!(!has_revived(&ev));
+    assert!(ev.conflicts.is_empty());
+}
+
+// ---------- generator coverage floor ----------
+
+/// Deterministic sample of the proptest strategy; guards against the
+/// generator silently stopping to exercise the rare `cycle`/`revived` rules.
+#[test]
+fn generator_covers_cycle_and_revived() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+    let mut runner = TestRunner::new_with_rng(
+        Config::default(),
+        TestRng::from_seed(RngAlgorithm::ChaCha, &[7; 32]),
+    );
+    let strat = script_strategy();
+    let (mut cyc, mut rev) = (0, 0);
+    let n = 1024;
+    for _ in 0..n {
+        let (nrep, script, _) = strat.new_tree(&mut runner).unwrap().current();
+        let ev = evaluate(&simulate(nrep, &script));
+        cyc += ev
+            .conflicts
+            .iter()
+            .any(|c| matches!(c, Conflict::Cycle { .. })) as usize;
+        rev += ev
+            .conflicts
+            .iter()
+            .any(|c| matches!(c, Conflict::Revived { .. })) as usize;
+    }
+    eprintln!("coverage over {n} cases: cycle={cyc} revived={rev}");
+    assert!(cyc * 25 >= n, "cycle coverage {cyc}/{n} below 4%");
+    assert!(rev * 50 >= n, "revived coverage {rev}/{n} below 2%");
 }
