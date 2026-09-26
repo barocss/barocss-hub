@@ -138,6 +138,93 @@ fn mkdir(c: u64, r: u128, deps: &[OpId], name: &str) -> Op {
     }
 }
 
+/// Golden v0 ids (§3.4), computed independently of the crate (Python
+/// hashlib over the hand-built encoding). Genesis: empty frontier.
+const GOLDEN_GENESIS: &str = "dc70eb086af535eff6a2962f8fc47dff408a30864dbd9100c4eb571cf6f8dc9f";
+/// Frontier `[(counter 2, replica 1)]`.
+const GOLDEN_ONE: &str = "1af9a8d2ffc10b66222599f3ccb419c60390b8f0daabc9809807a7eeb5087d1b";
+/// Frontier `{(1, 2), (2, 1)}`, canonical order `(1,2) < (2,1)`.
+const GOLDEN_TWO: &str = "5bb5b55810aed34beb083c3d33b1d172cedae7372030f983983a28c4e5db3912";
+
+/// §3.4 formula built byte by byte in the test:
+/// `SHA-256("barocss-hub/version/v0\n" || u64_be(|F|) || for f sorted by <:
+/// u64_be(counter) || u128_be(replica))`.
+fn manual_id(frontier: &[(u64, u128)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut f = frontier.to_vec();
+    f.sort();
+    let mut bytes: Vec<u8> = b"barocss-hub/version/v0\n".to_vec();
+    bytes.extend_from_slice(&(f.len() as u64).to_be_bytes());
+    for (c, r) in f {
+        bytes.extend_from_slice(&c.to_be_bytes());
+        bytes.extend_from_slice(&r.to_be_bytes());
+    }
+    Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[test]
+fn v0_encoding_matches_hand_built_bytes_and_golden_vectors() {
+    let cases: [(&[(u64, u128)], &str); 3] = [
+        (&[], GOLDEN_GENESIS),
+        (&[(2, 1)], GOLDEN_ONE),
+        (&[(2, 1), (1, 2)], GOLDEN_TWO),
+    ];
+    for (f, golden) in cases {
+        assert_eq!(manual_id(f), golden);
+        let mut ids: Vec<OpId> = f.iter().map(|&(c, r)| NodeId::new(c, r)).collect();
+        ids.sort();
+        assert_eq!(VersionId::of_frontier(&ids).hex(), golden);
+    }
+    // Wide replica ids exercise all 16 bytes of u128_be.
+    let wide = [(u64::MAX, u128::MAX - 7), (3, 1u128 << 100)];
+    let mut ids: Vec<OpId> = wide.iter().map(|&(c, r)| NodeId::new(c, r)).collect();
+    ids.sort();
+    assert_eq!(VersionId::of_frontier(&ids).hex(), manual_id(&wide));
+}
+
+#[test]
+fn eight_digit_collision_lengthens_short_ids() {
+    // Search independent root ops for two ids sharing SHORT_LEN hex digits.
+    let mut seen = std::collections::HashMap::new();
+    let (x, y, ox, oy) = 'found: {
+        for r in 1..4_000_000u128 {
+            let op = mkdir(1, r, &[], "d");
+            let id = VersionId::of_frontier(&[op.id]);
+            if let Some(&(prev, pr)) = seen.get(&id.0[..4]) {
+                break 'found (prev, id, mkdir(1, pr, &[], "d"), op);
+            }
+            seen.insert(id.0[..4].to_vec(), (id, r));
+        }
+        panic!("no 8-digit collision");
+    };
+    assert_eq!(x.short(), y.short());
+    let store = store_of(&[ox, oy, mkdir(1, 0, &[], "d")]);
+    let ix = VersionIndex::new(&store);
+    assert_eq!(
+        ix.resolve(&x.short()),
+        Err(ResolveError::Ambiguous(if x < y {
+            vec![x, y]
+        } else {
+            vec![y, x]
+        }))
+    );
+    let (sx, sy) = (ix.short(&x), ix.short(&y));
+    assert!(sx.len() > SHORT_LEN && sy.len() > SHORT_LEN, "{sx} {sy}");
+    assert_ne!(sx, sy);
+    assert_eq!(ix.resolve(&sx).unwrap().0, x);
+    assert_eq!(ix.resolve(&sy).unwrap().0, y);
+    // Shortest: one digit less is still ambiguous.
+    assert!(matches!(
+        ix.resolve(&sx[..sx.len() - 1]),
+        Err(ResolveError::Ambiguous(_))
+    ));
+    // Non-colliding ids keep the default length.
+    assert_eq!(ix.short(&VersionId::of_frontier(&[])).len(), SHORT_LEN);
+}
+
 #[test]
 fn genesis_single_and_multi_op_frontiers() {
     let a1 = mkdir(1, 1, &[], "a");
@@ -156,6 +243,9 @@ fn genesis_single_and_multi_op_frontiers() {
     let gid = version_id(&store, &g);
     assert_eq!(gid, VersionId::of_frontier(&[]));
     let ids = [gid, version_id(&store, &single), version_id(&store, &multi)];
+    assert_eq!(ids[0].hex(), GOLDEN_GENESIS);
+    assert_eq!(ids[1].hex(), GOLDEN_ONE);
+    assert_eq!(ids[2].hex(), GOLDEN_TWO);
     let set: BTreeSet<_> = ids.iter().collect();
     assert_eq!(set.len(), 3);
     for id in &ids {
