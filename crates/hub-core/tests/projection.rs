@@ -278,3 +278,134 @@ fn generator_covers_name_collisions() {
     eprintln!("collision coverage over {n} cases: any={any} multi={multi} total={total}");
     assert!(any * 4 >= n, "collision coverage {any}/{n} below 25%");
 }
+
+// ---------- Issue #10: review follow-ups ----------
+
+/// Evaluation over every delivery order of `extra` (duplicated) agrees with
+/// the spec fold on state and conflicts; returns the spec evaluation.
+fn eval_all_orders(base: &[Op], extra: &[Op]) -> Evaluation {
+    let all: Vec<Op> = base.iter().chain(extra).cloned().collect();
+    let spec = evaluate(&all);
+    for p in permutations(extra) {
+        let mut rep = Replica::new();
+        for o in base.iter().chain(p.iter()).chain(p.iter()) {
+            rep.receive(o.clone());
+        }
+        assert_eq!(rep.state(), &spec.state);
+    }
+    spec
+}
+
+/// Item 4: Create directly under TRASH, and under a trashed directory, is
+/// valid (node recorded) but not live: no path, no conflict.
+#[test]
+fn issue10_create_under_trash_and_trashed_dir() {
+    let (base, a) = base();
+    let t = op(3, A, &[a], create(Kind::File, TRASH, "t"));
+    let d = op(4, A, &[t.id], Payload::Delete { node: a });
+    let x = op(5, A, &[d.id], create(Kind::File, a, "x"));
+    let extra = [t.clone(), d, x.clone()];
+    let all: Vec<Op> = base.iter().chain(&extra).cloned().collect();
+    let spec = evaluate(&all);
+    assert!(spec.conflicts.is_empty(), "{:?}", spec.conflicts);
+    for n in [t.id, x.id] {
+        assert!(spec.state.contains_key(&n), "{n:?} not created");
+        assert!(!is_live(&spec.state, n));
+    }
+    assert_eq!(spec.state[&t.id].parent, Some(TRASH));
+    assert_eq!(spec.state[&x.id].parent, Some(a));
+    let p = project_all_orders(&base, &extra);
+    assert!(!p.paths.contains_key(&t.id));
+    assert!(!p.paths.contains_key(&x.id));
+    assert!(p.collisions.is_empty());
+    assert_eq!(p.paths.len(), 1); // ROOT only
+}
+
+/// Item 5: Create inside `a` concurrent with Delete of `a`, with the Create
+/// ordered both before and after the Delete in the total order, in every
+/// delivery order. The Create is valid either way (a trashed directory is
+/// still a directory, §2.2) so the node ends up recorded, not live, without
+/// a conflict.
+#[test]
+fn issue10_create_under_concurrently_deleted_dir_all_orders() {
+    let (base, a) = base();
+    for (cc, dc) in [(3, 4), (4, 3)] {
+        let x = op(cc, B, &[a], create(Kind::File, a, "x"));
+        let d = op(dc, A, &[a], Payload::Delete { node: a });
+        let spec = eval_all_orders(&base, &[x.clone(), d.clone()]);
+        assert!(spec.conflicts.is_empty(), "{:?}", spec.conflicts);
+        assert_eq!(spec.outcomes[&x.id], Outcome::Applied);
+        assert_eq!(spec.outcomes[&d.id], Outcome::Applied);
+        assert_eq!(spec.state[&x.id].parent, Some(a));
+        assert_eq!(spec.state[&a].parent, Some(TRASH));
+        assert!(!is_live(&spec.state, x.id));
+        let p = project_all_orders(&base, &[x.clone(), d]);
+        assert_eq!(p.paths.len(), 1); // ROOT only
+        assert!(p.collisions.is_empty());
+    }
+}
+
+/// Item 6: two collision losers with the same short id (same counter, same
+/// low 32 replica bits) must get distinct paths through the fallback chain.
+/// Catches "assigned candidate not added to `used`".
+#[test]
+fn issue10_losers_sharing_short_id_get_distinct_paths() {
+    let (base, a) = base();
+    let r1: u128 = (1 << 32) | 2;
+    let r2: u128 = (2 << 32) | 2;
+    let w = op(3, A, &[a], create(Kind::File, a, "n"));
+    let l1 = op(3, r1, &[a], create(Kind::File, a, "n"));
+    let l2 = op(3, r2, &[a], create(Kind::File, a, "n"));
+    assert_eq!(short_id(l1.id), short_id(l2.id));
+    let p = project_all_orders(&base, &[w.clone(), l1.clone(), l2.clone()]);
+    assert_eq!(p.paths[&w.id], "a/n");
+    assert_eq!(p.paths[&l1.id], "a/n~3-00000002");
+    assert_eq!(p.paths[&l2.id], "a/n~3-00000000000000000000000200000002");
+    assert_eq!(p.entries.len(), p.paths.len());
+    assert_eq!(p.collisions.len(), 2);
+
+    // Deeper: a user name occupies l2's long form, forcing the `.1` step.
+    let u = op(
+        3,
+        C,
+        &[a],
+        create(Kind::File, a, "n~3-00000000000000000000000200000002"),
+    );
+    let p = project_all_orders(&base, &[w, l1.clone(), l2.clone(), u.clone()]);
+    assert_eq!(p.paths[&u.id], "a/n~3-00000000000000000000000200000002");
+    assert_eq!(p.paths[&l1.id], "a/n~3-00000002");
+    assert_eq!(p.paths[&l2.id], "a/n~3-00000000000000000000000200000002.1");
+    assert_eq!(p.entries.len(), p.paths.len());
+}
+
+/// Item 7 (D-002, suffix instability accepted): a sibling created *later*
+/// with the exact name `n~<short-id>` takes it; the suffixed loser falls back
+/// to the long form. User-chosen names always win and are not rejected.
+#[test]
+fn issue10_later_sibling_takes_suffixed_name() {
+    let (base, a) = base();
+    let na = op(3, A, &[a], create(Kind::File, a, "n"));
+    let nb = op(3, B, &[a], create(Kind::File, a, "n"));
+    let before = project_all_orders(&base, &[na.clone(), nb.clone()]);
+    assert_eq!(before.paths[&nb.id], "a/n~3-00000002");
+    // Causally after both creates (it "sees" the suffixed path).
+    let later = op(4, A, &[na.id, nb.id], create(Kind::File, a, "n~3-00000002"));
+    let spec = evaluate(
+        &base
+            .iter()
+            .chain([&na, &nb, &later])
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    assert!(spec.conflicts.is_empty());
+    let p = project_all_orders(&base, &[na.clone(), nb.clone(), later.clone()]);
+    assert_eq!(p.paths[&later.id], "a/n~3-00000002");
+    assert_eq!(p.paths[&na.id], "a/n");
+    assert_eq!(p.paths[&nb.id], "a/n~3-00000000000000000000000000000002");
+    assert_eq!(p.entries.len(), p.paths.len());
+    // The user-named node is plain (no collision); nb keeps exactly one.
+    assert!(p.collisions.iter().all(|c| c.node != later.id));
+    let c: Vec<_> = p.collisions.iter().filter(|c| c.node == nb.id).collect();
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].projected_name, "n~3-00000000000000000000000000000002");
+}
