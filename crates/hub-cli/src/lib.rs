@@ -3,7 +3,9 @@
 //! [`Repo`] owns storage and replay; [`run`] implements the commands so they
 //! can be tested without spawning a process. `main.rs` is a thin wrapper.
 
+pub mod blobs;
 pub mod store;
+pub mod wd;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -13,15 +15,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use hub_core::checkpoint::{Checkpoint, Checkpoints, ResolveError, VersionIndex};
+use hub_core::checkpoint::{Checkpoint, Checkpoints, ResolveError, VersionId, VersionIndex};
 use hub_core::projection::{project, short_id, Projection};
 use hub_core::tree::{
-    evaluate, is_ancestor_or_self, valid_name, Conflict, Kind, NodeId, Op, Payload, Replica,
-    ReplicaId, State,
+    evaluate, is_ancestor_or_self, valid_name, BlobId, Conflict, Kind, NodeId, Op, Payload,
+    Replica, ReplicaId, State, ROOT,
 };
 use hub_core::version::{Store, Version};
 
 use store::{LockMode, RepoLock, StoreError};
+use wd::{Change, Entry, Index, PlanOpts, Target};
 
 pub const HUB_DIR: &str = ".hub";
 
@@ -40,8 +43,21 @@ impl From<StoreError> for Error {
     }
 }
 
+/// Message of the error produced when stdout's reader went away (EPIPE,
+/// e.g. `hub log | head -1`); `main` exits quietly on it.
+pub const BROKEN_PIPE: &str = "broken pipe";
+
+impl Error {
+    pub fn is_broken_pipe(&self) -> bool {
+        self.0 == BROKEN_PIPE
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            return Error(BROKEN_PIPE.into());
+        }
         Error(format!("i/o error: {e}"))
     }
 }
@@ -233,17 +249,42 @@ impl Repo {
         Ok(())
     }
 
-    /// Author a local op over the current frontier with a Lamport counter.
-    pub fn mint(&mut self, payload: Payload) -> Result<Op, Error> {
+    /// Build (not persist) a local op over the current frontier with a
+    /// Lamport counter.
+    pub fn prepare(&self, payload: Payload) -> Op {
         let deps: BTreeSet<_> = self.head().frontier(&self.store).into_iter().collect();
         let counter = 1 + self.store.keys().map(|o| o.counter).max().unwrap_or(1);
-        let op = Op {
+        Op {
             id: NodeId::new(counter, self.replica_id.0),
             deps,
             payload,
-        };
+        }
+    }
+
+    /// Author a local op over the current frontier with a Lamport counter.
+    pub fn mint(&mut self, payload: Payload) -> Result<Op, Error> {
+        let op = self.prepare(payload);
         self.append_op(op.clone())?;
         Ok(op)
+    }
+
+    /// The working directory: the parent of `.hub/`.
+    pub fn root(&self) -> PathBuf {
+        self.dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    pub fn blobs(&self) -> Result<blobs::Blobs, Error> {
+        Ok(blobs::Blobs::open(&self.dir)?)
+    }
+
+    /// Sorted frontier of the head.
+    pub fn head_frontier(&self) -> Vec<NodeId> {
+        let mut f = self.head().frontier(&self.store);
+        f.sort();
+        f
     }
 
     pub fn commit(&mut self, message: &str) -> Result<Checkpoint, Error> {
@@ -396,22 +437,369 @@ fn render_conflicts(proj: &Projection, conflicts: &BTreeSet<Conflict>) -> Vec<St
     out
 }
 
+fn render_long(state: &State, proj: &Projection) -> Vec<String> {
+    proj.entries
+        .iter()
+        .filter(|(p, _)| !p.is_empty())
+        .map(|(p, n)| match state[n].kind {
+            Kind::File => {
+                let b = proj.blobs.get(n).copied().unwrap_or_else(BlobId::empty);
+                format!("{} {} {p}", short_id(*n), &b.hex()[..12])
+            }
+            _ => format!("{} {:12} {p}/", short_id(*n), "-"),
+        })
+        .collect()
+}
+
+fn resolve(repo: &Repo, ix: &VersionIndex, id: &str) -> Result<Version, Error> {
+    ix.resolve_version(&repo.store, id).map_err(|e| match e {
+        ResolveError::InvalidPrefix => {
+            Error(format!("invalid version id '{id}' (need 4-64 hex digits)"))
+        }
+        ResolveError::NotFound => Error(format!("unknown version '{id}'")),
+        ResolveError::Ambiguous(ids) => Error(format!(
+            "ambiguous version '{id}': {}",
+            ids.iter()
+                .map(|i| ix.short(i))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    })
+}
+
+fn not_at_head(repo: &Repo, idx: &Index) -> Error {
+    let ix = repo.index();
+    Error(format!(
+        "working directory is at version {}, not head {}; run `hub checkout` to return to head first",
+        ix.short(&VersionId::of_frontier(&idx.base)),
+        ix.short(&VersionId::of_frontier(&repo.head_frontier()))
+    ))
+}
+
+/// Load the index, distrusting it when its base names ops the log does not
+/// have (e.g. a torn tail was dropped): then every on-disk path is treated
+/// as unrecorded (never clean), so no checkout deletes or overwrites it
+/// without `--force`.
+fn load_index(repo: &Repo, warn: &mut dyn Write) -> Result<Index, Error> {
+    let idx = Index::load(&repo.dir)?;
+    if idx.base.iter().any(|id| !repo.store.contains_key(id)) {
+        writeln!(
+            warn,
+            "warning: the index names ops missing from the log; treating all working files as unrecorded"
+        )?;
+        return Ok(Index::default());
+    }
+    Ok(idx)
+}
+
+/// Refuse while an interrupted checkout's marker exists.
+fn refuse_if_interrupted(repo: &Repo) -> Result<(), Error> {
+    if wd::interrupted(&repo.dir)?.is_some() {
+        return err(
+            "a checkout was interrupted; the working directory is partly updated. \
+             Run `hub checkout` to finish it before recording or changing the tree",
+        );
+    }
+    Ok(())
+}
+
+fn print_warnings(warn: &mut dyn Write, ws: &[String]) -> Result<(), Error> {
+    for w in ws {
+        writeln!(warn, "warning: {w}")?;
+    }
+    Ok(())
+}
+
+/// mkdir/touch/mv/rm: append `payload` and materialize its effect in the
+/// working directory. The plan is computed first, so a refused working-dir
+/// update appends nothing.
+fn mutate(repo: &mut Repo, payload: Payload, warn: &mut dyn Write) -> Result<(), Error> {
+    let root = repo.root();
+    refuse_if_interrupted(repo)?;
+    let idx = load_index(repo, warn)?;
+    if idx.base != repo.head_frontier() {
+        return Err(not_at_head(repo, &idx));
+    }
+    let op = repo.prepare(payload);
+    let ev = evaluate(repo.store.values().chain(std::iter::once(&op)));
+    let proj = project(&ev.state);
+    let mut ws = Vec::new();
+    let w = wd::scan(&root, &idx, &mut ws)?;
+    let plan = wd::plan(
+        &Target {
+            state: &ev.state,
+            proj: &proj,
+            frontier: vec![op.id],
+        },
+        &idx,
+        &w,
+        &repo.blobs()?,
+        &PlanOpts {
+            force: false,
+            restore_missing: false,
+            case_insensitive: wd::case_insensitive(&repo.dir)?,
+        },
+    )?;
+    repo.append_op(op)?;
+    ws.extend(wd::apply(plan, &root, &repo.dir)?);
+    print_warnings(warn, &ws)
+}
+
+fn record(
+    repo: &mut Repo,
+    msg: Option<&str>,
+    out: &mut dyn Write,
+    warn: &mut dyn Write,
+) -> Result<(), Error> {
+    let root = repo.root();
+    refuse_if_interrupted(repo)?;
+    wd::sweep_tmp(&repo.dir)?;
+    let blobs = repo.blobs()?;
+    let swept = blobs.sweep_temps()?;
+    if swept > 0 {
+        writeln!(
+            warn,
+            "warning: removed {swept} incomplete blob temp file(s) left by an interrupted write"
+        )?;
+    }
+    let idx = load_index(repo, warn)?;
+    if idx.base != repo.head_frontier() {
+        return Err(not_at_head(repo, &idx));
+    }
+    let mut ws = Vec::new();
+    let w = wd::scan(&root, &idx, &mut ws)?;
+    print_warnings(warn, &ws)?;
+    let changes = wd::diff(&idx, &w);
+    if changes.is_empty() {
+        writeln!(out, "nothing to record")?;
+        return Ok(());
+    }
+    let old = |p: &str| idx.entries[p].0;
+    let mut created: BTreeMap<String, NodeId> = BTreeMap::new();
+    let parent_of = |created: &BTreeMap<String, NodeId>, path: &str| -> (NodeId, String) {
+        let (d, n) = path.rsplit_once('/').unwrap_or(("", path));
+        let pn = if d.is_empty() {
+            ROOT
+        } else {
+            created.get(d).copied().unwrap_or_else(|| idx.entries[d].0)
+        };
+        (pn, n.to_string())
+    };
+    // Store every new blob before appending any op, so a crash can never
+    // leave an op that names a missing blob (or a half-recorded change).
+    let mut stored: BTreeMap<&str, BlobId> = BTreeMap::new();
+    for c in &changes {
+        if let Change::Added(p) | Change::Modified(p) = c {
+            if matches!(w[p], Entry::File { .. }) {
+                let bytes = fs::read(root.join(p))?;
+                let b = blobs.put(&bytes).map_err(|e| Error(e.to_string()))?;
+                stored.insert(p, b);
+            }
+        }
+    }
+    let put = |path: &str| -> Result<BlobId, Error> { Ok(stored[path]) };
+    // 1. Creates, parents first (a path sorts before its descendants).
+    for c in &changes {
+        let Change::Added(p) = c else { continue };
+        let (parent, name) = parent_of(&created, p);
+        let is_dir = matches!(w[p], Entry::Dir);
+        let kind = if is_dir { Kind::Directory } else { Kind::File };
+        let op = repo.mint(Payload::Create { kind, parent, name })?;
+        created.insert(p.clone(), op.id);
+        if !is_dir {
+            let blob = put(p)?;
+            if blob != BlobId::empty() {
+                repo.mint(Payload::SetContent { node: op.id, blob })?;
+            }
+        }
+    }
+    // 2. Moves (before deletes, so a file moved out of a deleted dir survives).
+    for c in &changes {
+        let Change::Renamed(a, b) = c else { continue };
+        let (new_parent, new_name) = parent_of(&created, b);
+        repo.mint(Payload::Move {
+            node: old(a),
+            new_parent,
+            new_name,
+        })?;
+    }
+    // 3. Content edits.
+    for c in &changes {
+        let Change::Modified(p) = c else { continue };
+        let blob = put(p)?;
+        repo.mint(Payload::SetContent { node: old(p), blob })?;
+    }
+    // 4. Deletes, top-most only (a Delete trashes the whole subtree).
+    let deleted: BTreeSet<&str> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::Deleted(p) => Some(p.as_str()),
+            _ => None,
+        })
+        .collect();
+    for p in &deleted {
+        let covered = p.match_indices('/').any(|(i, _)| deleted.contains(&p[..i]));
+        if !covered {
+            repo.mint(Payload::Delete { node: old(p) })?;
+        }
+    }
+    // New index from the head projection plus the scanned stats.
+    let state = repo.state().clone();
+    let proj = project(&state);
+    let mut nidx = Index {
+        base: repo.head_frontier(),
+        ..Index::default()
+    };
+    for (p, n) in &proj.entries {
+        if p.is_empty() {
+            continue;
+        }
+        let e = match (state[n].kind, w.get(p)) {
+            (Kind::File, we) => {
+                let blob = proj.blobs.get(n).copied().unwrap_or_else(BlobId::empty);
+                match we {
+                    Some(Entry::File {
+                        blob: wb,
+                        size,
+                        mtime,
+                    }) if *wb == blob => Entry::File {
+                        blob,
+                        size: *size,
+                        mtime: *mtime,
+                    },
+                    _ => {
+                        writeln!(warn, "warning: '{p}' differs from the recorded tree")?;
+                        Entry::File {
+                            blob,
+                            size: 0,
+                            mtime: 0,
+                        }
+                    }
+                }
+            }
+            _ => Entry::Dir,
+        };
+        nidx.entries.insert(p.clone(), (*n, e));
+    }
+    for p in w.keys() {
+        if !proj.entries.contains_key(p) {
+            writeln!(warn, "warning: '{p}' is not in the recorded tree")?;
+        }
+    }
+    nidx.save(&repo.dir)?;
+    writeln!(out, "recorded {} change(s):", changes.len())?;
+    for l in wd::render_changes(&changes, &idx, &w) {
+        writeln!(out, "  {l}")?;
+    }
+    if let Some(m) = msg {
+        let c = repo.commit(m)?;
+        let ix = repo.index();
+        writeln!(out, "[{}] {}", ix.short(&c.id()), c.message)?;
+    }
+    Ok(())
+}
+
+fn checkout(
+    repo: &mut Repo,
+    id: Option<&str>,
+    force: bool,
+    out: &mut dyn Write,
+    warn: &mut dyn Write,
+) -> Result<(), Error> {
+    let root = repo.root();
+    let blobs = repo.blobs()?;
+    blobs.sweep_temps()?;
+    wd::sweep_tmp(&repo.dir)?;
+    let ix = repo.index();
+    let v = match (id, wd::interrupted(&repo.dir)?) {
+        (Some(id), _) => resolve(repo, &ix, id)?,
+        (None, Some(f)) => match Version::downclose(&repo.store, f.iter().copied()) {
+            Ok(v) => {
+                writeln!(
+                    warn,
+                    "warning: resuming interrupted checkout of {}",
+                    ix.short(&VersionId::of_frontier(&f))
+                )?;
+                v
+            }
+            Err(_) => {
+                writeln!(
+                    warn,
+                    "warning: interrupted checkout names unknown ops; checking out head"
+                )?;
+                repo.head()
+            }
+        },
+        (None, None) => repo.head(),
+    };
+    let ev = evaluate(v.resolve(&repo.store));
+    let proj = project(&ev.state);
+    let idx = match load_index(repo, warn) {
+        Ok(i) => i,
+        Err(e) if force => {
+            writeln!(warn, "warning: {e}; ignoring the index (--force)")?;
+            Index::default()
+        }
+        Err(e) => return Err(e),
+    };
+    let mut ws = Vec::new();
+    let w = wd::scan(&root, &idx, &mut ws)?;
+    let frontier = v.frontier(&repo.store);
+    let plan = wd::plan(
+        &Target {
+            state: &ev.state,
+            proj: &proj,
+            frontier: frontier.clone(),
+        },
+        &idx,
+        &w,
+        &blobs,
+        &PlanOpts {
+            force,
+            restore_missing: true,
+            case_insensitive: wd::case_insensitive(&repo.dir)?,
+        },
+    )?;
+    let (written, removed) = plan.counts();
+    ws.extend(wd::apply(plan, &root, &repo.dir)?);
+    print_warnings(warn, &ws)?;
+    let vid = VersionId::of_frontier(&frontier);
+    writeln!(
+        out,
+        "checked out {} ({written} written, {removed} removed)",
+        ix.short(&vid)
+    )?;
+    let mut f = frontier;
+    f.sort();
+    if f != repo.head_frontier() {
+        writeln!(
+            out,
+            "note: not at head; `hub record` and mkdir/touch/mv/rm need `hub checkout` (head) first"
+        )?;
+    }
+    Ok(())
+}
+
 pub const HELP: &str = "\
 hub - CRDT-native source control (experimental, single local replica)
 
 Usage: hub <command> [args]
 
+The working directory is the directory containing .hub/ (minus .hub/).
+
 Commands:
   init                 create .hub/ in the current directory
-  mkdir <path>         create a directory
-  touch <path>         create an empty file node
-  mv <from> <to>       move/rename a node (<to> must not exist)
-  rm <path>            delete a node (moves it to TRASH)
-  ls [path]            list the projected tree (optionally under <path>)
-  status               tree, conflicts, name collisions and head version
-  commit -m <msg>      checkpoint the current version (local, private)
+  record [-m <msg>]    record working-directory changes as ops (-m: also checkpoint)
+  checkout [--force] [<short-id>]  write a version (default: head) to the working directory
+  mkdir <path>         create a directory (op + working directory)
+  touch <path>         create an empty file (op + working directory)
+  mv <from> <to>       move/rename a node, <to> must not exist (op + working directory)
+  rm <path>            delete a node, moves it to TRASH (op + working directory)
+  ls [-l] [path]       list the projected head tree (-l: node ids, blob ids)
+  status               head, conflicts, unrecorded working-directory changes, tree
+  commit -m <msg>      checkpoint the current head (local, private)
   log                  list checkpoints with short version ids, newest first
-  show <short-id>      print the tree of a version (hex prefix, >= 4 digits)
+  show [-l] <short-id> print the tree of a version (hex prefix, >= 4 digits)
   help, --help         show this help
 ";
 
@@ -450,16 +838,18 @@ pub fn run(
         return Ok(());
     }
     let known = [
-        "mkdir", "touch", "mv", "rm", "ls", "status", "commit", "log", "show",
+        "mkdir", "touch", "mv", "rm", "ls", "status", "commit", "log", "show", "record", "checkout",
     ];
     if !known.contains(&a[0]) {
         return err(format!("unknown command '{}' (see hub --help)", a[0]));
     }
-    // Mutating commands hold an exclusive lock from replay to append;
-    // read-only commands take a shared lock so they never observe a
-    // half-applied writer (and so a torn-tail truncation during their replay
-    // cannot race a writer's append).
-    let mode = if matches!(a[0], "mkdir" | "touch" | "mv" | "rm" | "commit") {
+    // Mutating commands hold an exclusive lock from replay to append (and,
+    // for record/checkout, across the working-directory update and index
+    // write); read-only commands take a shared lock.
+    let mode = if matches!(
+        a[0],
+        "mkdir" | "touch" | "mv" | "rm" | "commit" | "record" | "checkout"
+    ) {
         LockMode::Exclusive
     } else {
         LockMode::Shared
@@ -478,7 +868,7 @@ pub fn run(
             } else {
                 Kind::File
             };
-            repo.mint(Payload::Create { kind, parent, name })?;
+            mutate(&mut repo, Payload::Create { kind, parent, name }, warn)?;
         }
         ["mv", from, to] => {
             let node = lookup(&proj, from)?;
@@ -489,18 +879,38 @@ pub fn run(
             if is_ancestor_or_self(&state, node, new_parent) {
                 return err(format!("cannot move '{from}' into itself"));
             }
-            repo.mint(Payload::Move {
-                node,
-                new_parent,
-                new_name,
-            })?;
+            mutate(
+                &mut repo,
+                Payload::Move {
+                    node,
+                    new_parent,
+                    new_name,
+                },
+                warn,
+            )?;
         }
         ["rm", p] => {
             let node = lookup(&proj, p)?;
             if node == hub_core::tree::ROOT {
                 return err("cannot remove the root");
             }
-            repo.mint(Payload::Delete { node })?;
+            mutate(&mut repo, Payload::Delete { node }, warn)?;
+        }
+        ["record"] => record(&mut repo, None, out, warn)?,
+        ["record", "-m", msg] => record(&mut repo, Some(msg), out, warn)?,
+        ["checkout", rest @ ..] => {
+            let force = rest.contains(&"--force");
+            let ids: Vec<&str> = rest.iter().copied().filter(|x| *x != "--force").collect();
+            match ids.as_slice() {
+                [] => checkout(&mut repo, None, force, out, warn)?,
+                [id] if !id.starts_with('-') => checkout(&mut repo, Some(id), force, out, warn)?,
+                _ => return Err(usage("checkout")),
+            }
+        }
+        ["ls", "-l"] => {
+            for l in render_long(&state, &proj) {
+                writeln!(out, "{l}")?;
+            }
         }
         ["ls"] | ["ls", _] => {
             let under = match a.get(1) {
@@ -532,6 +942,29 @@ pub fn run(
                     writeln!(out, "  {c}")?;
                 }
             }
+            if wd::interrupted(&repo.dir)?.is_some() {
+                writeln!(out, "interrupted checkout: run `hub checkout` to finish it")?;
+            }
+            let idx = load_index(&repo, warn)?;
+            if idx.base != repo.head_frontier() {
+                writeln!(
+                    out,
+                    "working directory at version {} (not head)",
+                    ix.short(&VersionId::of_frontier(&idx.base))
+                )?;
+            }
+            let mut ws = Vec::new();
+            let w = wd::scan(&repo.root(), &idx, &mut ws)?;
+            print_warnings(warn, &ws)?;
+            let changes = wd::diff(&idx, &w);
+            if changes.is_empty() {
+                writeln!(out, "working directory: clean")?;
+            } else {
+                writeln!(out, "unrecorded changes:")?;
+                for l in wd::render_changes(&changes, &idx, &w) {
+                    writeln!(out, "  {l}")?;
+                }
+            }
             writeln!(out, "tree:")?;
             for l in render_tree(&state, &proj, hub_core::tree::ROOT) {
                 writeln!(out, "  {l}")?;
@@ -549,21 +982,10 @@ pub fn run(
                 writeln!(out, "{} {}", ix.short(&c.id()), c.message)?;
             }
         }
-        ["show", id] => {
+        ["show", id] | ["show", "-l", id] => {
+            let long = a.len() == 3;
             let ix = repo.index();
-            let v = ix.resolve_version(&repo.store, id).map_err(|e| match e {
-                ResolveError::InvalidPrefix => {
-                    Error(format!("invalid version id '{id}' (need 4-64 hex digits)"))
-                }
-                ResolveError::NotFound => Error(format!("unknown version '{id}'")),
-                ResolveError::Ambiguous(ids) => Error(format!(
-                    "ambiguous version '{id}': {}",
-                    ids.iter()
-                        .map(|i| ix.short(i))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )),
-            })?;
+            let v = resolve(&repo, &ix, id)?;
             let ev = evaluate(v.resolve(&repo.store));
             let p = project(&ev.state);
             let vid = hub_core::checkpoint::version_id(&repo.store, &v);
@@ -576,7 +998,12 @@ pub fn run(
             for m in msgs.get(&vid).into_iter().flatten() {
                 writeln!(out, "    {m}")?;
             }
-            for l in render_tree(&ev.state, &p, hub_core::tree::ROOT) {
+            let lines = if long {
+                render_long(&ev.state, &p)
+            } else {
+                render_tree(&ev.state, &p, hub_core::tree::ROOT)
+            };
+            for l in lines {
                 writeln!(out, "{l}")?;
             }
         }
