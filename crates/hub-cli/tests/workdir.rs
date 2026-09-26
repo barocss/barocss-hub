@@ -447,3 +447,207 @@ fn corrupt_blob_is_detected_on_read() {
     ok(&d, &["checkout"]);
     assert_eq!(fs::read(d.join("f")).unwrap(), b"precious");
 }
+
+/// Issue #19 repair: temps live in `.hub/tmp/`; an untracked file named
+/// like the old `.<name>.hub-tmp` scheme is never touched, and a leftover
+/// temp is never seen by status or record.
+#[test]
+fn old_temp_name_survives_checkout_and_leftover_temps_are_invisible() {
+    let d = tmp("tmpname");
+    ok(&d, &["init"]);
+    write(&d, "README", b"v1");
+    let c1 = short_of(ok(&d, &["record", "-m", "one"]).lines().last().unwrap());
+    write(&d, "README", b"v2");
+    ok(&d, &["record", "-m", "two"]);
+    write(&d, ".README.hub-tmp", b"precious");
+    ok(&d, &["checkout", &c1]);
+    assert_eq!(fs::read(d.join("README")).unwrap(), b"v1");
+    assert_eq!(fs::read(d.join(".README.hub-tmp")).unwrap(), b"precious");
+    ok(&d, &["checkout"]);
+    assert_eq!(fs::read(d.join("README")).unwrap(), b"v2");
+    assert_eq!(fs::read(d.join(".README.hub-tmp")).unwrap(), b"precious");
+    fs::remove_file(d.join(".README.hub-tmp")).unwrap();
+
+    // A crash leftover in .hub/tmp/: invisible to status and record, and
+    // swept by the next exclusive writer.
+    write(&d, ".hub/tmp/w-1-2-3", b"torn");
+    let st = ok(&d, &["status"]);
+    assert!(st.contains("working directory: clean"), "{st}");
+    assert!(ok(&d, &["record"]).contains("nothing to record"));
+    assert!(!d.join(".hub/tmp/w-1-2-3").exists(), "swept");
+    assert!(!long(&ok(&d, &["ls", "-l"]))
+        .keys()
+        .any(|p| p.contains("tmp")));
+    // No temp is left in the working tree or .hub/tmp after checkouts.
+    let names: Vec<_> = snapshot(&d).into_keys().collect();
+    assert_eq!(names, vec!["README".to_string()]);
+    assert_eq!(fs::read_dir(d.join(".hub/tmp")).unwrap().count(), 0);
+}
+
+/// Several same-blob candidates are ambiguous: delete + create, no rename.
+#[test]
+fn ambiguous_rename_falls_back_to_delete_and_create() {
+    // Two deleted, one added.
+    let d = tmp("ambig1");
+    ok(&d, &["init"]);
+    write(&d, "a", b"same");
+    write(&d, "b", b"same");
+    ok(&d, &["record"]);
+    let before = long(&ok(&d, &["ls", "-l"]));
+    fs::remove_file(d.join("a")).unwrap();
+    fs::remove_file(d.join("b")).unwrap();
+    write(&d, "c", b"same");
+    let r = ok(&d, &["record"]);
+    assert!(!r.contains("renamed:"), "{r}");
+    for l in ["deleted:  a", "deleted:  b", "added:    c"] {
+        assert!(r.contains(l), "{r}");
+    }
+    let after = long(&ok(&d, &["ls", "-l"]));
+    assert_eq!(after.keys().collect::<Vec<_>>(), vec!["c"]);
+    assert!(before.values().all(|(n, _)| *n != after["c"].0), "new node");
+
+    // One deleted, two added.
+    let d = tmp("ambig2");
+    ok(&d, &["init"]);
+    write(&d, "a", b"same");
+    ok(&d, &["record"]);
+    let before = long(&ok(&d, &["ls", "-l"]));
+    fs::remove_file(d.join("a")).unwrap();
+    write(&d, "b", b"same");
+    write(&d, "c", b"same");
+    let r = ok(&d, &["record"]);
+    assert!(!r.contains("renamed:"), "{r}");
+    for l in ["deleted:  a", "added:    b", "added:    c"] {
+        assert!(r.contains(l), "{r}");
+    }
+    let after = long(&ok(&d, &["ls", "-l"]));
+    assert!(
+        after.values().all(|(n, _)| *n != before["a"].0),
+        "new nodes"
+    );
+}
+
+/// A crash mid-checkout leaves the marker; record and tree edits refuse
+/// until `hub checkout` finishes (resuming the interrupted target).
+#[test]
+fn interrupted_checkout_blocks_record_until_checkout_completes() {
+    let d = tmp("midcheckout");
+    ok(&d, &["init"]);
+    write(&d, "a", b"a1");
+    write(&d, "b", b"b1");
+    let c1 = short_of(ok(&d, &["record", "-m", "one"]).lines().last().unwrap());
+    write(&d, "a", b"a2");
+    write(&d, "b", b"b2");
+    ok(&d, &["record", "-m", "two"]);
+    let o = hub_env(&d, &["checkout", &c1], &[(hub_cli::wd::CRASH_ENV, "1")]);
+    assert!(!o.status.success(), "must have aborted");
+    assert!(d.join(".hub/checkout-in-progress").exists());
+    // Exactly one file was switched to the target: a half-checked-out tree.
+    let snap = snapshot(&d);
+    let n1 = snap
+        .values()
+        .filter(|v| v.as_deref().is_some_and(|b| b.ends_with(b"1")))
+        .count();
+    assert_eq!(n1, 1, "{snap:?}");
+
+    for args in [
+        &["record"][..],
+        &["record", "-m", "x"],
+        &["touch", "z"],
+        &["rm", "a"],
+    ] {
+        let e = fail(&d, args);
+        assert!(e.contains("checkout was interrupted"), "{args:?}: {e}");
+    }
+    assert!(ok(&d, &["status"]).contains("interrupted checkout"));
+    let ops = fs::read_to_string(d.join(".hub/ops.log")).unwrap();
+
+    // `hub checkout` resumes the interrupted target without --force.
+    let o = hub(&d, &["checkout"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("resuming interrupted checkout"));
+    assert!(!d.join(".hub/checkout-in-progress").exists());
+    assert_eq!(fs::read(d.join("a")).unwrap(), b"a1");
+    assert_eq!(fs::read(d.join("b")).unwrap(), b"b1");
+    assert_eq!(
+        fs::read_to_string(d.join(".hub/ops.log")).unwrap(),
+        ops,
+        "nothing recorded"
+    );
+    ok(&d, &["checkout"]);
+    assert_eq!(fs::read(d.join("a")).unwrap(), b"a2");
+    assert!(ok(&d, &["record"]).contains("nothing to record"));
+}
+
+fn index_line<'a>(idx: &'a str, path: &str) -> &'a str {
+    idx.lines()
+        .find(|l| l.starts_with(&format!("f {} ", hub_cli::store::esc(path))))
+        .unwrap()
+}
+
+/// Racy-git: freshly written entries are smudged to `0 0`, and the stat
+/// cache is trusted only if the file is strictly older than the index.
+#[test]
+fn racy_entries_are_smudged_and_guard_is_enforced() {
+    let d = tmp("racy");
+    ok(&d, &["init"]);
+    write(&d, "f", b"aaaa");
+    ok(&d, &["record"]);
+    let ip = d.join(".hub/index");
+    let text = fs::read_to_string(&ip).unwrap();
+    assert!(index_line(&text, "f").ends_with(" 0 0"), "smudged: {text}");
+
+    // Same-size edit; forge a cache entry matching the new stat.
+    write(&d, "f", b"bbbb");
+    let md = fs::metadata(d.join("f")).unwrap();
+    let mt = md
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let line = index_line(&text, "f");
+    let mut t: Vec<&str> = line.split(' ').collect();
+    let (sz, ms) = (md.len().to_string(), mt.to_string());
+    t[4] = &sz;
+    t[5] = &ms;
+    let forged = text.replace(line, &t.join(" "));
+    let set_idx_mtime = |at: std::time::SystemTime| {
+        fs::write(&ip, &forged).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&ip)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    };
+    // Index not strictly newer than the file: racy, rehashed, detected.
+    set_idx_mtime(md.modified().unwrap());
+    assert!(ok(&d, &["status"]).contains("modified: f"));
+    // Index clearly newer: the forged cache is trusted (proves the guard is
+    // what caught the edit above).
+    set_idx_mtime(md.modified().unwrap() + std::time::Duration::from_secs(10));
+    assert!(ok(&d, &["status"]).contains("working directory: clean"));
+}
+
+#[test]
+fn broken_pipe_is_quiet() {
+    let d = tmp("epipe");
+    ok(&d, &["init"]);
+    ok(&d, &["commit", "-m", "c"]);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_hub"))
+        .arg("log")
+        .current_dir(&d)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(c.stdout.take()); // reader goes away before hub writes
+    let o = c.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        o.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}

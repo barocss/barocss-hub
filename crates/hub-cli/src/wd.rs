@@ -17,7 +17,12 @@
 //! of the file as hub last wrote or read it; `0 0` means "unknown, rehash".
 //! A file's cached blob is trusted only if size and mtime match *and* its
 //! mtime is strictly older than the index file's own mtime (racy-git guard);
-//! otherwise it is rehashed.
+//! otherwise it is rehashed. On save, entries whose mtime is within
+//! `RACY_NS` of the save time are smudged to `0 0` (git's racy-clean fix for
+//! coarse-mtime filesystems).
+//!
+//! Temps for working files live in `.hub/tmp/` (never scanned); an
+//! interrupted checkout leaves `.hub/checkout-in-progress`, see [`apply`].
 //!
 //! A missing index means nothing was materialized yet: base = genesis, no
 //! entries.
@@ -36,6 +41,8 @@ use crate::store::{self, esc, fmt_id, unesc};
 use crate::{Error, HUB_DIR};
 
 pub const INDEX_HEADER: &str = "barocss-hub/index/v0";
+/// Racy window (ns): covers 2 s mtime granularity (FAT/HFS+/some network fs).
+pub const RACY_NS: u128 = 2_000_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Entry {
@@ -166,7 +173,15 @@ impl Index {
         })
     }
 
+    /// Writes the index. Racy-git smudging: a file entry whose mtime is
+    /// within [`RACY_NS`] of now is stored as `0 0` (rehash next time), so
+    /// an edit landing in the same coarse mtime tick as hub's stat can never
+    /// be trusted as clean.
     pub fn save(&self, hub_dir: &Path) -> Result<(), Error> {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(u128::MAX);
         let mut s = format!("{INDEX_HEADER}\nbase ");
         if self.base.is_empty() {
             s.push('-');
@@ -178,12 +193,19 @@ impl Index {
         for (p, (n, e)) in &self.entries {
             match e {
                 Entry::Dir => s.push_str(&format!("d {} {}\n", esc(p), fmt_id(*n))),
-                Entry::File { blob, size, mtime } => s.push_str(&format!(
-                    "f {} {} {} {size} {mtime}\n",
-                    esc(p),
-                    fmt_id(*n),
-                    blob.hex()
-                )),
+                Entry::File { blob, size, mtime } => {
+                    let (size, mtime) = if mtime.saturating_add(RACY_NS) >= now {
+                        (&0, &0)
+                    } else {
+                        (size, mtime)
+                    };
+                    s.push_str(&format!(
+                        "f {} {} {} {size} {mtime}\n",
+                        esc(p),
+                        fmt_id(*n),
+                        blob.hex()
+                    ))
+                }
             }
         }
         store::write_atomic(&Self::path(hub_dir), s.as_bytes())?;
@@ -661,26 +683,137 @@ pub fn plan(
     Ok(p)
 }
 
-/// Crash-safe working-file write: `.<name>.hub-tmp` in the same directory,
-/// fsync, rename over the target.
-fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let tmp = dir.join(format!(
-        ".{}.hub-tmp",
-        path.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+/// Directory (under `.hub/`) holding in-flight working-file temps.
+pub const TMP_DIR: &str = "tmp";
+/// Checkout-in-progress marker (under `.hub/`), see [`apply`].
+pub const MARKER: &str = "checkout-in-progress";
+/// Test-only fault injection: when set, [`apply`] aborts the process right
+/// after writing the first working file (marker present, index not saved).
+pub const CRASH_ENV: &str = "HUB_TEST_CRASH_IN_CHECKOUT";
+
+/// Remove leftover working-file temps under `.hub/tmp/`. Callers hold the
+/// exclusive repo lock, so no live writer owns them.
+pub fn sweep_tmp(hub_dir: &Path) -> io::Result<usize> {
+    let dir = hub_dir.join(TMP_DIR);
+    let rd = match fs::read_dir(&dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut n = 0;
+    for e in rd {
+        let e = e?;
+        fs::remove_file(e.path())?;
+        n += 1;
     }
-    fs::rename(&tmp, path)
+    Ok(n)
+}
+
+/// Frontier recorded by an interrupted checkout, if its marker exists.
+pub fn interrupted(hub_dir: &Path) -> Result<Option<Vec<OpId>>, Error> {
+    let p = hub_dir.join(MARKER);
+    let text = match fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let ids = text.lines().nth(1).and_then(|l| l.strip_prefix("target "));
+    let f = match ids {
+        Some("-") => Vec::new(),
+        Some(ids) => ids
+            .split(',')
+            .map(parse_id)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|w| Error(format!("corrupt {}: {w}", p.display())))?,
+        None => return Err(Error(format!("corrupt {}", p.display()))),
+    };
+    Ok(Some(f))
+}
+
+fn fmt_frontier(f: &[OpId]) -> String {
+    if f.is_empty() {
+        "-".into()
+    } else {
+        f.iter().map(|i| fmt_id(*i)).collect::<Vec<_>>().join(",")
+    }
+}
+
+/// Crash-safe working-file write. The temp is a fresh, uniquely named file
+/// in `.hub/tmp/` created with `create_new` (O_EXCL), so it never truncates
+/// or replaces anything, and is never part of the working directory (scans
+/// skip `.hub/`). It is fsynced, then renamed over the target. `.hub/` lives
+/// inside the working directory; [`apply`] checks both are on the same
+/// device so the rename is atomic.
+fn write_file(tmp_dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    loop {
+        let tmp = tmp_dir.join(format!(
+            "w-{}-{nanos}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut f = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let r = f
+            .write_all(bytes)
+            .and_then(|_| f.sync_all())
+            .and_then(|_| fs::rename(&tmp, path));
+        if r.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        return r;
+    }
+}
+
+#[cfg(unix)]
+fn same_device(a: &Path, b: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(fs::metadata(a)?.dev() == fs::metadata(b)?.dev())
+}
+#[cfg(not(unix))]
+fn same_device(_: &Path, _: &Path) -> io::Result<bool> {
+    Ok(true)
 }
 
 /// Execute a plan under `root` and write the new index.
+///
+/// Before any working-directory change, `.hub/checkout-in-progress` is
+/// written durably (it names the target frontier); it is removed only after
+/// the new index is saved. While it exists, record and mkdir/touch/mv/rm
+/// refuse and `hub checkout` (no id) resumes the interrupted target.
 pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error> {
     let mut warnings = p.warnings;
+    let tmp_dir = hub_dir.join(TMP_DIR);
+    fs::create_dir_all(&tmp_dir)?;
+    if !same_device(root, &tmp_dir)? {
+        return Err(Error(format!(
+            "{} is on a different filesystem than the working directory; atomic writes need both on one filesystem",
+            tmp_dir.display()
+        )));
+    }
+    let marker = hub_dir.join(MARKER);
+    store::write_atomic(
+        &marker,
+        format!(
+            "barocss-hub/checkout/v0\ntarget {}\n",
+            fmt_frontier(&p.base)
+        )
+        .as_bytes(),
+    )?;
+    let crash = std::env::var_os(CRASH_ENV).is_some();
     for path in &p.force_remove {
         let fp = root.join(path);
         match fs::symlink_metadata(&fp) {
@@ -708,7 +841,10 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
         fs::create_dir_all(root.join(path))?;
     }
     for (path, bytes) in &p.write_files {
-        write_file(&root.join(path), bytes)?;
+        write_file(&tmp_dir, &root.join(path), bytes)?;
+        if crash {
+            std::process::abort();
+        }
     }
     let mut idx = Index {
         base: p.base,
@@ -729,5 +865,7 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
         idx.entries.insert(path, (node, e));
     }
     idx.save(hub_dir)?;
+    fs::remove_file(&marker)?;
+    fs::File::open(hub_dir)?.sync_all()?;
     Ok(warnings)
 }

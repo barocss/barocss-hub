@@ -171,8 +171,12 @@ fn truncated_tail_is_recovered_and_reported() {
     // Issue #19: the index still names the dropped op, so the working
     // directory is "not at head" until a checkout re-materializes head.
     assert!(fail(&d, &["touch", "a/y"]).contains("run `hub checkout`"));
-    ok(&d, &["checkout"]);
-    assert!(!d.join("a/y").exists());
+    // The index names an op the log no longer has, so it is distrusted:
+    // `a/y` is treated as unrecorded and kept (never deleted as "clean").
+    let o = hub(&d, &["checkout"]);
+    assert!(o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("treating all working files as unrecorded"));
+    assert!(d.join("a/y").exists());
     ok(&d, &["touch", "a/y"]);
     assert_eq!(ok(&d, &["ls"]), "a/\na/x\na/y\n");
     assert!(hub(&d, &["ls"]).stderr.is_empty());

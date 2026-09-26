@@ -12,6 +12,7 @@ fn main() -> ExitCode {
     let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
     match hub_cli::run(&args, &cwd, &mut out, &mut err) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.is_broken_pipe() => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("hub: {e}");
             ExitCode::FAILURE

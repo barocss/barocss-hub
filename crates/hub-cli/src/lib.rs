@@ -43,8 +43,21 @@ impl From<StoreError> for Error {
     }
 }
 
+/// Message of the error produced when stdout's reader went away (EPIPE,
+/// e.g. `hub log | head -1`); `main` exits quietly on it.
+pub const BROKEN_PIPE: &str = "broken pipe";
+
+impl Error {
+    pub fn is_broken_pipe(&self) -> bool {
+        self.0 == BROKEN_PIPE
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            return Error(BROKEN_PIPE.into());
+        }
         Error(format!("i/o error: {e}"))
     }
 }
@@ -463,6 +476,33 @@ fn not_at_head(repo: &Repo, idx: &Index) -> Error {
     ))
 }
 
+/// Load the index, distrusting it when its base names ops the log does not
+/// have (e.g. a torn tail was dropped): then every on-disk path is treated
+/// as unrecorded (never clean), so no checkout deletes or overwrites it
+/// without `--force`.
+fn load_index(repo: &Repo, warn: &mut dyn Write) -> Result<Index, Error> {
+    let idx = Index::load(&repo.dir)?;
+    if idx.base.iter().any(|id| !repo.store.contains_key(id)) {
+        writeln!(
+            warn,
+            "warning: the index names ops missing from the log; treating all working files as unrecorded"
+        )?;
+        return Ok(Index::default());
+    }
+    Ok(idx)
+}
+
+/// Refuse while an interrupted checkout's marker exists.
+fn refuse_if_interrupted(repo: &Repo) -> Result<(), Error> {
+    if wd::interrupted(&repo.dir)?.is_some() {
+        return err(
+            "a checkout was interrupted; the working directory is partly updated. \
+             Run `hub checkout` to finish it before recording or changing the tree",
+        );
+    }
+    Ok(())
+}
+
 fn print_warnings(warn: &mut dyn Write, ws: &[String]) -> Result<(), Error> {
     for w in ws {
         writeln!(warn, "warning: {w}")?;
@@ -475,7 +515,8 @@ fn print_warnings(warn: &mut dyn Write, ws: &[String]) -> Result<(), Error> {
 /// update appends nothing.
 fn mutate(repo: &mut Repo, payload: Payload, warn: &mut dyn Write) -> Result<(), Error> {
     let root = repo.root();
-    let idx = Index::load(&repo.dir)?;
+    refuse_if_interrupted(repo)?;
+    let idx = load_index(repo, warn)?;
     if idx.base != repo.head_frontier() {
         return Err(not_at_head(repo, &idx));
     }
@@ -511,6 +552,8 @@ fn record(
     warn: &mut dyn Write,
 ) -> Result<(), Error> {
     let root = repo.root();
+    refuse_if_interrupted(repo)?;
+    wd::sweep_tmp(&repo.dir)?;
     let blobs = repo.blobs()?;
     let swept = blobs.sweep_temps()?;
     if swept > 0 {
@@ -519,7 +562,7 @@ fn record(
             "warning: removed {swept} incomplete blob temp file(s) left by an interrupted write"
         )?;
     }
-    let idx = Index::load(&repo.dir)?;
+    let idx = load_index(repo, warn)?;
     if idx.base != repo.head_frontier() {
         return Err(not_at_head(repo, &idx));
     }
@@ -666,14 +709,32 @@ fn checkout(
     let root = repo.root();
     let blobs = repo.blobs()?;
     blobs.sweep_temps()?;
+    wd::sweep_tmp(&repo.dir)?;
     let ix = repo.index();
-    let v = match id {
-        Some(id) => resolve(repo, &ix, id)?,
-        None => repo.head(),
+    let v = match (id, wd::interrupted(&repo.dir)?) {
+        (Some(id), _) => resolve(repo, &ix, id)?,
+        (None, Some(f)) => match Version::downclose(&repo.store, f.iter().copied()) {
+            Ok(v) => {
+                writeln!(
+                    warn,
+                    "warning: resuming interrupted checkout of {}",
+                    ix.short(&VersionId::of_frontier(&f))
+                )?;
+                v
+            }
+            Err(_) => {
+                writeln!(
+                    warn,
+                    "warning: interrupted checkout names unknown ops; checking out head"
+                )?;
+                repo.head()
+            }
+        },
+        (None, None) => repo.head(),
     };
     let ev = evaluate(v.resolve(&repo.store));
     let proj = project(&ev.state);
-    let idx = match Index::load(&repo.dir) {
+    let idx = match load_index(repo, warn) {
         Ok(i) => i,
         Err(e) if force => {
             writeln!(warn, "warning: {e}; ignoring the index (--force)")?;
@@ -881,7 +942,10 @@ pub fn run(
                     writeln!(out, "  {c}")?;
                 }
             }
-            let idx = Index::load(&repo.dir)?;
+            if wd::interrupted(&repo.dir)?.is_some() {
+                writeln!(out, "interrupted checkout: run `hub checkout` to finish it")?;
+            }
+            let idx = load_index(&repo, warn)?;
             if idx.base != repo.head_frontier() {
                 writeln!(
                     out,
