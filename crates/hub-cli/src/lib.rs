@@ -371,6 +371,26 @@ fn render_conflicts(proj: &Projection, conflicts: &BTreeSet<Conflict>) -> Vec<St
                 short_id(*mv),
                 short_id(*delete)
             ),
+            Conflict::Content {
+                node,
+                winner,
+                loser,
+                winner_blob,
+                loser_blob,
+            } => format!(
+                "content: {} set by {} (blob {}) overwritten by {} (blob {})",
+                name(*node),
+                short_id(*loser),
+                &loser_blob.hex()[..8],
+                short_id(*winner),
+                &winner_blob.hex()[..8]
+            ),
+            Conflict::EditDeleted { node, edit, delete } => format!(
+                "edit-deleted: content edit {} of {} kept on trashed node (delete {})",
+                short_id(*edit),
+                name(*node),
+                short_id(*delete)
+            ),
         });
     }
     out

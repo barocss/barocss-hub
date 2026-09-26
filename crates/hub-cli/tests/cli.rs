@@ -295,3 +295,66 @@ fn usage_shows_arguments() {
     assert!(fail(&d, &["mv", "a"]).contains("usage: hub mv <from> <to>"));
     assert!(fail(&d, &["init", "x"]).contains("usage: hub init"));
 }
+
+#[test]
+fn status_renders_content_conflicts() {
+    use hub_core::tree::{BlobId, Kind, NodeId, Op, Payload};
+    let d = tmp("content");
+    ok(&d, &["init"]);
+    ok(&d, &["touch", "a.txt"]);
+    ok(&d, &["touch", "b.txt"]);
+    {
+        let mut repo = hub_cli::Repo::discover(&d).unwrap();
+        let files: Vec<NodeId> = repo
+            .state()
+            .values()
+            .filter(|n| n.kind == Kind::File)
+            .map(|n| n.id)
+            .collect();
+        let (a, b) = (files[0], files[1]);
+        let tip = *repo.store.keys().max().unwrap();
+        let mk = |c, r, payload| Op {
+            id: NodeId::new(c, r),
+            deps: [tip].into_iter().collect(),
+            payload,
+        };
+        // Two concurrent SetContents of a; concurrent edit and delete of b.
+        for op in [
+            mk(
+                100,
+                0x111,
+                Payload::SetContent {
+                    node: a,
+                    blob: BlobId::of(b"x"),
+                },
+            ),
+            mk(
+                100,
+                0x222,
+                Payload::SetContent {
+                    node: a,
+                    blob: BlobId::of(b"y"),
+                },
+            ),
+            mk(
+                100,
+                0x333,
+                Payload::SetContent {
+                    node: b,
+                    blob: BlobId::of(b"z"),
+                },
+            ),
+            mk(100, 0x444, Payload::Delete { node: b }),
+        ] {
+            repo.append_op(op).unwrap();
+        }
+    }
+    let s = ok(&d, &["status"]);
+    assert!(
+        s.contains("content: /a.txt set by") || s.contains("content: a.txt set by"),
+        "{s}"
+    );
+    assert!(s.contains("overwritten by"), "{s}");
+    assert!(s.contains("edit-deleted: content edit"), "{s}");
+    assert!(s.contains("kept on trashed node"), "{s}");
+}
