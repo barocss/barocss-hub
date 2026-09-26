@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+sha2 = "0.10"
 
 [dev-dependencies]
 proptest = "1"
