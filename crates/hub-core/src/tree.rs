@@ -7,6 +7,64 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use sha2::{Digest, Sha256};
+
+/// Content address of a whole-file blob: SHA-256 of its bytes (Issue #18).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BlobId(pub [u8; 32]);
+
+impl BlobId {
+    /// SHA-256 of `bytes`.
+    pub fn of(bytes: &[u8]) -> Self {
+        BlobId(Sha256::digest(bytes).into())
+    }
+    /// Content of a newly created File: the empty blob.
+    pub fn empty() -> Self {
+        Self::of(&[])
+    }
+    pub fn hex(&self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+impl std::fmt::Debug for BlobId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BlobId({})", &self.hex()[..12])
+    }
+}
+
+/// In-memory content-addressed blob store (v0; no disk, no chunking).
+#[derive(Clone, Debug, Default)]
+pub struct BlobStore {
+    blobs: BTreeMap<BlobId, Vec<u8>>,
+}
+
+impl BlobStore {
+    pub fn new() -> Self {
+        let mut s = BlobStore::default();
+        s.put(&[]);
+        s
+    }
+    /// Store `bytes`, returning their id. Idempotent.
+    pub fn put(&mut self, bytes: &[u8]) -> BlobId {
+        let id = BlobId::of(bytes);
+        self.blobs.entry(id).or_insert_with(|| bytes.to_vec());
+        id
+    }
+    pub fn get(&self, id: &BlobId) -> Option<&[u8]> {
+        self.blobs.get(id).map(|v| v.as_slice())
+    }
+    pub fn contains(&self, id: &BlobId) -> bool {
+        self.blobs.contains_key(id)
+    }
+    pub fn len(&self) -> usize {
+        self.blobs.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.blobs.is_empty()
+    }
+}
+
 /// 128-bit replica id. `ZERO` is reserved and never generated (§1.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReplicaId(pub u128);
@@ -59,6 +117,9 @@ pub struct Node {
     pub kind: Kind,
     pub parent: Option<NodeId>,
     pub name: String,
+    /// Whole-file content of a File (`Some`, empty blob at creation);
+    /// `None` for Root/Directory (Issue #18).
+    pub content: Option<BlobId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +137,11 @@ pub enum Payload {
     Delete {
         node: NodeId,
     },
+    /// Whole-file replace of a File's content (§2.2 `SetContent`, v0 Bytes).
+    SetContent {
+        node: NodeId,
+        blob: BlobId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,7 +156,15 @@ impl Op {
     pub fn moved_node(&self) -> Option<NodeId> {
         match &self.payload {
             Payload::Move { node, .. } | Payload::Delete { node } => Some(*node),
-            Payload::Create { .. } => None,
+            Payload::Create { .. } | Payload::SetContent { .. } => None,
+        }
+    }
+
+    /// Node targeted by a SetContent.
+    pub fn content_node(&self) -> Option<NodeId> {
+        match &self.payload {
+            Payload::SetContent { node, .. } => Some(*node),
+            _ => None,
         }
     }
 }
@@ -118,6 +192,23 @@ pub enum Conflict {
         delete: OpId,
         mv: OpId,
     },
+    /// Content set by `loser` overwritten by a concurrent SetContent `winner`
+    /// of the same node (§2.3, Issue #18). Both blobs are kept.
+    Content {
+        node: NodeId,
+        winner: OpId,
+        loser: OpId,
+        winner_blob: BlobId,
+        loser_blob: BlobId,
+    },
+    /// Informational (Issue #18): `edit` set content of `node`, but `node` is
+    /// not live because the concurrent `delete` trashed it or an ancestor.
+    /// The content is kept on the trashed record; `edit` is not a loser.
+    EditDeleted {
+        node: NodeId,
+        edit: OpId,
+        delete: OpId,
+    },
 }
 
 /// Tree state: every node record ever validly created, keyed by id.
@@ -132,6 +223,7 @@ pub fn initial_state() -> State {
             kind: Kind::Root,
             parent: None,
             name: String::new(),
+            content: None,
         },
     );
     s.insert(
@@ -141,6 +233,7 @@ pub fn initial_state() -> State {
             kind: Kind::Directory,
             parent: None,
             name: String::new(),
+            content: None,
         },
     );
     s
@@ -181,6 +274,10 @@ enum Undo {
         parent: Option<NodeId>,
         name: String,
         setter: OpId,
+    },
+    Content {
+        node: NodeId,
+        prev: Option<BlobId>,
     },
 }
 
@@ -236,11 +333,19 @@ impl Work {
                         kind: *kind,
                         parent: Some(*parent),
                         name: name.clone(),
+                        content: (*kind == Kind::File).then(BlobId::empty),
                     },
                 );
                 self.setter.insert(op.id, op.id);
                 (Outcome::Applied, Undo::RemoveNode(op.id))
             }
+            Payload::SetContent { node, blob } => match self.state.get_mut(node) {
+                Some(rec) if rec.kind == Kind::File && !node.is_reserved() => {
+                    let prev = rec.content.replace(*blob);
+                    (Outcome::Applied, Undo::Content { node: *node, prev })
+                }
+                _ => (Outcome::Invalid, Undo::None),
+            },
             Payload::Move { .. } | Payload::Delete { .. } => {
                 let (node, new_parent, new_name) = match &op.payload {
                     Payload::Move {
@@ -252,7 +357,7 @@ impl Work {
                         Some(n) => (*node, TRASH, n.name.clone()),
                         None => return (Outcome::Invalid, Undo::None),
                     },
-                    Payload::Create { .. } => unreachable!(),
+                    Payload::Create { .. } | Payload::SetContent { .. } => unreachable!(),
                 };
                 if node.is_reserved()
                     || !self.state.contains_key(&node)
@@ -309,6 +414,9 @@ impl Work {
                 rec.parent = parent;
                 rec.name = name;
                 self.setter.insert(node, setter);
+            }
+            Undo::Content { node, prev } => {
+                self.state.get_mut(&node).unwrap().content = prev;
             }
         }
     }
@@ -415,6 +523,58 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
                     delete: did,
                     mv: mid,
                 });
+            }
+        }
+    }
+
+    // Content (§2.3, Issue #18): winner = greatest Applied SetContent of a
+    // node; every other one without a causally later SetContent of the same
+    // node is a loser with exactly one `content` conflict.
+    let mut sets: BTreeMap<NodeId, Vec<(OpId, BlobId)>> = BTreeMap::new();
+    for (id, op) in &ops {
+        if let (Payload::SetContent { node, blob }, Outcome::Applied) = (&op.payload, &outcomes[id])
+        {
+            sets.entry(*node).or_default().push((*id, *blob));
+        }
+    }
+    for (n, es) in &sets {
+        let (winner, winner_blob) = *es.last().unwrap();
+        for &(e, loser_blob) in &es[..es.len() - 1] {
+            if !es.iter().any(|&(e2, _)| past[&e2].contains(&e)) {
+                conflicts.insert(Conflict::Content {
+                    node: *n,
+                    winner,
+                    loser: e,
+                    winner_blob,
+                    loser_blob,
+                });
+            }
+        }
+    }
+    // Edit vs delete (Issue #18): an Applied SetContent E of x, x not live
+    // finally, and an Applied Delete D of d with D ∥ E, D the winner for d,
+    // d ancestor-or-self of x in the final state.
+    for es in sets.values() {
+        for &(eid, _) in es {
+            let x = ops[&eid].content_node().unwrap();
+            if is_live(&w.state, x) {
+                continue;
+            }
+            for (&did, dop) in &ops {
+                let Payload::Delete { node: d } = dop.payload else {
+                    continue;
+                };
+                if outcomes[&did] == Outcome::Applied
+                    && applied[&d].last() == Some(&did)
+                    && concurrent(did, eid)
+                    && is_ancestor_or_self(&w.state, d, x)
+                {
+                    conflicts.insert(Conflict::EditDeleted {
+                        node: x,
+                        edit: eid,
+                        delete: did,
+                    });
+                }
             }
         }
     }
@@ -543,6 +703,10 @@ pub fn check_invariants<'a>(
             if steps > state.len() {
                 return Err(format!("cycle through {:?}", n.id));
             }
+        }
+        // Content present exactly on Files (Issue #18).
+        if (n.kind == Kind::File) != n.content.is_some() {
+            return Err(format!("content/kind mismatch on {:?}", n.id));
         }
         // 6 name validity (checked for all records, stronger than live only).
         if !valid_name(&n.name) {

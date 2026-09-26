@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::tree::{Kind, NodeId, State, ROOT};
+use crate::tree::{BlobId, Kind, NodeId, State, ROOT};
 
 /// Structural name-collision conflict: `node` is projected under a
 /// disambiguated name because `winner` (smallest NodeId) holds `name`.
@@ -37,6 +37,8 @@ pub struct Projection {
     pub entries: BTreeMap<String, NodeId>,
     /// One conflict per suffixed node.
     pub collisions: BTreeSet<NameCollision>,
+    /// Content of every live File (Issue #18).
+    pub blobs: BTreeMap<NodeId, BlobId>,
 }
 
 pub fn short_id(n: NodeId) -> String {
@@ -105,8 +107,14 @@ pub fn project(state: &State) -> Projection {
             };
             out.entries.insert(path.clone(), id);
             out.paths.insert(id, path);
-            if state[&id].kind == Kind::Directory {
-                stack.push(id);
+            match state[&id].kind {
+                Kind::Directory => stack.push(id),
+                Kind::File => {
+                    if let Some(b) = state[&id].content {
+                        out.blobs.insert(id, b);
+                    }
+                }
+                Kind::Root => {}
             }
         }
     }

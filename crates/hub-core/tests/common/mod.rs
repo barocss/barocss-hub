@@ -68,7 +68,13 @@ pub fn simulate(nrep: usize, script: &[(u8, u8, u8, u8)]) -> Vec<Op> {
             .collect();
         let pick = |v: &Vec<NodeId>, i: u8| v[i as usize % v.len()];
         let name = NAMES[b as usize % NAMES.len()].to_string();
-        match act % 13 {
+        let blob = BlobId::of(&[b % 4]);
+        let files: Vec<NodeId> = st
+            .values()
+            .filter(|n| n.kind == Kind::File)
+            .map(|n| n.id)
+            .collect();
+        match act % 16 {
             0 | 1 => {
                 let kind = if b % 3 == 0 {
                     Kind::File
@@ -214,6 +220,84 @@ pub fn simulate(nrep: usize, script: &[(u8, u8, u8, u8)]) -> Vec<Op> {
                         name: name.clone(),
                     });
                     reps[o].mint(Payload::Create { kind, parent, name });
+                }
+            }
+            13 if !nodes.is_empty() => {
+                // SetContent on any known file (live or trashed); with b % 7
+                // == 0 on any node, possibly a Directory (buggy peer, invalid).
+                let node = if files.is_empty() || b % 7 == 0 {
+                    pick(&nodes, a)
+                } else {
+                    pick(&files, a)
+                };
+                reps[r].mint(Payload::SetContent { node, blob });
+            }
+            14 if nrep > 1 => {
+                // Concurrent edits of the same file by r and an unsynced o
+                // (and a third replica when present).
+                let o = (r + 1) % nrep;
+                let sto = reps[o].state();
+                let common: Vec<NodeId> = files
+                    .iter()
+                    .copied()
+                    .filter(|f| sto.contains_key(f))
+                    .collect();
+                if !common.is_empty() {
+                    let node = pick(&common, a);
+                    reps[r].mint(Payload::SetContent { node, blob });
+                    reps[o].mint(Payload::SetContent {
+                        node,
+                        blob: BlobId::of(&[b % 4, 1]),
+                    });
+                    if nrep > 2 && a % 2 == 0 {
+                        let t = (r + 2) % nrep;
+                        if reps[t].state().contains_key(&node) {
+                            reps[t].mint(Payload::SetContent {
+                                node,
+                                blob: BlobId::of(&[b % 4, 2]),
+                            });
+                        }
+                    }
+                }
+            }
+            15 if nrep > 1 => {
+                // Edit of a file concurrent with a delete of it or an
+                // ancestor, or with a move of it (b selects).
+                let o = (r + 1) % nrep;
+                let sto = reps[o].state();
+                let common: Vec<NodeId> = files
+                    .iter()
+                    .copied()
+                    .filter(|f| sto.contains_key(f))
+                    .collect();
+                if !common.is_empty() {
+                    let x = pick(&common, a);
+                    reps[r].mint(Payload::SetContent { node: x, blob });
+                    if b % 2 == 0 {
+                        let mut anc = vec![x];
+                        let mut cur = sto[&x].parent;
+                        while let Some(c) = cur {
+                            if c.is_reserved() {
+                                break;
+                            }
+                            anc.push(c);
+                            cur = sto[&c].parent;
+                        }
+                        let d = anc[b as usize / 2 % anc.len()];
+                        reps[o].mint(Payload::Delete { node: d });
+                    } else {
+                        let dests: Vec<NodeId> = sto
+                            .values()
+                            .filter(|n| n.kind != Kind::File)
+                            .map(|n| n.id)
+                            .collect();
+                        let np = dests[b as usize / 2 % dests.len()];
+                        reps[o].mint(Payload::Move {
+                            node: x,
+                            new_parent: np,
+                            new_name: name,
+                        });
+                    }
                 }
             }
             _ => {}
