@@ -21,7 +21,7 @@ use hub_core::tree::{
 };
 use hub_core::version::{Store, Version};
 
-use store::StoreError;
+use store::{LockMode, RepoLock, StoreError};
 
 pub const HUB_DIR: &str = ".hub";
 
@@ -59,6 +59,8 @@ pub struct Repo {
     pub checkpoints: Checkpoints,
     /// Human-readable notes from opening (torn-tail recovery).
     pub warnings: Vec<String>,
+    /// `.hub/lock`, held for the lifetime of the `Repo`.
+    _lock: RepoLock,
 }
 
 fn new_replica_id(root: &Path) -> ReplicaId {
@@ -105,20 +107,35 @@ impl Repo {
         Self::open_dir(dir)
     }
 
-    /// Find `.hub/` in `start` or an ancestor and open it.
+    /// Find `.hub/` in `start` or an ancestor and open it for writing
+    /// (exclusive lock).
     pub fn discover(start: &Path) -> Result<Repo, Error> {
+        Self::discover_with(start, LockMode::Exclusive)
+    }
+
+    /// Find `.hub/` in `start` or an ancestor and open it under `mode`.
+    pub fn discover_with(start: &Path, mode: LockMode) -> Result<Repo, Error> {
         let mut cur = Some(start);
         while let Some(c) = cur {
             if c.join(HUB_DIR).is_dir() {
-                return Self::open_dir(c.join(HUB_DIR));
+                return Self::open_dir_with(c.join(HUB_DIR), mode);
             }
             cur = c.parent();
         }
         err("not a hub repository (no .hub/ here or in any parent); run `hub init`")
     }
 
-    /// Open and replay a `.hub/` directory.
+    /// Open and replay a `.hub/` directory for writing (exclusive lock).
     pub fn open_dir(dir: PathBuf) -> Result<Repo, Error> {
+        Self::open_dir_with(dir, LockMode::Exclusive)
+    }
+
+    /// Open and replay a `.hub/` directory. The lock is taken before any
+    /// file is read and held until the `Repo` is dropped, so a writer's
+    /// replay -> mint -> append is atomic with respect to other processes.
+    pub fn open_dir_with(dir: PathBuf, mode: LockMode) -> Result<Repo, Error> {
+        let lock = RepoLock::acquire(&dir, mode)
+            .map_err(|e| Error(format!("cannot lock {}: {e}", dir.join("lock").display())))?;
         let (rp, op, cp) = Self::paths(&dir);
         let rtext = fs::read_to_string(&rp)
             .map_err(|e| Error(format!("cannot read {}: {e}", rp.display())))?;
@@ -144,6 +161,24 @@ impl Repo {
                 line: i + 2,
                 why,
             })?;
+            // A repeated OpId must carry the identical op: a different
+            // payload/deps under one id is equivocation (e.g. two unlocked
+            // writers minting the same counter) and is corruption. An exact
+            // repeat is idempotent and skipped.
+            if let Some(prev) = st.get(&o.id) {
+                if *prev != o {
+                    return Err(StoreError::Corrupt {
+                        file: op.clone(),
+                        line: i + 2,
+                        why: format!(
+                            "duplicate op id {} with a different op",
+                            store::fmt_id(o.id)
+                        ),
+                    }
+                    .into());
+                }
+                continue;
+            }
             st.insert(o.id, o.clone());
             replica.receive(o);
         }
@@ -177,6 +212,7 @@ impl Repo {
             store: st,
             checkpoints,
             warnings,
+            _lock: lock,
         })
     }
 
@@ -367,7 +403,15 @@ pub fn run(
     warn: &mut dyn Write,
 ) -> Result<(), Error> {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    let usage = |c: &str| Error(format!("usage: hub {c}  (see hub --help)"));
+    let usage = |c: &str| {
+        let syn = HELP
+            .lines()
+            .map(str::trim_start)
+            .find(|l| l.split_whitespace().next() == Some(c))
+            .and_then(|l| l.split("  ").next())
+            .unwrap_or(c);
+        Error(format!("usage: hub {}  (see hub --help)", syn.trim_end()))
+    };
     if matches!(a.as_slice(), [] | ["help"] | ["--help"] | ["-h"]) {
         out.write_all(HELP.as_bytes())?;
         return Ok(());
@@ -391,7 +435,16 @@ pub fn run(
     if !known.contains(&a[0]) {
         return err(format!("unknown command '{}' (see hub --help)", a[0]));
     }
-    let mut repo = Repo::discover(cwd)?;
+    // Mutating commands hold an exclusive lock from replay to append;
+    // read-only commands take a shared lock so they never observe a
+    // half-applied writer (and so a torn-tail truncation during their replay
+    // cannot race a writer's append).
+    let mode = if matches!(a[0], "mkdir" | "touch" | "mv" | "rm" | "commit") {
+        LockMode::Exclusive
+    } else {
+        LockMode::Shared
+    };
+    let mut repo = Repo::discover_with(cwd, mode)?;
     for w in &repo.warnings {
         writeln!(warn, "warning: {w}")?;
     }

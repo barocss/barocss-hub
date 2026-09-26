@@ -20,7 +20,11 @@
 //! Appends write one whole line and `fsync` before returning. On open, a
 //! final record with no trailing newline or a bad checksum is a torn write:
 //! it is truncated away (file `set_len` + fsync) and reported. A bad record
-//! that is not the last line is corruption and opening fails.
+//! that is not the last line is corruption and opening fails. A repeated op
+//! id with a different op is corruption; an exact repeat is skipped.
+//!
+//! `.hub/lock` is an advisory `flock` file: mutating commands hold it
+//! exclusively from replay to append, read-only commands hold it shared.
 
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
@@ -300,4 +304,68 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     }
     fs::rename(&tmp, path)?;
     File::open(dir)?.sync_all()
+}
+
+/// Lock mode for `.hub/lock` (Issue #16 repair).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockMode {
+    /// Readers: excludes writers, admits other readers.
+    Shared,
+    /// Writers: held across open (replay) -> mint/commit -> append.
+    Exclusive,
+}
+
+/// An advisory whole-repo lock: `flock(2)` on `.hub/lock`, blocking until
+/// granted and released when the file is closed (drop or process exit, so a
+/// crashed holder never leaves a stale lock).
+///
+/// `flock` is declared directly against the platform C library (no new
+/// crate); std's `File::lock` needs Rust 1.89. On non-unix targets this is a
+/// no-op; concurrent use there is unsupported in v0.
+#[derive(Debug)]
+pub struct RepoLock {
+    _file: File,
+}
+
+#[cfg(unix)]
+mod sys {
+    use std::os::raw::c_int;
+    // Same values on Linux, macOS and the BSDs.
+    pub const LOCK_SH: c_int = 1;
+    pub const LOCK_EX: c_int = 2;
+    extern "C" {
+        pub fn flock(fd: c_int, operation: c_int) -> c_int;
+    }
+}
+
+impl RepoLock {
+    pub fn acquire(dir: &Path, mode: LockMode) -> io::Result<RepoLock> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("lock"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let op = match mode {
+                LockMode::Shared => sys::LOCK_SH,
+                LockMode::Exclusive => sys::LOCK_EX,
+            };
+            loop {
+                // SAFETY: valid open fd owned by `file`; flock has no memory effects.
+                if unsafe { sys::flock(file.as_raw_fd(), op) } == 0 {
+                    break;
+                }
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        Ok(RepoLock { _file: file })
+    }
 }

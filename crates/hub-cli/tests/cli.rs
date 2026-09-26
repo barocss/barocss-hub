@@ -139,6 +139,7 @@ fn ambiguous_short_id_is_reported() {
         *by4.entry(id.hex()[..4].to_string()).or_default() += 1;
     }
     let (p, _) = by4.iter().find(|(_, n)| **n > 1).expect("a shared prefix");
+    drop(repo); // release the repo lock before spawning `hub`
     let e = fail(&d, &["show", p]);
     assert!(e.contains("ambiguous version"), "{e}");
     // Each listed candidate is displayed with a unique (>= 8 digit) prefix.
@@ -190,4 +191,107 @@ fn mid_log_corruption_is_an_error() {
         s,
         "must not rewrite on error"
     );
+}
+
+/// Issue #16 repair: 40 concurrent writers must not lose or duplicate ops.
+#[test]
+fn parallel_writers_do_not_lose_ops() {
+    const N: usize = 40;
+    let d = tmp("parallel");
+    ok(&d, &["init"]);
+    let kids: Vec<_> = (0..N)
+        .map(|i| {
+            Command::new(env!("CARGO_BIN_EXE_hub"))
+                .args(["mkdir", &format!("d{i}")])
+                .current_dir(&d)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for k in kids {
+        let o = k.wait_with_output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    let ls = ok(&d, &["ls"]);
+    let mut got: Vec<&str> = ls.lines().collect();
+    got.sort();
+    let mut want: Vec<String> = (0..N).map(|i| format!("d{i}/")).collect();
+    want.sort();
+    assert_eq!(got, want);
+    let log = fs::read_to_string(d.join(".hub/ops.log")).unwrap();
+    let ids: Vec<&str> = log
+        .lines()
+        .skip(1)
+        .map(|l| l.split(' ').nth(1).unwrap())
+        .collect();
+    let uniq: std::collections::BTreeSet<_> = ids.iter().collect();
+    assert_eq!(ids.len(), N);
+    assert_eq!(uniq.len(), N, "duplicate OpIds in log");
+}
+
+fn crc8(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(body.as_bytes())[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Same OpId, different payload: corruption, file untouched.
+#[test]
+fn conflicting_duplicate_op_id_is_corruption() {
+    let d = tmp("dup");
+    ok(&d, &["init"]);
+    ok(&d, &["mkdir", "a"]);
+    let log = d.join(".hub/ops.log");
+    let s = fs::read_to_string(&log).unwrap();
+    let body = s.lines().nth(1).unwrap().rsplit_once('\t').unwrap().0;
+    assert!(body.ends_with(" sa"));
+    let other = format!("{} sb", &body[..body.len() - 3]);
+    let bad = format!("{s}{other}\t{}\n", crc8(&other));
+    fs::write(&log, &bad).unwrap();
+    let e = fail(&d, &["ls"]);
+    assert!(
+        e.contains("corrupt") && e.contains("line 3") && e.contains("duplicate op id"),
+        "{e}"
+    );
+    assert!(fail(&d, &["mkdir", "c"]).contains("duplicate op id"));
+    assert_eq!(fs::read_to_string(&log).unwrap(), bad, "must not rewrite");
+
+    // An exact duplicate record is idempotent.
+    let exact = format!("{s}{body}\t{}\n", crc8(body));
+    fs::write(&log, &exact).unwrap();
+    assert_eq!(ok(&d, &["ls"]), "a/\n");
+}
+
+/// A crc-valid final line without '\n' is still a torn append.
+#[test]
+fn crc_valid_tail_without_newline_is_torn() {
+    let d = tmp("nonl");
+    ok(&d, &["init"]);
+    ok(&d, &["mkdir", "a"]);
+    let log = d.join(".hub/ops.log");
+    let good = fs::read(&log).unwrap();
+    ok(&d, &["mkdir", "b"]);
+    let mut full = fs::read(&log).unwrap();
+    assert_eq!(full.pop(), Some(b'\n'));
+    fs::write(&log, &full).unwrap();
+    let o = hub(&d, &["ls"]);
+    assert!(o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("recovered: dropped a truncated"));
+    assert_eq!(String::from_utf8(o.stdout).unwrap(), "a/\n");
+    assert_eq!(fs::read(&log).unwrap(), good);
+}
+
+#[test]
+fn usage_shows_arguments() {
+    let d = tmp("usage");
+    ok(&d, &["init"]);
+    assert!(fail(&d, &["commit"]).contains("usage: hub commit -m <msg>"));
+    assert!(fail(&d, &["commit", "-m", "a", "x"]).contains("usage: hub commit -m <msg>"));
+    assert!(fail(&d, &["mkdir"]).contains("usage: hub mkdir <path>"));
+    assert!(fail(&d, &["mv", "a"]).contains("usage: hub mv <from> <to>"));
+    assert!(fail(&d, &["init", "x"]).contains("usage: hub init"));
 }
