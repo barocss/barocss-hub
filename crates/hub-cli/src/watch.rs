@@ -52,6 +52,14 @@
 //! self-write were noticed, `record` would find nothing to record, so the op
 //! count cannot grow without a real change.
 //!
+//! # Pinned (D-020, repair)
+//! `hub checkout <id>` of a non-head version writes `.hub/pinned`
+//! ([`set_pinned`]). While it exists the step does nothing but announce
+//! "paused" once: no auto-record (which would record on an old base, which
+//! plain `record` refuses) and no auto-checkout (which would undo the
+//! user's checkout). Syncing continues, so the log keeps up. Plain
+//! `hub checkout` (head) removes the pin and the next step resumes.
+//!
 //! # Signals and crashes
 //! SIGINT/SIGTERM set a flag; the in-flight step (which holds the repo
 //! lock) runs to completion, then the watcher removes `.hub/watch.pid`,
@@ -76,6 +84,58 @@ use std::time::{Duration, Instant};
 use crate::store::{self, LockMode};
 use crate::sync::find_hub;
 use crate::{err, wd, Error, Repo};
+
+pub const PIN_FILE: &str = "pinned";
+pub const PIN_HEADER: &str = "barocss-hub/pinned/v0";
+
+/// `.hub/pinned` (Issue #25 repair, D-020): present iff the user checked
+/// out a version other than head (`hub checkout <id>`). Format v0: header
+/// line, then the pinned frontier (comma-joined op ids). Written with
+/// temp + fsync + rename; removed by a checkout that lands on head
+/// (including `hub checkout <id>` naming head itself, which never pins).
+/// While present, `hub watch` pauses auto-record and auto-checkout (it still
+/// syncs the log), so a deliberate old checkout is neither undone nor
+/// recorded on the old base.
+pub fn set_pinned(hub: &Path, f: Option<&Vec<hub_core::tree::OpId>>) -> Result<(), Error> {
+    let p = hub.join(PIN_FILE);
+    match f {
+        Some(f) => {
+            let ids: Vec<String> = f.iter().map(|i| store::fmt_id(*i)).collect();
+            let body = if ids.is_empty() {
+                "-".into()
+            } else {
+                ids.join(",")
+            };
+            store::write_atomic(&p, format!("{PIN_HEADER}\n{body}\n").as_bytes())?;
+        }
+        None => match fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        },
+    }
+    Ok(())
+}
+
+/// The pinned frontier, if the working directory is pinned.
+pub fn pinned(hub: &Path) -> Result<Option<Vec<hub_core::tree::OpId>>, Error> {
+    let p = hub.join(PIN_FILE);
+    let text = match fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    match lines.as_slice() {
+        [h, "-"] if *h == PIN_HEADER => Ok(Some(Vec::new())),
+        [h, ids] if *h == PIN_HEADER => ids
+            .split(',')
+            .map(|t| store::parse_id(t).map_err(|e| Error(format!("corrupt {}: {e}", p.display()))))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        _ => err(format!("corrupt {}", p.display())),
+    }
+}
 
 pub const PEERS_HEADER: &str = "barocss-hub/peers/v0";
 pub const PID_FILE: &str = "watch.pid";
@@ -112,8 +172,11 @@ fn peer_root(cwd: &Path, arg: &str) -> Result<PathBuf, Error> {
     if !p.is_dir() {
         return err(format!("no such directory: {arg}"));
     }
-    let hub = fs::canonicalize(find_hub(&p)?)?;
-    let root = hub.parent().map(Path::to_path_buf).unwrap_or(hub);
+    // Canonicalize first: a lexical walk of `a/../b` would find a's `.hub`.
+    let root = fs::canonicalize(&p)?;
+    if !root.join(crate::HUB_DIR).is_dir() {
+        return err(format!("no hub repository at {arg} (run `hub init` there)"));
+    }
     let s = root.to_string_lossy();
     if s.contains('\n') || s.contains('\r') {
         return err("peer path contains a newline");
@@ -183,6 +246,8 @@ pub fn active_watch(hub: &Path) -> Result<Option<String>, Error> {
 // ---------- signals ----------
 
 static STOP: AtomicBool = AtomicBool::new(false);
+/// Whether the current pause was already announced.
+static PAUSE_SAID: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 mod sig {
@@ -314,6 +379,19 @@ fn step(hub: &Path, out: &mut dyn Write, warn: &mut dyn Write) -> Result<bool, E
     }
     if wd::interrupted(&repo.dir)?.is_some() {
         crate::checkout(&mut repo, None, false, out, warn)?;
+    }
+    if let Some(p) = pinned(&repo.dir)? {
+        let msg = format!(
+            "paused: working directory checked out at {} (pinned); run `hub checkout` to resume watching",
+            repo.index().short(&hub_core::checkpoint::VersionId::of_frontier(&p))
+        );
+        if !PAUSE_SAID.swap(true, Ordering::SeqCst) {
+            writeln!(out, "{msg}")?;
+        }
+        return Ok(false);
+    }
+    if PAUSE_SAID.swap(false, Ordering::SeqCst) {
+        writeln!(out, "resumed: working directory back at head")?;
     }
     let mut quiet = Vec::new();
     let recorded = crate::record(&mut repo, None, true, &mut quiet, warn)?;

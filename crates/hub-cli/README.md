@@ -183,6 +183,11 @@ watch stopped
   `hub status` on both sides, with the same bytes in both folders.
 - The watcher's own writes are not re-recorded (the tree snapshot is taken
   again after each step), and the op count stays constant when idle.
+- `hub checkout <id>` of an older version **pins** the working directory
+  (`.hub/pinned`): the watcher pauses auto-record and auto-checkout (it
+  keeps syncing the log) and says "paused: ..."; `hub status` shows
+  "pinned at <id>". Plain `hub checkout` (head) unpins and watching resumes.
+  `hub checkout <id>` naming head itself does not pin. [decision-proposal]
 - After a crash or `kill -9`, just start `hub watch` (or any command) again:
   an interrupted checkout is resumed, a torn log tail is dropped, temps are
   swept. A second `hub watch` on the same repo refuses while one runs.
@@ -197,7 +202,7 @@ watch stopped
 - `index`: the last materialized version (`base` frontier), plus
   path -> node, blob, size and mtime for fast change detection. `u` lines are
   unmaterialized paths (D-019).
-- `peers`, `watch.lock`, `watch.pid`: Issue #25, local only (never
+- `peers`, `pinned`, `watch.lock`, `watch.pid`: Issue #25, local only (never
   synced). A watch is active only while `watch.lock` is `flock`ed, so a pid
   file left by a crash is ignored.
 - `tmp/`, `checkout-in-progress`: in-flight working-file temps and the

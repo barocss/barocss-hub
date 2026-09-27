@@ -455,3 +455,87 @@ fn watch_usage_errors() {
     assert!(!o.status.success());
     let _ = fs::remove_dir_all(t);
 }
+
+#[test]
+fn checkout_old_pins_and_pauses_watch_until_plain_checkout() {
+    let (t, a, b) = pair("pin");
+    fs::write(a.join("notes.txt"), b"v1").unwrap();
+    ok(&a, &["record", "-m", "cp1"]);
+    let cp1 = ok(&a, &["log"])
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    fs::write(a.join("extra.txt"), b"x").unwrap();
+    ok(&a, &["record"]);
+    // `checkout <head id>` never pins.
+    let head = ok(&a, &["status"])
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_string();
+    ok(&a, &["checkout", &head]);
+    assert!(!a.join(".hub/pinned").exists());
+
+    let wa = Watcher::start(&a, &[]);
+    let _wb = Watcher::start(&b, &[]);
+    wait_for("B has extra", || b.join("extra.txt").exists());
+    ok(&a, &["checkout", &cp1]);
+    assert!(a.join(".hub/pinned").exists());
+    assert!(!a.join("extra.txt").exists());
+    assert!(ok(&a, &["status"]).contains("pinned at "));
+    wait_for("paused message", || wa.output().contains("paused: "));
+    // An edit while pinned is not recorded, and the checkout is not undone.
+    let n = op_count(&a);
+    fs::write(a.join("notes.txt"), b"edited while pinned").unwrap();
+    // Log keeps syncing while pinned.
+    fs::write(b.join("fromb.txt"), b"b").unwrap();
+    wait_for("B's op reaches A's log", || op_count(&a) > n);
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!a.join("extra.txt").exists(), "old checkout was undone");
+    assert!(!a.join("fromb.txt").exists(), "auto-checkout while pinned");
+    assert_eq!(
+        read(&a.join("notes.txt")).as_deref(),
+        Some(&b"edited while pinned"[..])
+    );
+    let st = ok(&a, &["status"]);
+    assert!(st.contains("unrecorded changes"), "{st}");
+    assert!(!hub(&a, &["record"]).status.success());
+    // Plain checkout unpins. notes.txt is unchanged between cp1 and head,
+    // so the unrecorded edit is kept (never clobbered), and the resumed
+    // watcher records it at head and propagates it.
+    ok(&a, &["checkout"]);
+    assert!(!a.join(".hub/pinned").exists());
+    assert_eq!(
+        read(&a.join("notes.txt")).as_deref(),
+        Some(&b"edited while pinned"[..])
+    );
+    wait_for("resumed", || {
+        wa.output().contains("resumed: ")
+            && a.join("extra.txt").exists()
+            && a.join("fromb.txt").exists()
+            && read(&b.join("notes.txt")).as_deref() == Some(b"edited while pinned")
+            && clean(&a)
+    });
+    let _ = fs::remove_dir_all(t);
+}
+
+#[test]
+fn peer_add_before_peer_init_is_not_self() {
+    let t = tmp("peerpre");
+    let (a, b) = (t.join("a"), t.join("b"));
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    ok(&a, &["init"]);
+    let o = hub(&a, &["peer", "add", "../b"]);
+    assert!(!o.status.success());
+    let e = String::from_utf8_lossy(&o.stderr);
+    assert!(e.contains("no hub repository at ../b"), "{e}");
+    assert!(!e.contains("own peer"), "{e}");
+    let o = hub(&a, &["sync", "../b"]);
+    assert!(!o.status.success());
+    assert!(!String::from_utf8_lossy(&o.stderr).contains("itself"));
+    ok(&b, &["init"]);
+    ok(&a, &["peer", "add", "../b"]);
+    let _ = fs::remove_dir_all(t);
+}

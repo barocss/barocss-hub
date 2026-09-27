@@ -829,6 +829,14 @@ pub(crate) fn checkout(
     )?;
     let (written, removed) = plan.counts();
     ws.extend(wd::apply(plan, &root, &repo.dir)?);
+    // Issue #25 repair (D-020): pinned iff the materialized version is not
+    // head. Written after the index; a crash before it leaves the
+    // checkout marker, whose resume re-derives the pin.
+    {
+        let mut f = frontier.clone();
+        f.sort();
+        watch::set_pinned(&repo.dir, (f != repo.head_frontier()).then_some(&f))?;
+    }
     print_warnings(warn, &ws)?;
     let vid = VersionId::of_frontier(&frontier);
     writeln!(
@@ -1066,6 +1074,13 @@ pub fn run(
                 for p in &peers {
                     writeln!(out, "  {}", p.display())?;
                 }
+            }
+            if let Some(p) = watch::pinned(&repo.dir)? {
+                writeln!(
+                    out,
+                    "pinned at {} (`hub checkout <id>` of an older version); watch pauses auto-record and auto-checkout; run `hub checkout` to resume",
+                    ix.short(&VersionId::of_frontier(&p))
+                )?;
             }
             if let Some(pid) = watch::active_watch(&repo.dir)? {
                 writeln!(out, "watch: active (pid {pid})")?;
