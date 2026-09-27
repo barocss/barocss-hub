@@ -331,44 +331,248 @@ fn concurrent_set_content_conflict_shows_in_status_and_checkout_writes_winner() 
     let _ = node;
 }
 
+/// Head tree: `README`, `readme` (files, clash), `Src/a` and `src/b` (dirs
+/// clash), `other` (no clash, content "o").
+fn clash_repo(d: &Path) {
+    ok(d, &["init"]);
+    let mut r = repo(d);
+    let rid = r.replica_id.0;
+    let dir = hub_core::tree::Kind::Directory;
+    let file = hub_core::tree::Kind::File;
+    let root = hub_core::tree::ROOT;
+    let n = |c: u64| NodeId::new(c, rid);
+    let creates = [
+        (2u64, file, root, "README"),
+        (3, file, root, "readme"),
+        (4, dir, root, "Src"),
+        (5, dir, root, "src"),
+        (6, file, n(4), "a"),
+        (7, file, n(5), "b"),
+        (8, file, root, "other"),
+    ];
+    for (c, kind, parent, name) in creates {
+        let deps = r.head().frontier(&r.store).into_iter().collect();
+        r.append_op(Op {
+            id: n(c),
+            deps,
+            payload: Payload::Create {
+                kind,
+                parent,
+                name: name.into(),
+            },
+        })
+        .unwrap();
+    }
+    let blob = r.blobs().unwrap().put(b"o").unwrap();
+    let deps = r.head().frontier(&r.store).into_iter().collect();
+    r.append_op(Op {
+        id: n(9),
+        deps,
+        payload: Payload::SetContent { node: n(8), blob },
+    })
+    .unwrap();
+}
+
+fn fs_is_case_insensitive(d: &Path) -> bool {
+    let probe = d.join("CaseProbe");
+    fs::write(&probe, b"").unwrap();
+    let r = d.join("caseprobe").exists();
+    fs::remove_file(&probe).unwrap();
+    r
+}
+
+/// D-019 assertions for a (real or forced) case-insensitive checkout.
+fn assert_clash_skipped(d: &Path, env: &[(&str, &str)]) {
+    let run = |args: &[&str]| {
+        let o = hub_env(d, args, env);
+        assert!(
+            o.status.success(),
+            "hub {args:?} failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        (
+            String::from_utf8(o.stdout).unwrap(),
+            String::from_utf8(o.stderr).unwrap(),
+        )
+    };
+    let (_, err) = run(&["checkout"]);
+    for p in ["README", "readme", "Src", "src", "Src/a", "src/b"] {
+        assert!(err.contains(&format!("'{p}'")), "warning for {p}: {err}");
+    }
+    // Only the clashing paths are skipped; the rest is materialized.
+    assert_eq!(
+        snapshot(d),
+        BTreeMap::from([("other".to_string(), Some(b"o".to_vec()))])
+    );
+    let (st, _) = run(&["status"]);
+    assert!(st.contains("unmaterialized (case clash"), "{st}");
+    for p in [
+        "  README\n",
+        "  readme\n",
+        "  Src\n",
+        "  src\n",
+        "  Src/a\n",
+        "  src/b\n",
+    ] {
+        assert!(st.contains(p), "status lists {p:?}: {st}");
+    }
+    // Unmaterialized paths are not "deleted" and record nothing.
+    assert!(st.contains("working directory: clean"), "{st}");
+    let (rec, _) = run(&["record"]);
+    assert!(rec.contains("nothing to record"), "{rec}");
+    let idx = fs::read_to_string(d.join(".hub/index")).unwrap();
+    assert_eq!(
+        idx.lines().filter(|l| l.starts_with("u ")).count(),
+        6,
+        "{idx}"
+    );
+    // Idempotent re-checkout; a non-clashing edit still records normally.
+    run(&["checkout"]);
+    assert_eq!(snapshot(d).len(), 1);
+    fs::write(d.join("other"), b"o2").unwrap();
+    let (rec, _) = run(&["record"]);
+    assert!(rec.contains("modified: other"), "{rec}");
+    let (st, _) = run(&["status"]);
+    assert!(st.contains("unmaterialized (case clash"), "{st}");
+    assert!(st.contains("working directory: clean"), "{st}");
+}
+
+/// #20 repair: a working file occupying (or case-folding onto, or under) an
+/// unmaterialized path is reported as blocked; record refuses; a mutating
+/// command that would materialize that path does not overwrite it.
+fn assert_blocked_reported(d: &Path, env: &[(&str, &str)]) {
+    let run = |args: &[&str]| hub_env(d, args, env);
+    let out = |o: Output| String::from_utf8(o.stdout).unwrap();
+    assert!(run(&["checkout"]).status.success());
+    // A file at an exact unmaterialized path.
+    fs::write(d.join("README"), b"user bytes").unwrap();
+    let st = out(run(&["status"]));
+    assert!(
+        st.contains("blocked:  README collides with unmaterialized"),
+        "{st}"
+    );
+    assert!(st.contains("'README'") && st.contains("'readme'"), "{st}");
+    assert!(!st.contains("working directory: clean"), "{st}");
+    let o = run(&["record"]);
+    assert!(!o.status.success());
+    let e = String::from_utf8(o.stderr).unwrap();
+    assert!(
+        e.contains("refusing to record") && e.contains("README"),
+        "{e}"
+    );
+    assert!(e.contains("renam"), "{e}");
+    // A directory case-folding onto an unmaterialized dir, with a file in it.
+    fs::remove_file(d.join("README")).unwrap();
+    fs::create_dir(d.join("SRC")).unwrap();
+    fs::write(d.join("SRC/new"), b"n").unwrap();
+    let st = out(run(&["status"]));
+    assert!(
+        st.contains("blocked:  SRC collides with unmaterialized"),
+        "{st}"
+    );
+    assert!(
+        st.contains("blocked:  SRC/new collides with unmaterialized"),
+        "{st}"
+    );
+    assert!(!run(&["record"]).status.success());
+    // Checkout does not touch the blocked paths.
+    assert!(run(&["checkout"]).status.success());
+    assert_eq!(fs::read(d.join("SRC/new")).unwrap(), b"n");
+    // Resolve: remove them; clean again, record has nothing to do.
+    fs::remove_dir_all(d.join("SRC")).unwrap();
+    let st = out(run(&["status"]));
+    assert!(st.contains("working directory: clean"), "{st}");
+    assert!(out(run(&["record"])).contains("nothing to record"));
+    // Un-clash by renaming one node: the occupying file is not overwritten.
+    fs::write(d.join("README"), b"user bytes").unwrap();
+    let o = run(&["mv", "readme", "readme2"]);
+    assert_eq!(fs::read(d.join("README")).unwrap(), b"user bytes");
+    let _ = o;
+}
+
 #[test]
-fn case_clash_is_refused_on_case_insensitive_fs() {
-    let d = tmp("case");
+fn blocked_file_on_unmaterialized_path_real_fs() {
+    let d = tmp("case-blocked-real");
+    clash_repo(&d);
+    if fs_is_case_insensitive(&d) {
+        assert_blocked_reported(&d, &[]);
+    }
+}
+
+#[test]
+fn blocked_file_on_unmaterialized_path_forced_probe() {
+    let d = tmp("case-blocked-forced");
+    clash_repo(&d);
+    assert_blocked_reported(&d, &[("HUB_TEST_FORCE_CASE_INSENSITIVE", "1")]);
+}
+
+#[test]
+fn case_clash_skips_only_clashing_files_real_fs() {
+    // Uses the real filesystem's behavior (macOS APFS/HFS+ default:
+    // case-insensitive; Linux ext4: case-sensitive).
+    let d = tmp("case-real");
+    clash_repo(&d);
+    if fs_is_case_insensitive(&d) {
+        assert_clash_skipped(&d, &[]);
+    } else {
+        ok(&d, &["checkout"]);
+        for p in ["README", "readme", "Src/a", "src/b", "other"] {
+            assert!(d.join(p).exists(), "{p}");
+        }
+        assert!(!ok(&d, &["status"]).contains("unmaterialized"));
+    }
+}
+
+#[test]
+fn case_clash_skips_only_clashing_files_forced_probe() {
+    // Simulated case-insensitive probe via the test hook, so D-019 is
+    // exercised on case-sensitive filesystems too.
+    let d = tmp("case-forced");
+    clash_repo(&d);
+    assert_clash_skipped(&d, &[("HUB_TEST_FORCE_CASE_INSENSITIVE", "1")]);
+}
+
+#[test]
+fn case_clash_appearing_later_removes_clean_tracked_file() {
+    // `README` materialized first; a later `readme` makes both clash: the
+    // clean tracked `README` is removed and both become unmaterialized.
+    let d = tmp("case-later");
+    let env = [("HUB_TEST_FORCE_CASE_INSENSITIVE", "1")];
     ok(&d, &["init"]);
+    fs::write(d.join("README"), b"r").unwrap();
+    assert!(hub_env(&d, &["record"], &env).status.success());
     {
         let mut r = repo(&d);
         let rid = r.replica_id.0;
-        for (c, name) in [(2u64, "README"), (3, "readme")] {
-            let deps = r.head().frontier(&r.store).into_iter().collect();
-            r.append_op(Op {
-                id: NodeId::new(c, rid),
-                deps,
-                payload: Payload::Create {
-                    kind: hub_core::tree::Kind::File,
-                    parent: hub_core::tree::ROOT,
-                    name: name.into(),
-                },
-            })
-            .unwrap();
-        }
+        let deps = r.head().frontier(&r.store).into_iter().collect();
+        let c = r
+            .head()
+            .frontier(&r.store)
+            .iter()
+            .map(|i| i.counter)
+            .max()
+            .unwrap()
+            + 1;
+        r.append_op(Op {
+            id: NodeId::new(c, rid),
+            deps,
+            payload: Payload::Create {
+                kind: hub_core::tree::Kind::File,
+                parent: hub_core::tree::ROOT,
+                name: "readme".into(),
+            },
+        })
+        .unwrap();
     }
-    let probe = d.join("CaseProbe");
-    fs::write(&probe, b"").unwrap();
-    let insensitive = d.join("caseprobe").exists();
-    fs::remove_file(&probe).unwrap();
-    if insensitive {
-        let e = fail(&d, &["checkout"]);
-        assert!(
-            e.contains("case clash") && e.contains("README") && e.contains("readme"),
-            "{e}"
-        );
-        let e = fail(&d, &["checkout", "--force"]);
-        assert!(e.contains("case clash"), "{e}");
-        assert!(!d.join("README").exists());
-    } else {
-        ok(&d, &["checkout"]);
-        assert!(d.join("README").exists() && d.join("readme").exists());
-    }
+    let o = hub_env(&d, &["checkout"], &env);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(snapshot(&d).is_empty());
+    let st = String::from_utf8(hub_env(&d, &["status"], &env).stdout).unwrap();
+    assert!(
+        st.contains("  README\n") && st.contains("  readme\n"),
+        "{st}"
+    );
+    assert!(st.contains("working directory: clean"), "{st}");
 }
 
 #[cfg(unix)]

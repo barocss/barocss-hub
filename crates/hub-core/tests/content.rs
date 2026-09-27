@@ -16,7 +16,7 @@ fn content_of(s: &State) -> BTreeMap<NodeId, Option<BlobId>> {
 fn content_conflicts(ev: &Evaluation) -> BTreeSet<Conflict> {
     ev.conflicts
         .iter()
-        .filter(|c| matches!(c, Conflict::Content { .. } | Conflict::EditDeleted { .. }))
+        .filter(|c| matches!(c, Conflict::Content { .. } | Conflict::EditRevived { .. }))
         .cloned()
         .collect()
 }
@@ -66,6 +66,61 @@ fn content_no_silent_drop(ops: &[Op], ev: &Evaluation) -> Result<(), String> {
     Ok(())
 }
 
+/// D-014: no Applied SetContent of a non-live file is left whose trashing
+/// Delete did not see it (else the edit should have revived), and every
+/// `edit-revived` names an Applied edit of that node and a Delete that did
+/// not causally follow it.
+fn edit_revive_holds(ops: &[Op], ev: &Evaluation) -> Result<(), String> {
+    let map: BTreeMap<OpId, Op> = ops.iter().map(|o| (o.id, o.clone())).collect();
+    let past = causal_past(&map);
+    for op in ops {
+        let Some(x) = op.content_node() else { continue };
+        if ev.outcomes[&op.id] != Outcome::Applied || is_live(&ev.state, x) {
+            continue;
+        }
+        let mut top = x;
+        while let Some(p) = ev.state[&top].parent {
+            if p == TRASH {
+                break;
+            }
+            top = p;
+        }
+        // The winning parent-setting op of `top`: the greatest Applied
+        // Move/Delete of it.
+        let w = ops
+            .iter()
+            .filter(|o| o.moved_node() == Some(top) && ev.outcomes[&o.id] == Outcome::Applied)
+            .map(|o| o.id)
+            .max();
+        if let Some(w) = w {
+            if matches!(map[&w].payload, Payload::Delete { .. }) && !past[&w].contains(&op.id) {
+                // Exempt: pre-delete parent is TRASH itself, or the restore
+                // would form a cycle.
+                let prefix: Vec<&Op> = ops.iter().filter(|o| o.id < w).collect();
+                let p = evaluate(prefix).state[&top].parent.unwrap();
+                if p == TRASH || is_ancestor_or_self(&ev.state, top, p) {
+                    continue;
+                }
+                return Err(format!(
+                    "edit {:?} of dead {:?} did not revive (delete {:?})",
+                    op.id, x, w
+                ));
+            }
+        }
+    }
+    for c in &ev.conflicts {
+        if let Conflict::EditRevived { node, edit, delete } = c {
+            if map[edit].content_node() != Some(*node)
+                || !matches!(map[delete].payload, Payload::Delete { .. })
+                || past[delete].contains(edit)
+            {
+                return Err(format!("bad {c:?}"));
+            }
+        }
+    }
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 1024, ..ProptestConfig::default() })]
 
@@ -87,6 +142,8 @@ proptest! {
             prop_assert_eq!(project(rep.state()).blobs, project(&spec.state).blobs);
         }
         let r = content_no_silent_drop(&ops, &spec);
+        prop_assert!(r.is_ok(), "{:?}", r);
+        let r = edit_revive_holds(&ops, &spec);
         prop_assert!(r.is_ok(), "{:?}", r);
     }
 
@@ -261,51 +318,112 @@ fn causally_later_edit_is_not_a_conflict_and_clears() {
     assert!(content_conflicts(&ev).is_empty());
 }
 
+// ---------- D-014: an edit revives a deleted file (Issue #20) ----------
+
 #[test]
-fn edit_vs_delete_both_orders() {
+fn edit_vs_delete_both_orders_revives() {
     for (erid, drid) in [(A, B), (B, A)] {
         let (mut ops, a, _, x) = base();
         let e = set(5, erid, &[x], x, b"E");
         let d = op(5, drid, &[x], Payload::Delete { node: x });
         ops.extend([e.clone(), d.clone()]);
         let ev = all_orders_agree(&ops);
-        // Node trashed either way (SetContent is not structural); content kept.
-        assert!(!is_live(&ev.state, x));
-        assert!(is_live(&ev.state, a));
-        assert_eq!(ev.state[&x].content, Some(BlobId::of(b"E")));
+        // Revived to its pre-delete parent `a` with the edited content.
+        assert!(is_live(&ev.state, x));
+        assert_eq!(ev.state[&x].parent, Some(a));
+        assert_eq!(project(&ev.state).paths[&x], "a/x");
+        assert_eq!(project(&ev.state).blobs[&x], BlobId::of(b"E"));
         assert_eq!(
             content_conflicts(&ev),
-            BTreeSet::from([Conflict::EditDeleted {
+            BTreeSet::from([Conflict::EditRevived {
                 node: x,
                 edit: e.id,
                 delete: d.id
             }])
         );
-        assert!(!project(&ev.state).blobs.contains_key(&x));
+        assert!(check_invariants(&ev.state, &ops, &ev.outcomes).is_ok());
     }
 }
 
 #[test]
-fn edit_vs_delete_of_ancestor() {
+fn edit_vs_delete_of_parent_folder_revives_folder() {
+    for (erid, drid) in [(A, B), (B, A)] {
+        let (mut ops, a, _, x) = base();
+        let e = set(5, erid, &[x], x, b"E");
+        let d = op(5, drid, &[x], Payload::Delete { node: a });
+        ops.extend([e.clone(), d.clone()]);
+        let ev = all_orders_agree(&ops);
+        // The deleted node (`a`) returns to its pre-delete parent; x's path
+        // is unchanged.
+        assert!(is_live(&ev.state, a));
+        assert_eq!(ev.state[&a].parent, Some(ROOT));
+        assert_eq!(project(&ev.state).paths[&x], "a/x");
+        assert_eq!(
+            content_conflicts(&ev),
+            BTreeSet::from([Conflict::EditRevived {
+                node: x,
+                edit: e.id,
+                delete: d.id
+            }])
+        );
+    }
+}
+
+#[test]
+fn edit_vs_nested_deletes_revives_whole_chain() {
+    // A deletes `a`; B (after seeing a move of `a` under `b`) ... simpler:
+    // `c` under `a`, x under `c`; A deletes `c`, B deletes `a`, C edits x,
+    // all concurrent: both deletes are undone so x is live again.
     let (mut ops, a, _, x) = base();
-    let e = set(5, A, &[x], x, b"E");
-    let d = op(5, B, &[x], Payload::Delete { node: a });
-    ops.extend([e.clone(), d.clone()]);
+    let c = NodeId::new(5, A);
+    ops.push(op(
+        5,
+        A,
+        &[x],
+        Payload::Create {
+            kind: Kind::Directory,
+            parent: a,
+            name: "c".into(),
+        },
+    ));
+    ops.push(op(
+        6,
+        A,
+        &[c],
+        Payload::Move {
+            node: x,
+            new_parent: c,
+            new_name: "x".into(),
+        },
+    ));
+    let m = NodeId::new(6, A);
+    let e = set(7, C, &[m], x, b"E");
+    let d1 = op(7, A, &[m], Payload::Delete { node: c });
+    let d2 = op(7, B, &[m], Payload::Delete { node: a });
+    ops.extend([e.clone(), d1.clone(), d2.clone()]);
     let ev = all_orders_agree(&ops);
-    assert!(!is_live(&ev.state, x));
+    assert_eq!(project(&ev.state).paths[&x], "a/c/x");
     assert_eq!(
         content_conflicts(&ev),
-        BTreeSet::from([Conflict::EditDeleted {
-            node: x,
-            edit: e.id,
-            delete: d.id
-        }])
+        BTreeSet::from([
+            Conflict::EditRevived {
+                node: x,
+                edit: e.id,
+                delete: d1.id
+            },
+            Conflict::EditRevived {
+                node: x,
+                edit: e.id,
+                delete: d2.id
+            },
+        ])
     );
 }
 
 #[test]
 fn edit_vs_delete_revived_by_move_no_edit_conflict() {
-    // D-001 Option A: A deletes x, C (later) moves x to /b: x live, edit kept.
+    // D-001 Option A: A deletes x, C (later) moves x to /b: x live via the
+    // move, edit kept; the edit has nothing to revive.
     let (mut ops, _, b, x) = base();
     ops.push(op(5, A, &[x], Payload::Delete { node: x }));
     ops.push(set(5, B, &[x], x, b"E"));
@@ -321,16 +439,50 @@ fn edit_vs_delete_revived_by_move_no_edit_conflict() {
     ));
     let ev = all_orders_agree(&ops);
     assert!(is_live(&ev.state, x));
+    assert_eq!(project(&ev.state).paths[&x], "b/x");
     assert_eq!(project(&ev.state).blobs[&x], BlobId::of(b"E"));
     assert!(content_conflicts(&ev).is_empty());
 }
 
 #[test]
-fn edit_after_seeing_delete_is_not_a_conflict() {
-    let (mut ops, _, _, x) = base();
+fn edit_causally_after_delete_revives() {
+    // [decision-proposal] (D-014 leaves it to the spec): an edit that saw the
+    // delete also revives, with the same conflict.
+    let (mut ops, a, _, x) = base();
     let d = op(5, A, &[x], Payload::Delete { node: x });
     let e = set(6, B, &[d.id], x, b"E");
-    ops.extend([d, e]);
+    ops.extend([d.clone(), e.clone()]);
+    let ev = all_orders_agree(&ops);
+    assert_eq!(ev.state[&x].parent, Some(a));
+    assert_eq!(
+        content_conflicts(&ev),
+        BTreeSet::from([Conflict::EditRevived {
+            node: x,
+            edit: e.id,
+            delete: d.id
+        }])
+    );
+}
+
+#[test]
+fn delete_causally_after_edit_stays_deleted() {
+    let (mut ops, _, _, x) = base();
+    let e = set(5, A, &[x], x, b"E");
+    let d = op(6, B, &[e.id], Payload::Delete { node: x });
+    ops.extend([e, d]);
+    let ev = all_orders_agree(&ops);
+    assert!(!is_live(&ev.state, x));
+    assert_eq!(ev.state[&x].content, Some(BlobId::of(b"E")));
+    assert!(content_conflicts(&ev).is_empty());
+}
+
+#[test]
+fn redelete_after_seeing_revive_sticks() {
+    let (mut ops, _, _, x) = base();
+    let e = set(5, A, &[x], x, b"E");
+    let d = op(5, B, &[x], Payload::Delete { node: x });
+    let d2 = op(6, B, &[e.id, d.id], Payload::Delete { node: x });
+    ops.extend([e, d, d2]);
     let ev = all_orders_agree(&ops);
     assert!(!is_live(&ev.state, x));
     assert!(content_conflicts(&ev).is_empty());
@@ -379,6 +531,7 @@ fn generator_emits_content_scenarios() {
     // Sanity: the shared generator produces concurrent content conflicts and
     // edit-vs-delete conflicts for some scripts.
     let (mut c, mut d, mut inv) = (false, false, false);
+    let mut with_revive = 0usize;
     for s in 0..400u64 {
         let mut x = s.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         let script: Vec<(u8, u8, u8, u8)> = (0..40)
@@ -392,10 +545,17 @@ fn generator_emits_content_scenarios() {
             .collect();
         let ops = simulate(3, &script);
         let ev = evaluate(&ops);
+        if ev
+            .conflicts
+            .iter()
+            .any(|c| matches!(c, Conflict::EditRevived { .. }))
+        {
+            with_revive += 1;
+        }
         for cf in &ev.conflicts {
             match cf {
                 Conflict::Content { .. } => c = true,
-                Conflict::EditDeleted { .. } => d = true,
+                Conflict::EditRevived { .. } => d = true,
                 Conflict::InvalidOp { op }
                     if matches!(
                         ops.iter().find(|o| o.id == *op).unwrap().payload,
@@ -410,6 +570,12 @@ fn generator_emits_content_scenarios() {
     }
     assert!(
         c && d && inv,
-        "content={c} edit-deleted={d} invalid-set={inv}"
+        "content={c} edit-revived={d} invalid-set={inv}"
+    );
+    // Measured rate (Issue #20): printed with --nocapture, floor asserted.
+    println!("edit-revived histories: {with_revive}/400");
+    assert!(
+        with_revive >= 20,
+        "edit-revived rate too low: {with_revive}/400"
     );
 }
