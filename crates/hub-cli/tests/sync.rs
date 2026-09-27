@@ -691,3 +691,30 @@ fn record_suffixes_new_node_when_collision_appears() {
     ok(&b, &["checkout"]);
     assert_eq!(snapshot(&a), snapshot(&b));
 }
+
+/// Issue #26 + #24: materializing the projection change would have to move
+/// a directory holding an ignored untracked file; record must refuse
+/// (append nothing, touch nothing) rather than delete it, and succeed once
+/// the ignored file is moved away.
+#[test]
+fn record_refuses_rename_that_would_delete_ignored_file() {
+    let (_t, a, _b) = collided("i26-ign");
+    fs::write(a.join(".hubignore"), "*.o\n").unwrap();
+    ok(&a, &["record"]);
+    let h = head(&a);
+    // As in record_suffixes_new_node_when_collision_appears, plus an
+    // ignored file inside the new directory.
+    fs::remove_file(a.join("f1")).unwrap();
+    fs::create_dir(a.join("f1")).unwrap();
+    fs::write(a.join("f1/keep"), "mine\n").unwrap();
+    fs::write(a.join("f1/cache.o"), "junk\n").unwrap();
+    let e = fail(&a, &["record"]);
+    assert!(e.contains("refusing to record"), "{e}");
+    assert_eq!(head(&a), h);
+    assert_eq!(fs::read(a.join("f1/cache.o")).unwrap(), b"junk\n");
+    assert_eq!(fs::read(a.join("f1/keep")).unwrap(), b"mine\n");
+    fs::remove_file(a.join("f1/cache.o")).unwrap();
+    ok(&a, &["record"]);
+    assert_eq!(fs::read(a.join("f1")).unwrap(), b"same\n");
+    assert_eq!(ok(&a, &["record"]).trim(), "nothing to record");
+}

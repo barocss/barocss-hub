@@ -563,7 +563,11 @@ fn record(
         return Err(not_at_head(repo, &idx));
     }
     let mut ws = Vec::new();
-    let w = wd::scan(&root, &idx, &mut ws)?;
+    // `w_all` keeps untracked ignored paths so the rename plan below never
+    // clobbers or deletes them (#24); `w` is what record sees.
+    let (w_all, ignored) = wd::scan_all(&root, &idx, &mut ws)?;
+    let mut w = w_all.clone();
+    w.retain(|p, _| !ignored.contains(p));
     print_warnings(warn, &ws)?;
     let blocked = wd::blocked(&idx, &w);
     if !blocked.is_empty() {
@@ -713,13 +717,14 @@ fn record(
             frontier: ops.last().map(|o| vec![o.id]).unwrap_or_default(),
         },
         &mid,
-        &w,
+        &w_all,
         &blobs,
         &PlanOpts {
             force: false,
             restore_missing: false,
             case_insensitive: wd::case_insensitive(&repo.dir)?,
             verb: "record",
+            ignored,
         },
     )?;
     for op in ops {
