@@ -66,6 +66,9 @@ same head id and identical files.
   (new ops use it; old ops keep theirs), then sync. Do this before
   recording in the copy: ops already recorded under the shared id still
   collide.
+- A successful `hub reid` also clears this repository's saved
+  `duplicate-replica` warnings (provisional default, #23; the other copy
+  keeps its own until it is synced or reid'd).
 - `hub init` draws the replica id from the OS CSPRNG. Existing repositories
   keep theirs.
 
@@ -87,9 +90,20 @@ same head id and identical files.
   They refuse, appending nothing, if that would clobber unrecorded changes.
 - `record` and `mkdir/touch/mv/rm` require the working directory to be at the
   head. After `hub checkout <older-id>`, run `hub checkout` to return first.
-- Names are byte-exact (D-003). On a case-insensitive filesystem, a checkout
-  whose tree has names that differ only in case is refused, even with
-  `--force`.
+- Names are byte-exact (D-003). On a case-insensitive filesystem, paths
+  whose names differ only in case cannot all exist on disk (D-019): checkout
+  skips just those clashing paths with a warning, records them in the index
+  as *unmaterialized* (`u` entries), and writes everything else. `hub status`
+  lists them under `unmaterialized (case clash ...)`. They are not reported
+  as deleted and `hub record` ignores them.
+- A working file or directory that sits on (or case-folds onto, or lies
+  under) an unmaterialized path is *blocked*. `hub status` prints one line
+  per path, `blocked:  <path> collides with unmaterialized <node paths>`,
+  under `blocked (record refuses until resolved):`. `hub record` refuses
+  until you rename or remove those files, or rename one of the clashing
+  nodes (for example in a case-sensitive checkout). Checkout never
+  overwrites a blocked file, and `mkdir/touch/mv/rm` refuse (`refusing to
+  mv: ...`) rather than overwrite it.
 - Symlinks and special files are skipped with a warning.
 
 ## Ignore rules (`.hubignore`)
@@ -135,4 +149,13 @@ classes, backslash escapes other than a leading `\#` or `\!`, nested
 - `blobs/<sha256 hex>`: raw file bytes, written temp, fsync, rename, then the
   directory is fsynced. Every read verifies the hash.
 - `index`: the last materialized version (`base` frontier), plus
-  path -> node, blob, size and mtime for fast change detection.
+  path -> node, blob, size and mtime for fast change detection. `u` lines are
+  unmaterialized paths (D-019).
+- `tmp/`, `checkout-in-progress`: in-flight working-file temps and the
+  interrupted-checkout marker (rerun `hub checkout` to finish).
+- Blob ids are canonical lowercase hex everywhere; an uppercase blob id in a
+  log is rejected as corrupt.
+- Locking uses `flock` on unix. Other targets have no repository lock and
+  every command prints a warning saying so.
+- The full layout is specified in the Wiki, Repository-Semantics,
+  "On-disk format v0".

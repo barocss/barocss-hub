@@ -144,6 +144,9 @@ impl Repo {
             _ => return err(format!("corrupt {}", rp.display())),
         };
         let mut warnings = Vec::new();
+        if !store::LOCKING_AVAILABLE {
+            warnings.push(store::NO_LOCK_WARNING.to_string());
+        }
         let ops = store::read_log(&op, store::OPLOG_HEADER)?;
         if ops.truncated_tail {
             warnings.push(format!(
@@ -495,7 +498,12 @@ fn print_warnings(warn: &mut dyn Write, ws: &[String]) -> Result<(), Error> {
 /// mkdir/touch/mv/rm: append `payload` and materialize its effect in the
 /// working directory. The plan is computed first, so a refused working-dir
 /// update appends nothing.
-fn mutate(repo: &mut Repo, payload: Payload, warn: &mut dyn Write) -> Result<(), Error> {
+fn mutate(
+    repo: &mut Repo,
+    verb: &'static str,
+    payload: Payload,
+    warn: &mut dyn Write,
+) -> Result<(), Error> {
     let root = repo.root();
     refuse_if_interrupted(repo)?;
     let idx = load_index(repo, warn)?;
@@ -521,6 +529,7 @@ fn mutate(repo: &mut Repo, payload: Payload, warn: &mut dyn Write) -> Result<(),
             restore_missing: false,
             case_insensitive: wd::case_insensitive(&repo.dir)?,
             ignored,
+            verb,
         },
     )?;
     repo.append_op(op)?;
@@ -763,6 +772,7 @@ fn checkout(
             restore_missing: true,
             case_insensitive: wd::case_insensitive(&repo.dir)?,
             ignored,
+            verb: "check out",
         },
     )?;
     let (written, removed) = plan.counts();
@@ -810,7 +820,9 @@ Commands:
                        local repo (log only; run `hub checkout` afterwards)
   publish <short-id|message>  mark a local checkpoint published (sync sends it)
   warnings             list sync warnings (D-008) and pending ops
-  reid                 give this repo a fresh replica id (after copying a .hub/)
+  reid                 give this repo a fresh replica id (after copying a .hub/;
+                       run it BEFORE recording in the copy); clears saved
+                       duplicate-replica warnings (provisional default)
   help, --help         show this help
 ";
 
@@ -881,12 +893,17 @@ pub fn run(
     match a.as_slice() {
         ["mkdir", p] | ["touch", p] => {
             let (parent, name) = resolve_new(&state, &proj, p)?;
-            let kind = if a[0] == "mkdir" {
-                Kind::Directory
+            let (kind, verb) = if a[0] == "mkdir" {
+                (Kind::Directory, "mkdir")
             } else {
-                Kind::File
+                (Kind::File, "touch")
             };
-            mutate(&mut repo, Payload::Create { kind, parent, name }, warn)?;
+            mutate(
+                &mut repo,
+                verb,
+                Payload::Create { kind, parent, name },
+                warn,
+            )?;
         }
         ["mv", from, to] => {
             let node = lookup(&proj, from)?;
@@ -899,6 +916,7 @@ pub fn run(
             }
             mutate(
                 &mut repo,
+                "mv",
                 Payload::Move {
                     node,
                     new_parent,
@@ -912,7 +930,7 @@ pub fn run(
             if node == hub_core::tree::ROOT {
                 return err("cannot remove the root");
             }
-            mutate(&mut repo, Payload::Delete { node }, warn)?;
+            mutate(&mut repo, "rm", Payload::Delete { node }, warn)?;
         }
         ["record"] => record(&mut repo, None, out, warn)?,
         ["record", "-m", msg] => record(&mut repo, Some(msg), out, warn)?,
