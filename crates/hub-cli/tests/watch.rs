@@ -539,3 +539,49 @@ fn peer_add_before_peer_init_is_not_self() {
     ok(&a, &["peer", "add", "../b"]);
     let _ = fs::remove_dir_all(t);
 }
+
+/// Crash a `checkout <old>` after the index save (before the pin write) or
+/// after the pin write (before the marker removal): the repo must end up
+/// pinned and a watcher must not record a local edit.
+#[test]
+fn crash_around_pin_write_still_pins() {
+    for stage in ["after-index", "after-pin"] {
+        let t = tmp(&format!("pincrash-{stage}"));
+        ok(&t, &["init"]);
+        fs::write(t.join("notes.txt"), b"v1").unwrap();
+        ok(&t, &["record", "-m", "cp1"]);
+        let cp1 = ok(&t, &["log"])
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        fs::write(t.join("extra.txt"), b"x").unwrap();
+        ok(&t, &["record"]);
+        let o = Command::new(env!("CARGO_BIN_EXE_hub"))
+            .args(["checkout", &cp1])
+            .current_dir(&t)
+            .env("HUB_TEST_CRASH_IN_CHECKOUT", stage)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!o.status.success(), "{stage}: checkout did not crash");
+        // Every crash point leaves the marker (and, after-pin, the pin).
+        assert!(t.join(".hub/checkout-in-progress").exists(), "{stage}");
+        assert_eq!(t.join(".hub/pinned").exists(), stage == "after-pin");
+        fs::write(t.join("notes.txt"), b"edited after crash").unwrap();
+        let n = op_count(&t);
+        let w = Watcher::start(&t, &[]);
+        wait_for("resume + pause", || {
+            w.output().contains("paused: ") && !t.join(".hub/checkout-in-progress").exists()
+        });
+        assert!(t.join(".hub/pinned").exists(), "{stage}: not pinned");
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(op_count(&t), n, "{stage}: edit recorded while pinned");
+        assert!(ok(&t, &["status"]).contains("pinned at "));
+        drop(w);
+        // Plain checkout clears it.
+        ok(&t, &["checkout"]);
+        assert!(!t.join(".hub/pinned").exists(), "{stage}");
+        let _ = fs::remove_dir_all(t);
+    }
+}

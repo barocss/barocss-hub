@@ -828,15 +828,15 @@ pub(crate) fn checkout(
         },
     )?;
     let (written, removed) = plan.counts();
-    ws.extend(wd::apply(plan, &root, &repo.dir)?);
     // Issue #25 repair (D-020): pinned iff the materialized version is not
-    // head. Written after the index; a crash before it leaves the
-    // checkout marker, whose resume re-derives the pin.
+    // head; `apply` writes or clears it before removing the marker.
+    let mut plan = plan;
     {
         let mut f = frontier.clone();
         f.sort();
-        watch::set_pinned(&repo.dir, (f != repo.head_frontier()).then_some(&f))?;
+        plan.pin = Some((f != repo.head_frontier()).then_some(f));
     }
+    ws.extend(wd::apply(plan, &root, &repo.dir)?);
     print_warnings(warn, &ws)?;
     let vid = VersionId::of_frontier(&frontier);
     writeln!(

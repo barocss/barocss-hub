@@ -572,6 +572,10 @@ pub struct Plan {
     index: BTreeMap<String, (NodeId, Entry, bool)>,
     base: Vec<OpId>,
     pub warnings: Vec<String>,
+    /// Issue #25 repair (D-020): `Some(pin)` makes [`apply`] write
+    /// (`Some(frontier)`) or clear (`None`) `.hub/pinned` after the index is
+    /// saved and *before* the marker is removed; `None` leaves it alone.
+    pub pin: Option<Option<Vec<OpId>>>,
 }
 
 impl Plan {
@@ -912,6 +916,11 @@ pub const MARKER: &str = "checkout-in-progress";
 /// after writing the first working file (marker present, index not saved).
 #[doc(hidden)]
 pub const CRASH_ENV: &str = "HUB_TEST_CRASH_IN_CHECKOUT";
+/// [`CRASH_ENV`] stage values: abort after the index save (before the pin
+/// write), or after the pin write (before the marker removal). Any other
+/// value aborts after the first working file.
+pub const CRASH_AFTER_INDEX: &str = "after-index";
+pub const CRASH_AFTER_PIN: &str = "after-pin";
 
 /// Remove leftover working-file temps under `.hub/tmp/`. Callers hold the
 /// exclusive repo lock, so no live writer owns them.
@@ -1035,7 +1044,10 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
         )
         .as_bytes(),
     )?;
-    let crash = std::env::var_os(CRASH_ENV).is_some();
+    let stage = std::env::var(CRASH_ENV).ok();
+    let crash = stage
+        .as_deref()
+        .is_some_and(|v| v != CRASH_AFTER_INDEX && v != CRASH_AFTER_PIN);
     for path in &p.force_remove {
         let fp = root.join(path);
         match fs::symlink_metadata(&fp) {
@@ -1087,6 +1099,17 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
         idx.entries.insert(path, (node, e));
     }
     idx.save(hub_dir)?;
+    if stage.as_deref() == Some(CRASH_AFTER_INDEX) {
+        std::process::abort();
+    }
+    // A crash at any point leaves either the marker (resume re-derives the
+    // pin) or the correct pin.
+    if let Some(pin) = &p.pin {
+        crate::watch::set_pinned(hub_dir, pin.as_ref())?;
+    }
+    if stage.as_deref() == Some(CRASH_AFTER_PIN) {
+        std::process::abort();
+    }
     fs::remove_file(&marker)?;
     fs::File::open(hub_dir)?.sync_all()?;
     Ok(warnings)
