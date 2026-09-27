@@ -397,7 +397,8 @@ pub fn sync_with(
     if !peer_path.is_dir() {
         return err(format!("no such directory: {peer_arg}"));
     }
-    let theirs = fs::canonicalize(find_hub(&peer_path)?)?;
+    // Canonicalize before the upward walk: `a/../b` must not find a's hub.
+    let theirs = fs::canonicalize(find_hub(&fs::canonicalize(&peer_path)?)?)?;
     if mine == theirs {
         return err("cannot sync a repository with itself");
     }

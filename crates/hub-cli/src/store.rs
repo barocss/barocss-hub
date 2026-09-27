@@ -368,9 +368,36 @@ mod sys {
     // Same values on Linux, macOS and the BSDs.
     pub const LOCK_SH: c_int = 1;
     pub const LOCK_EX: c_int = 2;
+    pub const LOCK_NB: c_int = 4;
     extern "C" {
         pub fn flock(fd: c_int, operation: c_int) -> c_int;
     }
+}
+
+/// Try to take an exclusive `flock` on `path` without blocking (Issue #25:
+/// `.hub/watch.lock`). `Ok(None)` = another process holds it. The lock is
+/// released when the returned file is closed, including on SIGKILL, so a
+/// crashed holder never looks alive. Non-unix: always granted.
+pub fn try_lock_exclusive(path: &Path) -> io::Result<Option<File>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: valid open fd owned by `file`; flock has no memory effects.
+        if unsafe { sys::flock(file.as_raw_fd(), sys::LOCK_EX | sys::LOCK_NB) } != 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(e);
+        }
+    }
+    Ok(Some(file))
 }
 
 impl RepoLock {

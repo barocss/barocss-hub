@@ -141,6 +141,57 @@ classes, backslash escapes other than a leading `\#` or `\!`, nested
   if one is in the way, it refuses and names it; move it away and retry.
 - Sync is unaffected: rules only apply when scanning the working directory.
 
+## Live sync between two folders (`hub watch`)
+
+`hub watch` records working-directory edits automatically, syncs with every
+configured peer and applies what arrives. Run it in the foreground in each
+folder; Ctrl-C stops it cleanly (exit 0).
+
+```sh
+mkdir a b
+(cd a && hub init) && (cd b && hub init)
+(cd a && hub peer add ../b)       # .hub/peers: local config, not replicated
+(cd b && hub peer add ../a)
+(cd a && hub watch)               # terminal 1
+(cd b && hub watch)               # terminal 2
+echo hello > a/notes.txt          # ~1 s later: b/notes.txt says hello
+echo "from b" >> b/notes.txt      # ~1 s later: a/notes.txt has both lines
+(cd a && hub status)              # "peers:", "watch: active (pid N)", clean
+```
+
+Watcher output (terminal 1) for the above, as actually run:
+
+```text
+watching /.../a (1 peer(s)); Ctrl-C to stop
+recorded 1 change(s):
+  added:    notes.txt
+synced with /.../b: received 0 op(s), 0 blob(s), 0 checkpoint(s); sent 2 op(s), 1 blob(s), 0 checkpoint(s)
+checked out f1137570 (1 written, 0 removed)
+watch stopped
+```
+
+- Change detection polls the tree (`--poll`, default 100 ms); an edit is
+  recorded after the tree has been quiet for `--debounce` (default 400 ms),
+  so a burst of saves becomes one record. Peers are also synced every
+  `--sync` ms (default 2000).
+- Auto-record is `hub record`: `.hubignore`, blocked paths and an
+  interrupted checkout are honoured; a refusal is printed and retried.
+  It never checkpoints; use `hub commit`. [decision-proposal]
+- Unrecorded edits are never clobbered: before incoming ops are applied the
+  local edits are recorded (depending on the version you last had on disk),
+  so a same-file edit on both sides becomes a content conflict in
+  `hub status` on both sides, with the same bytes in both folders.
+- The watcher's own writes are not re-recorded (the tree snapshot is taken
+  again after each step), and the op count stays constant when idle.
+- `hub checkout <id>` of an older version **pins** the working directory
+  (`.hub/pinned`): the watcher pauses auto-record and auto-checkout (it
+  keeps syncing the log) and says "paused: ..."; `hub status` shows
+  "pinned at <id>". Plain `hub checkout` (head) unpins and watching resumes.
+  `hub checkout <id>` naming head itself does not pin. [decision-proposal]
+- After a crash or `kill -9`, just start `hub watch` (or any command) again:
+  an interrupted checkout is resumed, a torn log tail is dropped, temps are
+  swept. A second `hub watch` on the same repo refuses while one runs.
+
 ## Storage (`.hub/`)
 
 - `replica`, `ops.log`, `checkpoints.log`, `lock`: see Issue #16.
@@ -151,6 +202,9 @@ classes, backslash escapes other than a leading `\#` or `\!`, nested
 - `index`: the last materialized version (`base` frontier), plus
   path -> node, blob, size and mtime for fast change detection. `u` lines are
   unmaterialized paths (D-019).
+- `peers`, `pinned`, `watch.lock`, `watch.pid`: Issue #25, local only (never
+  synced). A watch is active only while `watch.lock` is `flock`ed, so a pid
+  file left by a crash is ignored.
 - `tmp/`, `checkout-in-progress`: in-flight working-file temps and the
   interrupted-checkout marker (rerun `hub checkout` to finish).
 - Blob ids are canonical lowercase hex everywhere; an uppercase blob id in a
