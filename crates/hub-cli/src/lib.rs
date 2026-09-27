@@ -5,15 +5,8 @@
 
 pub mod blobs;
 pub mod store;
+pub mod sync;
 pub mod wd;
-
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use sha2::{Digest, Sha256};
 
 use hub_core::checkpoint::{Checkpoint, Checkpoints, ResolveError, VersionId, VersionIndex};
 use hub_core::projection::{project, short_id, Projection};
@@ -22,6 +15,10 @@ use hub_core::tree::{
     Replica, ReplicaId, State, ROOT,
 };
 use hub_core::version::{Store, Version};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use store::{LockMode, RepoLock, StoreError};
 use wd::{Change, Entry, Index, PlanOpts, Target};
@@ -62,7 +59,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
-fn err<T>(s: impl Into<String>) -> Result<T, Error> {
+pub(crate) fn err<T>(s: impl Into<String>) -> Result<T, Error> {
     Err(Error(s.into()))
 }
 
@@ -77,22 +74,6 @@ pub struct Repo {
     pub warnings: Vec<String>,
     /// `.hub/lock`, held for the lifetime of the `Repo`.
     _lock: RepoLock,
-}
-
-fn new_replica_id(root: &Path) -> ReplicaId {
-    let mut h = Sha256::new();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    h.update(now.to_be_bytes());
-    h.update(std::process::id().to_be_bytes());
-    h.update(root.to_string_lossy().as_bytes());
-    let d = h.finalize();
-    let mut b = [0u8; 16];
-    b.copy_from_slice(&d[..16]);
-    // Non-zero: replica 0 is reserved for ROOT/TRASH.
-    ReplicaId(u128::from_be_bytes(b).max(1))
 }
 
 impl Repo {
@@ -114,7 +95,7 @@ impl Repo {
         let (rp, op, cp) = Self::paths(&dir);
         store::write_atomic(&op, format!("{}\n", store::OPLOG_HEADER).as_bytes())?;
         store::write_atomic(&cp, format!("{}\n", store::CKPT_HEADER).as_bytes())?;
-        let rid = new_replica_id(root);
+        let rid = hub_core::sync::new_replica_id();
         // Replica file last: its presence marks a complete init.
         store::write_atomic(
             &rp,
@@ -800,6 +781,11 @@ Commands:
   commit -m <msg>      checkpoint the current head (local, private)
   log                  list checkpoints with short version ids, newest first
   show [-l] <short-id> print the tree of a version (hex prefix, >= 4 digits)
+  sync <path>          exchange ops, blobs and published checkpoints with another
+                       local repo (log only; run `hub checkout` afterwards)
+  publish <short-id|message>  mark a local checkpoint published (sync sends it)
+  warnings             list sync warnings (D-008) and pending ops
+  reid                 give this repo a fresh replica id (after copying a .hub/)
   help, --help         show this help
 ";
 
@@ -837,8 +823,15 @@ pub fn run(
         )?;
         return Ok(());
     }
+    if a[0] == "sync" {
+        return match a.as_slice() {
+            ["sync", p] => sync::sync_cmd(cwd, p, out, warn),
+            _ => Err(usage("sync")),
+        };
+    }
     let known = [
-        "mkdir", "touch", "mv", "rm", "ls", "status", "commit", "log", "show", "record", "checkout",
+        "publish", "warnings", "reid", "mkdir", "touch", "mv", "rm", "ls", "status", "commit",
+        "log", "show", "record", "checkout",
     ];
     if !known.contains(&a[0]) {
         return err(format!("unknown command '{}' (see hub --help)", a[0]));
@@ -848,7 +841,7 @@ pub fn run(
     // write); read-only commands take a shared lock.
     let mode = if matches!(
         a[0],
-        "mkdir" | "touch" | "mv" | "rm" | "commit" | "record" | "checkout"
+        "mkdir" | "touch" | "mv" | "rm" | "commit" | "record" | "checkout" | "publish" | "reid"
     ) {
         LockMode::Exclusive
     } else {
@@ -927,10 +920,11 @@ pub fn run(
             let hid = hub_core::checkpoint::version_id(&repo.store, &head);
             writeln!(
                 out,
-                "head {} ({} ops, {} checkpoints)",
+                "head {} ({} ops, {} checkpoints, {} published)",
                 ix.short(&hid),
                 repo.store.len(),
-                repo.checkpoints.len()
+                repo.checkpoints.len(),
+                sync::read_published(&repo)?.len()
             )?;
             let ev = evaluate(repo.store.values());
             let cs = render_conflicts(&proj, &ev.conflicts);
@@ -942,6 +936,19 @@ pub fn run(
                     writeln!(out, "  {c}")?;
                 }
             }
+            let (sw, npend) = sync::warnings_view(&repo)?;
+            if !sw.is_empty() {
+                writeln!(out, "sync warnings:")?;
+                for w in &sw {
+                    writeln!(out, "  {}", sync::render_warning(w))?;
+                }
+            }
+            if npend > 0 {
+                writeln!(
+                    out,
+                    "pending ops: {npend} (missing deps; retried on the next sync)"
+                )?;
+            }
             if wd::interrupted(&repo.dir)?.is_some() {
                 writeln!(out, "interrupted checkout: run `hub checkout` to finish it")?;
             }
@@ -952,6 +959,13 @@ pub fn run(
                     "working directory at version {} (not head)",
                     ix.short(&VersionId::of_frontier(&idx.base))
                 )?;
+                let n = sync::behind_by(&repo, &idx.base);
+                if n > 0 {
+                    writeln!(
+                        out,
+                        "working directory is behind head by {n} op(s); `hub checkout` brings it up to date"
+                    )?;
+                }
             }
             let mut ws = Vec::new();
             let w = wd::scan(&repo.root(), &idx, &mut ws)?;
@@ -977,11 +991,87 @@ pub fn run(
         }
         ["log"] => {
             let ix = repo.index();
-            let list: Vec<&Checkpoint> = repo.checkpoints.iter().collect();
+            let published = sync::read_published(&repo)?;
+            let mut list: Vec<&Checkpoint> = repo.checkpoints.iter().collect();
+            for c in &published {
+                if !list.contains(&c) {
+                    list.push(c);
+                }
+            }
             for c in list.iter().rev() {
-                writeln!(out, "{} {}", ix.short(&c.id()), c.message)?;
+                if published.contains(c) {
+                    writeln!(out, "{} [published] {}", ix.short(&c.id()), c.message)?;
+                } else {
+                    writeln!(out, "{} {}", ix.short(&c.id()), c.message)?;
+                }
             }
         }
+        ["publish", what] => {
+            let ix = repo.index();
+            let published = sync::read_published(&repo)?;
+            let mut cands: Vec<&Checkpoint> = repo
+                .checkpoints
+                .iter()
+                .filter(|c| c.message == *what)
+                .collect();
+            let lw = what.to_ascii_lowercase();
+            if cands.is_empty() && lw.len() >= 4 && lw.bytes().all(|b| b.is_ascii_hexdigit()) {
+                cands = repo
+                    .checkpoints
+                    .iter()
+                    .filter(|c| c.id().hex().starts_with(&lw))
+                    .collect();
+            }
+            let mut uniq: Vec<&Checkpoint> = Vec::new();
+            for c in cands {
+                if !uniq.contains(&c) {
+                    uniq.push(c);
+                }
+            }
+            match uniq.as_slice() {
+                [] => return err(format!("no local checkpoint matches '{what}'")),
+                [c] if published.contains(c) => {
+                    writeln!(
+                        out,
+                        "already published: [{}] {}",
+                        ix.short(&c.id()),
+                        c.message
+                    )?;
+                }
+                [c] => {
+                    sync::append_published(&repo, c)?;
+                    writeln!(out, "published [{}] {}", ix.short(&c.id()), c.message)?;
+                }
+                many => {
+                    return err(format!(
+                        "ambiguous checkpoint '{what}': {}; publish by exact message",
+                        many.iter()
+                            .map(|c| format!("[{}] {}", ix.short(&c.id()), c.message))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                }
+            }
+        }
+        ["warnings"] => {
+            let (sw, _) = sync::warnings_view(&repo)?;
+            let pend = sync::read_pending(&repo.dir)?;
+            if sw.is_empty() && pend.is_empty() {
+                writeln!(out, "no warnings")?;
+            }
+            for w in &sw {
+                writeln!(out, "{}", sync::render_warning(w))?;
+            }
+            for (o, p) in &pend {
+                writeln!(
+                    out,
+                    "pending op {} from peer {} (missing deps)",
+                    store::fmt_id(o.id),
+                    &format!("{:032x}", p.0)[..8]
+                )?;
+            }
+        }
+        ["reid"] => sync::reid(&mut repo, out)?,
         ["show", id] | ["show", "-l", id] => {
             let long = a.len() == 3;
             let ix = repo.index();
