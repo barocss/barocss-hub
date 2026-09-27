@@ -98,14 +98,7 @@ fn mtime_ns(m: &fs::Metadata) -> u128 {
 }
 
 fn parse_blob(t: &str) -> Result<BlobId, String> {
-    if t.len() != 64 {
-        return Err("bad blob".into());
-    }
-    let mut b = [0u8; 32];
-    for (i, o) in b.iter_mut().enumerate() {
-        *o = u8::from_str_radix(&t[2 * i..2 * i + 2], 16).map_err(|_| "bad blob")?;
-    }
-    Ok(BlobId(b))
+    crate::store::parse_blob(t)
 }
 
 fn parse_id(t: &str) -> Result<NodeId, String> {
@@ -533,6 +526,8 @@ pub struct PlanOpts {
     /// change them (true for `checkout`, false for mkdir/touch/mv/rm).
     pub restore_missing: bool,
     pub case_insensitive: bool,
+    /// Command named in a refusal: `"check out"`, `"mkdir"`, `"mv"`, ...
+    pub verb: &'static str,
 }
 
 /// Plan materializing `t` over the working directory `w` last written as
@@ -784,8 +779,14 @@ pub fn plan(
         }
     }
     if !refused.is_empty() {
+        let hint = if opts.verb == "check out" {
+            " (use --force to discard unrecorded changes)"
+        } else {
+            " (it would overwrite or delete unrecorded working-directory changes; nothing was appended)"
+        };
         return Err(Error(format!(
-            "refusing to check out (use --force to discard unrecorded changes):\n  {}",
+            "refusing to {}{hint}:\n  {}",
+            opts.verb,
             refused.join("\n  ")
         )));
     }

@@ -320,6 +320,36 @@ fn copied_hub_is_duplicate_replica_then_reid_allows_sync() {
     assert_eq!(snapshot(&a), snapshot(&b));
 }
 
+/// #23 PROVISIONAL default (`hub_cli::sync::REID_CLEARS_DUPLICATE_WARNINGS`,
+/// pending user confirmation): a successful `hub reid` clears this repo's
+/// saved duplicate-replica warnings; the other copy keeps its own.
+#[test]
+fn reid_clears_duplicate_replica_warnings() {
+    let t = tmp("dup-clear");
+    let a = t.join("a");
+    let b = t.join("b");
+    fs::create_dir_all(&a).unwrap();
+    ok(&a, &["init"]);
+    let st = Command::new("cp")
+        .args(["-R", a.to_str().unwrap(), b.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    fail(&b, &["sync", "../a"]);
+    assert!(ok(&b, &["warnings"]).contains("duplicate-replica"));
+    let rid = ok(&b, &["reid"]);
+    assert_eq!(
+        rid.contains("cleared 1 duplicate-replica warning(s)"),
+        hub_cli::sync::REID_CLEARS_DUPLICATE_WARNINGS,
+        "{rid}"
+    );
+    assert_eq!(
+        !ok(&b, &["warnings"]).contains("duplicate-replica"),
+        hub_cli::sync::REID_CLEARS_DUPLICATE_WARNINGS
+    );
+    assert!(ok(&a, &["warnings"]).contains("duplicate-replica"));
+}
+
 #[test]
 fn unpublished_checkpoint_never_reaches_peer() {
     let (_t, r) = repos("publish", &["a", "b"]);

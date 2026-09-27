@@ -260,8 +260,26 @@ fn persist_warnings(repo: &Repo, s: &SyncReplica) -> Result<(), Error> {
     rewrite(&repo.dir.join("warnings.log"), WARNINGS_HEADER, &ws)
 }
 
-fn persist(repo: &mut Repo, s: &SyncReplica, appended: &mut usize) -> Result<Counts, Error> {
-    let crash_at: Option<usize> = std::env::var(CRASH_ENV).ok().and_then(|v| v.parse().ok());
+/// Where a sync stops early (tests only). `Abort` is the process-level
+/// [`CRASH_ENV`] hook; `Return` is its in-process equivalent: the same point
+/// (after this many op appends across both repos, before the rest of the
+/// persist steps) but reported as an [`INTERRUPTED`] error instead of
+/// killing the process, so property tests can interrupt many syncs cheaply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Interrupt {
+    Abort(usize),
+    Return(usize),
+}
+
+/// Error message of an in-process [`Interrupt::Return`].
+pub const INTERRUPTED: &str = "sync interrupted (test hook)";
+
+fn persist(
+    repo: &mut Repo,
+    s: &SyncReplica,
+    appended: &mut usize,
+    stop: Option<Interrupt>,
+) -> Result<Counts, Error> {
     let new_ops: Vec<Op> = s
         .store()
         .values()
@@ -288,8 +306,10 @@ fn persist(repo: &mut Repo, s: &SyncReplica, appended: &mut usize) -> Result<Cou
     }
     // 2. Ops in `<` order.
     for o in &new_ops {
-        if crash_at == Some(*appended) {
-            std::process::abort();
+        match stop {
+            Some(Interrupt::Abort(n)) if n == *appended => std::process::abort(),
+            Some(Interrupt::Return(n)) if n == *appended => return err(INTERRUPTED),
+            _ => {}
         }
         repo.append_op(o.clone())?;
         *appended += 1;
@@ -351,6 +371,21 @@ fn dup_warning(peer: ReplicaId, other: &Path) -> RejectWarning {
 pub fn sync_cmd(
     cwd: &Path,
     peer_arg: &str,
+    out: &mut dyn Write,
+    warn: &mut dyn Write,
+) -> Result<(), Error> {
+    let stop = std::env::var(CRASH_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Interrupt::Abort);
+    sync_with(cwd, peer_arg, stop, out, warn)
+}
+
+/// [`sync_cmd`] with an explicit test interruption point.
+pub fn sync_with(
+    cwd: &Path,
+    peer_arg: &str,
+    stop: Option<Interrupt>,
     out: &mut dyn Write,
     warn: &mut dyn Write,
 ) -> Result<(), Error> {
@@ -431,8 +466,8 @@ pub fn sync_cmd(
         ));
     }
     let mut appended = 0;
-    let got = persist(&mut a, &sa, &mut appended)?;
-    let sent = persist(&mut b, &sb, &mut appended)?;
+    let got = persist(&mut a, &sa, &mut appended, stop)?;
+    let sent = persist(&mut b, &sb, &mut appended, stop)?;
     writeln!(
         out,
         "synced with {}: received {} op(s), {} blob(s), {} checkpoint(s); sent {} op(s), {} blob(s), {} checkpoint(s)",
@@ -485,7 +520,16 @@ pub fn behind_by(repo: &Repo, base: &[hub_core::tree::OpId]) -> usize {
     }
 }
 
+/// PROVISIONAL default (#23, pending user confirmation): after a successful
+/// `hub reid`, drop this repository's saved `duplicate-replica` warnings,
+/// since the id they complain about is no longer ours. Flip to `false` to
+/// keep them until cleared by hand; `reid_clears_duplicate_replica_warnings`
+/// in `tests/sync.rs` pins the current behavior.
+pub const REID_CLEARS_DUPLICATE_WARNINGS: bool = true;
+
 /// `hub reid`: a fresh CSPRNG replica id. Old ops keep their author id.
+/// Run it before recording in a copied repository: ops already recorded
+/// under the shared id still collide.
 pub fn reid(repo: &mut Repo, out: &mut dyn Write) -> Result<(), Error> {
     let old = repo.replica_id;
     let mut new = core::new_replica_id();
@@ -498,5 +542,18 @@ pub fn reid(repo: &mut Repo, out: &mut dyn Write) -> Result<(), Error> {
     )?;
     repo.replica_id = new;
     writeln!(out, "replica id {:032x} -> {:032x}", old.0, new.0)?;
+    if REID_CLEARS_DUPLICATE_WARNINGS {
+        let ws = read_warnings(&repo.dir)?;
+        let keep: Vec<String> = ws
+            .iter()
+            .filter(|w| w.reason != RejectReason::DuplicateReplica)
+            .map(encode_warning)
+            .collect();
+        let cleared = ws.len() - keep.len();
+        if cleared > 0 {
+            rewrite(&repo.dir.join("warnings.log"), WARNINGS_HEADER, &keep)?;
+            writeln!(out, "cleared {cleared} duplicate-replica warning(s)")?;
+        }
+    }
     Ok(())
 }
