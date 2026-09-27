@@ -109,7 +109,7 @@ pub fn fmt_id(n: NodeId) -> String {
     format!("{}.{:032x}", n.counter, n.replica.0)
 }
 
-fn parse_id(t: &str) -> Result<NodeId, String> {
+pub fn parse_id(t: &str) -> Result<NodeId, String> {
     let (c, r) = t.split_once('.').ok_or("bad id")?;
     if r.len() != 32 {
         return Err("bad replica".into());
@@ -298,11 +298,16 @@ pub fn read_log(path: &Path, header: &str) -> Result<LogRead, StoreError> {
     })
 }
 
+/// One framed record line: `<body>\t<crc>\n`.
+pub fn frame(body: &str) -> String {
+    debug_assert!(!body.contains('\t') && !body.contains('\n'));
+    format!("{body}\t{}\n", crc(body))
+}
+
 /// Append one record and fsync.
 pub fn append_record(path: &Path, body: &str) -> io::Result<()> {
-    debug_assert!(!body.contains('\t') && !body.contains('\n'));
     let mut f = OpenOptions::new().append(true).open(path)?;
-    f.write_all(format!("{body}\t{}\n", crc(body)).as_bytes())?;
+    f.write_all(frame(body).as_bytes())?;
     f.sync_data()
 }
 

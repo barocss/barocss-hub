@@ -165,6 +165,41 @@ impl SyncReplica {
         }
     }
 
+    /// Rebuild a replica from persisted parts (Issue #22: `.hub/` on disk).
+    /// `store` must be causally closed and every blob its `SetContent` ops
+    /// name must be in `blobs`. `pending` ops are re-buffered (and applied
+    /// if they became ready); `warnings` keep their fields, `stuck` is
+    /// recomputed on read. The rejected set is not persisted: a rejected op
+    /// that arrives again is re-rejected, and the warning dedups.
+    pub fn from_parts(
+        id: ReplicaId,
+        store: Store,
+        blobs: BlobStore,
+        pending: Vec<(Op, PeerId)>,
+        warnings: Vec<RejectWarning>,
+        published: Vec<Checkpoint>,
+    ) -> Self {
+        let mut r = SyncReplica::with_id(id);
+        r.tick = warnings.iter().map(|w| w.first_seen).max().unwrap_or(0);
+        r.counter = store.keys().map(|o| o.counter).max().unwrap_or(0);
+        r.store = store;
+        r.blobs = blobs;
+        r.warnings = warnings;
+        r.published = published;
+        for (op, peer) in pending {
+            if !r.store.contains_key(&op.id) {
+                r.pending.insert(op.id, (op, peer));
+            }
+        }
+        r.drain();
+        r
+    }
+
+    /// Buffered ops with the peer each came from, in `<` order.
+    pub fn pending_ops(&self) -> Vec<(Op, PeerId)> {
+        self.pending.values().cloned().collect()
+    }
+
     pub fn id(&self) -> ReplicaId {
         self.id
     }
