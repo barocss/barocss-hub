@@ -90,8 +90,42 @@ same head id and identical files.
 - Names are byte-exact (D-003). On a case-insensitive filesystem, a checkout
   whose tree has names that differ only in case is refused, even with
   `--force`.
-- Symlinks and special files are skipped with a warning. Only `.hub/` is
-  ignored (there is no `.hubignore` yet).
+- Symlinks and special files are skipped with a warning.
+
+## Ignore rules (`.hubignore`)
+
+A `.hubignore` file at the working-directory root lists paths that `record`
+never adds. `.hub/` is always ignored. Example:
+
+```text
+# build output
+target/
+*.log
+!keep.log
+**/node_modules/
+```
+
+Supported (a subset of gitignore): blank lines and `#` comments; `!` to
+re-include (the last matching line wins); a trailing `/` matches directories
+only; a pattern with a `/` at the start or in the middle is anchored to the
+root, otherwise it matches the name at any depth; `*` and `?` (never across
+`/`); `**` as a whole segment (`**/x`, `a/**/b`, `a/**`). As in git, nothing
+inside an ignored directory can be re-included. Not supported: `[...]`
+classes, backslash escapes other than a leading `\#` or `\!`, nested
+`.hubignore` files, global or per-repo exclude files.
+
+- `.hubignore` is an ordinary tracked file: record it and it syncs, so every
+  replica ignores the same paths. [decision-proposal]
+- A file that is already tracked stays tracked when a rule starts matching
+  it; its edits and deletion are still recorded, and `hub status` lists it
+  under "tracked but ignored". Use `hub rm` to stop tracking it.
+  [decision-proposal]
+- `hub status` hides ignored files; `hub status --ignored` lists them (the
+  top-most ignored path of each ignored subtree).
+- `hub checkout` still writes tracked files that match a rule. It never
+  deletes or overwrites an ignored untracked file, **even with `--force`**:
+  if one is in the way, it refuses and names it; move it away and retry.
+- Sync is unaffected: rules only apply when scanning the working directory.
 
 ## Storage (`.hub/`)
 

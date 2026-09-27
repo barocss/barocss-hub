@@ -224,12 +224,47 @@ impl Index {
 /// The current working directory contents.
 pub type Scan = BTreeMap<String, Entry>;
 
-/// Walk `root` (excluding top-level `.hub`), hashing files unless the index
-/// stat cache is trustworthy.
+/// Untracked working-directory paths matched by `.hubignore` (Issue #24).
+pub type Ignored = BTreeSet<String>;
+
+/// Stand-in blob for ignored files, which are never hashed. It cannot equal
+/// a real content hash in practice, and [`plan`] refuses to touch ignored
+/// paths before comparing blobs.
+const IGNORED_BLOB: BlobId = BlobId([0xff; 32]);
+
+fn has_tracked_under(idx: &Index, dir: &str) -> bool {
+    let lo = format!("{dir}/");
+    idx.entries
+        .range(lo.clone()..)
+        .next()
+        .is_some_and(|(k, _)| k.starts_with(&lo))
+}
+
+/// Walk `root` (excluding top-level `.hub`) and return only the paths that
+/// are tracked or not ignored: what `status` and `record` see.
 pub fn scan(root: &Path, idx: &Index, warnings: &mut Vec<String>) -> Result<Scan, Error> {
+    let (mut w, ign) = scan_all(root, idx, warnings)?;
+    w.retain(|p, _| !ign.contains(p));
+    Ok(w)
+}
+
+/// Walk `root` (excluding top-level `.hub`), hashing files unless the index
+/// stat cache is trustworthy. The scan includes untracked ignored paths
+/// (listed again in the returned set): ignored files are not hashed, and an
+/// ignored untracked directory is not descended unless tracked paths lie
+/// under it. Tracked paths are never classed as ignored ([decision-proposal],
+/// #24: once tracked, a path stays tracked even if a rule matches it).
+pub fn scan_all(
+    root: &Path,
+    idx: &Index,
+    warnings: &mut Vec<String>,
+) -> Result<(Scan, Ignored), Error> {
+    let ig = crate::ignore::Ignore::load(root)?;
     let mut out = Scan::new();
-    let mut stack = vec![(root.to_path_buf(), String::new())];
-    while let Some((dir, rel)) = stack.pop() {
+    let mut ignored = Ignored::new();
+    // (dir, rel, an ancestor dir is ignored)
+    let mut stack = vec![(root.to_path_buf(), String::new(), false)];
+    while let Some((dir, rel, under_ignored)) = stack.pop() {
         for e in fs::read_dir(&dir)? {
             let e = e?;
             let name = e.file_name();
@@ -250,13 +285,35 @@ pub fn scan(root: &Path, idx: &Index, warnings: &mut Vec<String>) -> Result<Scan
             };
             let md = fs::symlink_metadata(e.path())?;
             let ft = md.file_type();
+            let tracked = idx.entries.contains_key(&path);
+            let matched = under_ignored || ig.is_ignored_here(&path, ft.is_dir());
+            let is_ign = matched && !tracked;
             if ft.is_symlink() {
-                warnings.push(format!("skipping symlink '{path}' (unsupported in v0)"));
+                if !is_ign {
+                    warnings.push(format!("skipping symlink '{path}' (unsupported in v0)"));
+                }
             } else if ft.is_dir() {
                 out.insert(path.clone(), Entry::Dir);
-                stack.push((e.path(), path));
+                if is_ign {
+                    ignored.insert(path.clone());
+                }
+                if !is_ign || has_tracked_under(idx, &path) {
+                    stack.push((e.path(), path, matched));
+                }
             } else if ft.is_file() {
                 let (size, mtime) = (md.len(), mtime_ns(&md));
+                if is_ign {
+                    ignored.insert(path.clone());
+                    out.insert(
+                        path,
+                        Entry::File {
+                            blob: IGNORED_BLOB,
+                            size,
+                            mtime,
+                        },
+                    );
+                    continue;
+                }
                 let cached = match idx.entries.get(&path) {
                     Some((
                         _,
@@ -273,12 +330,24 @@ pub fn scan(root: &Path, idx: &Index, warnings: &mut Vec<String>) -> Result<Scan
                     None => BlobId::of(&fs::read(e.path())?),
                 };
                 out.insert(path, Entry::File { blob, size, mtime });
-            } else {
+            } else if !is_ign {
                 warnings.push(format!("skipping special file '{path}'"));
             }
         }
     }
-    Ok(out)
+    Ok((out, ignored))
+}
+
+/// Tracked paths (index entries) that an ignore rule matches: they stay
+/// tracked ([decision-proposal], #24) and `status` notes them.
+pub fn tracked_but_ignored(root: &Path, idx: &Index) -> Result<Vec<String>, Error> {
+    let ig = crate::ignore::Ignore::load(root)?;
+    Ok(idx
+        .entries
+        .iter()
+        .filter(|(p, (_, e))| ig.is_ignored(p, e.is_dir()))
+        .map(|(p, _)| p.clone())
+        .collect())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -533,6 +602,9 @@ pub struct PlanOpts {
     /// change them (true for `checkout`, false for mkdir/touch/mv/rm).
     pub restore_missing: bool,
     pub case_insensitive: bool,
+    /// Untracked ignored paths in `w` (from [`scan_all`]): never written
+    /// over or deleted, even under `force` (Issue #24).
+    pub ignored: Ignored,
 }
 
 /// Plan materializing `t` over the working directory `w` last written as
@@ -647,6 +719,31 @@ pub fn plan(
     };
     // 2. Target paths, shallow first (BTreeMap order puts parents first).
     for (path, (node, blob)) in &tgt {
+        if opts.ignored.contains(path) {
+            refused.push(format!(
+                "ignored untracked '{path}' is in the way (never deleted, even with --force; move it away)"
+            ));
+            continue;
+        }
+        // A tracked directory being removed (non-recursively) and replaced
+        // by a file must be empty of untracked leftovers, or the file write
+        // would fail half-way (found while testing #24).
+        if blob.is_some() && removing.contains(path) && w.get(path).is_some_and(Entry::is_dir) {
+            let pre = format!("{path}/");
+            let left = w
+                .keys()
+                .find(|k| k.starts_with(&pre) && !idx.entries.contains_key(*k));
+            if let Some(k) = left {
+                if opts.force {
+                    p.force_remove.push(path.clone());
+                } else {
+                    refused.push(format!(
+                        "untracked '{k}' is inside directory '{path}', which would be replaced by a file"
+                    ));
+                    continue;
+                }
+            }
+        }
         let we = w.get(path).filter(|_| !gone(&removing, path));
         // Case-insensitive: an on-disk sibling differing only by case is in
         // the way unless it is being removed.
@@ -781,6 +878,16 @@ pub fn plan(
                     );
                 }
             }
+        }
+    }
+    // Ignored untracked files are never deleted, even with --force: refuse
+    // any forced removal that is, or contains, an ignored path.
+    for f in &p.force_remove {
+        let pre = format!("{f}/");
+        if let Some(i) = opts.ignored.iter().find(|i| *i == f || i.starts_with(&pre)) {
+            refused.push(format!(
+                "ignored untracked '{i}' would be deleted (never deleted, even with --force; move it away)"
+            ));
         }
     }
     if !refused.is_empty() {

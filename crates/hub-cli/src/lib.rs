@@ -4,6 +4,7 @@
 //! can be tested without spawning a process. `main.rs` is a thin wrapper.
 
 pub mod blobs;
+pub mod ignore;
 pub mod store;
 pub mod sync;
 pub mod wd;
@@ -505,7 +506,7 @@ fn mutate(repo: &mut Repo, payload: Payload, warn: &mut dyn Write) -> Result<(),
     let ev = evaluate(repo.store.values().chain(std::iter::once(&op)));
     let proj = project(&ev.state);
     let mut ws = Vec::new();
-    let w = wd::scan(&root, &idx, &mut ws)?;
+    let (w, ignored) = wd::scan_all(&root, &idx, &mut ws)?;
     let plan = wd::plan(
         &Target {
             state: &ev.state,
@@ -519,11 +520,16 @@ fn mutate(repo: &mut Repo, payload: Payload, warn: &mut dyn Write) -> Result<(),
             force: false,
             restore_missing: false,
             case_insensitive: wd::case_insensitive(&repo.dir)?,
+            ignored,
         },
     )?;
     repo.append_op(op)?;
     ws.extend(wd::apply(plan, &root, &repo.dir)?);
     print_warnings(warn, &ws)
+}
+
+fn w_all_is_dir(root: &Path, p: &str) -> bool {
+    fs::symlink_metadata(root.join(p)).is_ok_and(|m| m.is_dir())
 }
 
 fn record(
@@ -741,7 +747,7 @@ fn checkout(
         Err(e) => return Err(e),
     };
     let mut ws = Vec::new();
-    let w = wd::scan(&root, &idx, &mut ws)?;
+    let (w, ignored) = wd::scan_all(&root, &idx, &mut ws)?;
     let frontier = v.frontier(&repo.store);
     let plan = wd::plan(
         &Target {
@@ -756,6 +762,7 @@ fn checkout(
             force,
             restore_missing: true,
             case_insensitive: wd::case_insensitive(&repo.dir)?,
+            ignored,
         },
     )?;
     let (written, removed) = plan.counts();
@@ -794,7 +801,8 @@ Commands:
   mv <from> <to>       move/rename a node, <to> must not exist (op + working directory)
   rm <path>            delete a node, moves it to TRASH (op + working directory)
   ls [-l] [path]       list the projected head tree (-l: node ids, blob ids)
-  status               head, conflicts, unrecorded working-directory changes, tree
+  status [--ignored]   head, conflicts, unrecorded working-directory changes, tree
+                       (--ignored: also list paths excluded by .hubignore)
   commit -m <msg>      checkpoint the current head (local, private)
   log                  list checkpoints with short version ids, newest first
   show [-l] <short-id> print the tree of a version (hex prefix, >= 4 digits)
@@ -931,7 +939,7 @@ pub fn run(
                 writeln!(out, "{l}")?;
             }
         }
-        ["status"] => {
+        ["status"] | ["status", "--ignored"] => {
             let ix = repo.index();
             let head = repo.head();
             let hid = hub_core::checkpoint::version_id(&repo.store, &head);
@@ -985,9 +993,33 @@ pub fn run(
                 }
             }
             let mut ws = Vec::new();
-            let w = wd::scan(&repo.root(), &idx, &mut ws)?;
+            let (mut w, ignored) = wd::scan_all(&repo.root(), &idx, &mut ws)?;
+            w.retain(|p, _| !ignored.contains(p));
             print_warnings(warn, &ws)?;
             let changes = wd::diff(&idx, &w);
+            let tbi = wd::tracked_but_ignored(&repo.root(), &idx)?;
+            if !tbi.is_empty() {
+                writeln!(
+                    out,
+                    "tracked but ignored (still tracked; `hub rm` to stop tracking):"
+                )?;
+                for p in &tbi {
+                    writeln!(out, "  {p}")?;
+                }
+            }
+            if a.len() == 2 && ignored.is_empty() {
+                writeln!(out, "ignored: none")?;
+            } else if a.len() == 2 {
+                writeln!(out, "ignored:")?;
+                // Only the top-most ignored path of an ignored subtree.
+                for p in &ignored {
+                    let covered = p.match_indices('/').any(|(i, _)| ignored.contains(&p[..i]));
+                    if !covered {
+                        let dir = w_all_is_dir(&repo.root(), p);
+                        writeln!(out, "  {p}{}", if dir { "/" } else { "" })?;
+                    }
+                }
+            }
             let unmat: Vec<&String> = idx
                 .entries
                 .iter()
