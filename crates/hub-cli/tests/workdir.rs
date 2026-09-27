@@ -487,7 +487,11 @@ fn assert_blocked_reported(d: &Path, env: &[(&str, &str)]) {
     fs::write(d.join("README"), b"user bytes").unwrap();
     let o = run(&["mv", "readme", "readme2"]);
     assert_eq!(fs::read(d.join("README")).unwrap(), b"user bytes");
-    let _ = o;
+    // #23: the refusal names the command (mv), not checkout.
+    assert!(!o.status.success());
+    let e = String::from_utf8(o.stderr).unwrap();
+    assert!(e.contains("refusing to mv") && e.contains("README"), "{e}");
+    assert!(!e.contains("check out"), "{e}");
 }
 
 #[test]

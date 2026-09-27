@@ -136,9 +136,15 @@ fn parse_ids(t: &str) -> Result<Vec<NodeId>, String> {
     t.split(',').map(parse_id).collect()
 }
 
-fn parse_blob(t: &str) -> Result<BlobId, String> {
-    if t.len() != 64 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("bad blob".into());
+/// Parse a blob id token. Canonical form only (decided in #23): exactly 64
+/// lowercase hex digits, as `BlobId::hex` writes and as `.hub/blobs/` names
+/// files. Uppercase is rejected so one blob has one spelling in every log.
+pub fn parse_blob(t: &str) -> Result<BlobId, String> {
+    if t.len() != 64 {
+        return Err(format!("bad blob id (need 64 hex digits, got {})", t.len()));
+    }
+    if !t.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err("bad blob id (must be lowercase hex, canonical form)".into());
     }
     let mut out = [0u8; 32];
     for (i, o) in out.iter_mut().enumerate() {
@@ -341,8 +347,16 @@ pub enum LockMode {
 /// crashed holder never leaves a stale lock).
 ///
 /// `flock` is declared directly against the platform C library (no new
-/// crate); std's `File::lock` needs Rust 1.89. On non-unix targets this is a
-/// no-op; concurrent use there is unsupported in v0.
+/// crate); std's `File::lock` needs Rust 1.89 (toolchain is 1.87). On
+/// non-unix targets this is a no-op; concurrent use there is unsupported in
+/// v0 and `Repo::open` emits [`NO_LOCK_WARNING`] on every command (#23).
+/// Warning shown on targets where [`RepoLock`] cannot lock.
+pub const NO_LOCK_WARNING: &str = "repository locking is UNAVAILABLE on this platform \
+     (no flock); do not run two hub commands on the same repository at once";
+
+/// Whether [`RepoLock`] actually locks on this target.
+pub const LOCKING_AVAILABLE: bool = cfg!(unix);
+
 #[derive(Debug)]
 pub struct RepoLock {
     _file: File,
@@ -396,6 +410,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn no_lock_warning_matches_target() {
+        // #23: non-unix builds warn loudly (Repo::open); unix builds lock.
+        assert_eq!(LOCKING_AVAILABLE, cfg!(unix));
+        assert!(NO_LOCK_WARNING.contains("UNAVAILABLE"));
+    }
+
+    #[test]
     fn set_content_round_trip() {
         let op = Op {
             id: NodeId::new(7, 0xabc),
@@ -413,5 +434,12 @@ mod tests {
         )));
         assert_eq!(decode_op(&line).unwrap(), op);
         assert!(decode_op(&line.replace(&BlobId::of(b"hello").hex(), "zz")).is_err());
+        // Canonical form only (#23): uppercase blob hex is rejected.
+        let upper = line.replace(
+            &BlobId::of(b"hello").hex(),
+            &BlobId::of(b"hello").hex().to_uppercase(),
+        );
+        let e = decode_op(&upper).unwrap_err();
+        assert!(e.contains("lowercase"), "{e}");
     }
 }
