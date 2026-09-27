@@ -569,6 +569,15 @@ fn record(
     let mut ws = Vec::new();
     let w = wd::scan(&root, &idx, &mut ws)?;
     print_warnings(warn, &ws)?;
+    let blocked = wd::blocked(&idx, &w);
+    if !blocked.is_empty() {
+        return Err(Error(format!(
+            "refusing to record: working-directory paths collide with unmaterialized \
+             case-clashing paths (D-019):\n  {}\nresolve by renaming or removing these \
+             files, or rename one of the clashing nodes (e.g. in a case-sensitive checkout)",
+            wd::render_blocked(&blocked).join("\n  ")
+        )));
+    }
     let changes = wd::diff(&idx, &w);
     if changes.is_empty() {
         writeln!(out, "nothing to record")?;
@@ -980,9 +989,16 @@ pub fn run(
                     writeln!(out, "  {p}")?;
                 }
             }
-            if changes.is_empty() {
+            let blocked = wd::blocked(&idx, &w);
+            if !blocked.is_empty() {
+                writeln!(out, "blocked (record refuses until resolved):")?;
+                for l in wd::render_blocked(&blocked) {
+                    writeln!(out, "  {l}")?;
+                }
+            }
+            if changes.is_empty() && blocked.is_empty() {
                 writeln!(out, "working directory: clean")?;
-            } else {
+            } else if !changes.is_empty() {
                 writeln!(out, "unrecorded changes:")?;
                 for l in wd::render_changes(&changes, &idx, &w) {
                     writeln!(out, "  {l}")?;

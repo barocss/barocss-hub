@@ -292,8 +292,52 @@ pub enum Change {
     Renamed(String, String),
 }
 
-/// Changes from the index to the scan.
+/// A working-directory path that occupies an unmaterialized (D-019) path:
+/// equal to one, case-folding onto one, or under such a path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Blocked {
+    pub path: String,
+    /// The unmaterialized index paths it collides with, with their nodes.
+    pub with: Vec<(String, NodeId)>,
+}
+
+/// Scanned paths that collide with unmaterialized index entries (#20
+/// repair). Such paths are excluded from [`diff`]; `status` reports them and
+/// `record` refuses while any exist.
+pub fn blocked(idx: &Index, w: &Scan) -> Vec<Blocked> {
+    let unmat: Vec<(String, &String, NodeId)> = idx
+        .entries
+        .iter()
+        .filter(|(_, (_, e))| *e == Entry::Unmaterialized)
+        .map(|(p, (n, _))| (fold(p), p, *n))
+        .collect();
+    if unmat.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for p in w.keys() {
+        let fp = fold(p);
+        let with: Vec<(String, NodeId)> = unmat
+            .iter()
+            .filter(|(fq, _, _)| {
+                fp == *fq || (fp.starts_with(fq.as_str()) && fp.as_bytes()[fq.len()] == b'/')
+            })
+            .map(|(_, q, n)| ((*q).clone(), *n))
+            .collect();
+        if !with.is_empty() {
+            out.push(Blocked {
+                path: p.clone(),
+                with,
+            });
+        }
+    }
+    out
+}
+
+/// Changes from the index to the scan. Paths reported by [`blocked`] are
+/// not changes.
 pub fn diff(idx: &Index, w: &Scan) -> Vec<Change> {
+    let blocked: BTreeSet<String> = blocked(idx, w).into_iter().map(|b| b.path).collect();
     let mut added = Vec::new();
     let mut deleted = Vec::new();
     let mut out = Vec::new();
@@ -303,6 +347,7 @@ pub fn diff(idx: &Index, w: &Scan) -> Vec<Change> {
         }
         match w.get(p) {
             None => deleted.push(p.clone()),
+            Some(_) if blocked.contains(p) => {}
             Some(we) if we.is_dir() != ie.is_dir() => {
                 deleted.push(p.clone());
                 added.push(p.clone());
@@ -312,7 +357,7 @@ pub fn diff(idx: &Index, w: &Scan) -> Vec<Change> {
         }
     }
     for p in w.keys() {
-        if !idx.entries.contains_key(p) {
+        if !idx.entries.contains_key(p) && !blocked.contains(p) {
             added.push(p.clone());
         }
     }
@@ -353,6 +398,23 @@ pub fn diff(idx: &Index, w: &Scan) -> Vec<Change> {
     );
     out.sort();
     out
+}
+
+pub fn render_blocked(b: &[Blocked]) -> Vec<String> {
+    b.iter()
+        .map(|b| {
+            let with: Vec<String> = b
+                .with
+                .iter()
+                .map(|(q, n)| format!("'{q}' ({})", fmt_id(*n)))
+                .collect();
+            format!(
+                "blocked:  {} collides with unmaterialized {}",
+                b.path,
+                with.join(", ")
+            )
+        })
+        .collect()
 }
 
 pub fn render_changes(changes: &[Change], idx: &Index, w: &Scan) -> Vec<String> {

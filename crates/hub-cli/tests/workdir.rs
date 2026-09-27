@@ -437,6 +437,75 @@ fn assert_clash_skipped(d: &Path, env: &[(&str, &str)]) {
     assert!(st.contains("working directory: clean"), "{st}");
 }
 
+/// #20 repair: a working file occupying (or case-folding onto, or under) an
+/// unmaterialized path is reported as blocked; record refuses; a mutating
+/// command that would materialize that path does not overwrite it.
+fn assert_blocked_reported(d: &Path, env: &[(&str, &str)]) {
+    let run = |args: &[&str]| hub_env(d, args, env);
+    let out = |o: Output| String::from_utf8(o.stdout).unwrap();
+    assert!(run(&["checkout"]).status.success());
+    // A file at an exact unmaterialized path.
+    fs::write(d.join("README"), b"user bytes").unwrap();
+    let st = out(run(&["status"]));
+    assert!(
+        st.contains("blocked:  README collides with unmaterialized"),
+        "{st}"
+    );
+    assert!(st.contains("'README'") && st.contains("'readme'"), "{st}");
+    assert!(!st.contains("working directory: clean"), "{st}");
+    let o = run(&["record"]);
+    assert!(!o.status.success());
+    let e = String::from_utf8(o.stderr).unwrap();
+    assert!(
+        e.contains("refusing to record") && e.contains("README"),
+        "{e}"
+    );
+    assert!(e.contains("renam"), "{e}");
+    // A directory case-folding onto an unmaterialized dir, with a file in it.
+    fs::remove_file(d.join("README")).unwrap();
+    fs::create_dir(d.join("SRC")).unwrap();
+    fs::write(d.join("SRC/new"), b"n").unwrap();
+    let st = out(run(&["status"]));
+    assert!(
+        st.contains("blocked:  SRC collides with unmaterialized"),
+        "{st}"
+    );
+    assert!(
+        st.contains("blocked:  SRC/new collides with unmaterialized"),
+        "{st}"
+    );
+    assert!(!run(&["record"]).status.success());
+    // Checkout does not touch the blocked paths.
+    assert!(run(&["checkout"]).status.success());
+    assert_eq!(fs::read(d.join("SRC/new")).unwrap(), b"n");
+    // Resolve: remove them; clean again, record has nothing to do.
+    fs::remove_dir_all(d.join("SRC")).unwrap();
+    let st = out(run(&["status"]));
+    assert!(st.contains("working directory: clean"), "{st}");
+    assert!(out(run(&["record"])).contains("nothing to record"));
+    // Un-clash by renaming one node: the occupying file is not overwritten.
+    fs::write(d.join("README"), b"user bytes").unwrap();
+    let o = run(&["mv", "readme", "readme2"]);
+    assert_eq!(fs::read(d.join("README")).unwrap(), b"user bytes");
+    let _ = o;
+}
+
+#[test]
+fn blocked_file_on_unmaterialized_path_real_fs() {
+    let d = tmp("case-blocked-real");
+    clash_repo(&d);
+    if fs_is_case_insensitive(&d) {
+        assert_blocked_reported(&d, &[]);
+    }
+}
+
+#[test]
+fn blocked_file_on_unmaterialized_path_forced_probe() {
+    let d = tmp("case-blocked-forced");
+    clash_repo(&d);
+    assert_blocked_reported(&d, &[("HUB_TEST_FORCE_CASE_INSENSITIVE", "1")]);
+}
+
 #[test]
 fn case_clash_skips_only_clashing_files_real_fs() {
     // Uses the real filesystem's behavior (macOS APFS/HFS+ default:
