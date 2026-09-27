@@ -2,8 +2,8 @@
 //!
 //! One file, `.hubignore` at the working-directory root, one pattern per
 //! line. Supported:
-//! - blank lines and lines starting with `#` are skipped; trailing spaces
-//!   are trimmed; a leading `\` escapes a literal `#` or `!`;
+//! - blank lines and lines starting with `#` are skipped; trailing spaces,
+//!   tabs and `\r` are trimmed; a leading `\` escapes a literal `#` or `!`;
 //! - `!pat` negates (re-includes); the **last** matching line wins;
 //! - a trailing `/` matches directories only;
 //! - a pattern with a `/` at the start or in the middle is anchored to the

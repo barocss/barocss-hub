@@ -504,6 +504,7 @@ pub fn render_changes(changes: &[Change], idx: &Index, w: &Scan) -> Vec<String> 
 /// probing, so case-clash handling (D-019) can be tested on a case-sensitive
 /// filesystem. Clash detection is purely name-based, so the only difference
 /// from a real case-insensitive filesystem is that both names could exist.
+#[doc(hidden)]
 pub const FORCE_CI_ENV: &str = "HUB_TEST_FORCE_CASE_INSENSITIVE";
 
 /// Probe whether the filesystem holding `hub_dir` folds ASCII case.
@@ -886,7 +887,9 @@ pub fn plan(
         }
     }
     if !refused.is_empty() {
-        let hint = if opts.verb == "check out" {
+        let hint = if opts.verb == "check out" && opts.force {
+            " (these paths are protected even with --force)"
+        } else if opts.verb == "check out" {
             " (use --force to discard unrecorded changes)"
         } else {
             " (it would overwrite or delete unrecorded working-directory changes; nothing was appended)"
@@ -907,6 +910,7 @@ pub const TMP_DIR: &str = "tmp";
 pub const MARKER: &str = "checkout-in-progress";
 /// Test-only fault injection: when set, [`apply`] aborts the process right
 /// after writing the first working file (marker present, index not saved).
+#[doc(hidden)]
 pub const CRASH_ENV: &str = "HUB_TEST_CRASH_IN_CHECKOUT";
 
 /// Remove leftover working-file temps under `.hub/tmp/`. Callers hold the

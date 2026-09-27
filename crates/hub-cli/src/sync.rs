@@ -47,6 +47,7 @@ pub const PUBLISHED_HEADER: &str = "barocss-hub/published/v0";
 
 /// Test-only fault injection: abort the process after this many ops have
 /// been appended (across both repos) during a sync.
+#[doc(hidden)]
 pub const CRASH_ENV: &str = "HUB_TEST_CRASH_IN_SYNC";
 
 /// Ops per `Ops` batch.
@@ -265,6 +266,7 @@ fn persist_warnings(repo: &Repo, s: &SyncReplica) -> Result<(), Error> {
 /// (after this many op appends across both repos, before the rest of the
 /// persist steps) but reported as an [`INTERRUPTED`] error instead of
 /// killing the process, so property tests can interrupt many syncs cheaply.
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Interrupt {
     Abort(usize),
@@ -382,6 +384,7 @@ pub fn sync_cmd(
 }
 
 /// [`sync_cmd`] with an explicit test interruption point.
+#[doc(hidden)]
 pub fn sync_with(
     cwd: &Path,
     peer_arg: &str,
