@@ -8,6 +8,11 @@
 //! is still asserted after the final full schedule reruns every sync. The
 //! share of cases with at least one interrupt that actually fired is
 //! measured, printed, and required to be >= 20%.
+//!
+//! Issue #26: after every step each repo's working tree must equal
+//! `project(head)` of that repo (paths, kinds and bytes), so a record that
+//! changes *other* nodes' projected names (a collision disappearing) must
+//! materialize those renames. The shrunk failing seed is pinned below.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -51,6 +56,30 @@ fn snapshot(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
     }
     let mut m = BTreeMap::new();
     walk(root, "", &mut m);
+    m
+}
+
+/// The working tree `d` must hold: `project(head)` with blob bytes.
+fn projected(d: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+    let repo =
+        hub_cli::Repo::open_dir_with(d.join(".hub"), hub_cli::store::LockMode::Shared).unwrap();
+    let blobs = repo.blobs().unwrap();
+    let state = repo.state();
+    let proj = hub_core::projection::project(state);
+    let mut m = BTreeMap::new();
+    for (p, n) in &proj.entries {
+        if p.is_empty() {
+            continue;
+        }
+        let v = match state[n].kind {
+            hub_core::tree::Kind::File => Some(match proj.blobs.get(n) {
+                Some(b) => blobs.get(b).unwrap(),
+                None => Vec::new(),
+            }),
+            _ => None,
+        };
+        m.insert(p.clone(), v);
+    }
     m
 }
 
@@ -169,6 +198,15 @@ fn one_case(n: usize, steps: &[Step]) -> Result<(), TestCaseError> {
             }
             Step::Sync { .. } | Step::Interrupted { .. } => {}
         }
+        for (i, r) in rs.iter().enumerate() {
+            prop_assert_eq!(
+                snapshot(r),
+                projected(r),
+                "r{} working tree != project(head) after {:?}",
+                i,
+                s
+            );
+        }
     }
     CASES_RUN.fetch_add(1, SeqCst);
     if fired {
@@ -216,4 +254,19 @@ fn random_sessions_and_syncs_converge() {
         100.0 * ci as f64 / c as f64
     );
     assert!(ci * 5 >= c, "interrupted cases {ci}/{c} below 20%");
+}
+
+/// Issue #26: the shrunk seed from the #24 Review. Deleting the collision
+/// winner renames the other node from `f1~<id>` to `f1`; record must move it
+/// on disk, or the replicas' working trees diverge.
+#[test]
+fn issue26_shrunk_seed() {
+    use Step::*;
+    let steps = [
+        Write { r: 0, k: 1, v: 0 },
+        Write { r: 1, k: 1, v: 0 },
+        Sync { a: 1, b: 0 },
+        Delete { r: 0, k: 1 },
+    ];
+    one_case(2, &steps).unwrap();
 }

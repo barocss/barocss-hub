@@ -573,3 +573,148 @@ fn case_clash_from_sync_is_unmaterialized_and_blocks_record_d019() {
     ok(a, &["checkout"]);
     assert_eq!(head(a), head(b));
 }
+
+/// Issue #26 setup: a and b each create `f1` with the same bytes and sync,
+/// so both hold `f1` and `f1~<id>` (a name collision). Returns the paths.
+fn collided(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let (t, r) = repos(tag, &["a", "b"]);
+    let (a, b) = (r[0].clone(), r[1].clone());
+    fs::write(a.join("f1"), "same\n").unwrap();
+    ok(&a, &["record"]);
+    fs::write(b.join("f1"), "same\n").unwrap();
+    ok(&b, &["record"]);
+    sync(&b, &a);
+    ok(&a, &["checkout"]);
+    ok(&b, &["checkout"]);
+    assert_eq!(snapshot(&a), snapshot(&b));
+    assert_eq!(snapshot(&a).len(), 2, "{:?}", snapshot(&a).keys());
+    (t, a, b)
+}
+
+fn names(d: &Path) -> Vec<String> {
+    snapshot(d).into_keys().collect()
+}
+
+/// Issue #26 hand repro: `rm f1; hub record` deletes the collision winner,
+/// so the other node's projected name becomes `f1`. record must rename it
+/// on disk and index it, or the replicas diverge after sync.
+#[test]
+fn record_materializes_rename_when_collision_disappears() {
+    let (_t, a, b) = collided("i26-rec");
+    fs::remove_file(a.join("f1")).unwrap();
+    ok(&a, &["record"]);
+    assert_eq!(names(&a), vec!["f1".to_string()]);
+    assert_eq!(fs::read(a.join("f1")).unwrap(), b"same\n");
+    assert_eq!(ok(&a, &["record"]).trim(), "nothing to record");
+    let st = ok(&a, &["status"]);
+    assert!(!st.contains("deleted") && !st.contains("added"), "{st}");
+    sync(&a, &b);
+    ok(&a, &["checkout"]);
+    ok(&b, &["checkout"]);
+    assert_eq!(snapshot(&a), snapshot(&b));
+    assert_eq!(head(&a), head(&b));
+    assert_eq!(ok(&a, &["record"]).trim(), "nothing to record");
+    assert_eq!(ok(&b, &["record"]).trim(), "nothing to record");
+}
+
+/// Same, through the mutating command `hub rm`.
+#[test]
+fn rm_materializes_rename_when_collision_disappears() {
+    let (_t, a, b) = collided("i26-rm");
+    ok(&a, &["rm", "f1"]);
+    assert_eq!(names(&a), vec!["f1".to_string()]);
+    assert_eq!(ok(&a, &["record"]).trim(), "nothing to record");
+    sync(&a, &b);
+    ok(&b, &["checkout"]);
+    assert_eq!(snapshot(&a), snapshot(&b));
+}
+
+/// Inverse (Issue #26): a collision *appears* (here through sync +
+/// checkout, the only way two live siblings can get one name; see the
+/// Issue comment), so an existing clean file gains a suffix on disk. A
+/// later record in either repo must see nothing to record.
+#[test]
+fn checkout_suffixes_existing_file_when_collision_appears() {
+    let (_t, r) = repos("i26-inv", &["a", "b"]);
+    let (a, b) = (&r[0], &r[1]);
+    fs::write(a.join("f1"), "from a\n").unwrap();
+    ok(a, &["record"]);
+    fs::write(b.join("f1"), "from b\n").unwrap();
+    ok(b, &["record"]);
+    sync(a, b);
+    ok(a, &["checkout"]);
+    ok(b, &["checkout"]);
+    assert_eq!(snapshot(a), snapshot(b));
+    let n = names(a);
+    assert_eq!(n.len(), 2, "{n:?}");
+    assert!(n[0] == "f1" && n[1].starts_with("f1~"), "{n:?}");
+    assert_eq!(ok(a, &["record"]).trim(), "nothing to record");
+    assert_eq!(ok(b, &["record"]).trim(), "nothing to record");
+    // And back: deleting the suffixed loser keeps the winner at `f1`;
+    // deleting the winner instead (in b) moves the loser to `f1`.
+    fs::remove_file(b.join("f1")).unwrap();
+    ok(b, &["record"]);
+    assert_eq!(names(b), vec!["f1".to_string()]);
+    sync(a, b);
+    ok(a, &["checkout"]);
+    assert_eq!(snapshot(a), snapshot(b));
+    assert_eq!(ok(a, &["record"]).trim(), "nothing to record");
+}
+
+/// Inverse through record (Issue #26): in one record, delete the winner
+/// `f1` and create a directory `f1/`. The new directory node joins the
+/// loser's collision group with a larger id, so the loser (older) takes
+/// `f1` and the user's new directory gains a suffix: record must move it on
+/// disk (with its contents) and write the loser at `f1`.
+#[test]
+fn record_suffixes_new_node_when_collision_appears() {
+    let (_t, a, b) = collided("i26-rinv");
+    fs::remove_file(a.join("f1")).unwrap();
+    fs::create_dir(a.join("f1")).unwrap();
+    fs::write(a.join("f1/keep"), "mine\n").unwrap();
+    ok(&a, &["record"]);
+    let snap = snapshot(&a);
+    assert_eq!(snap.get("f1"), Some(&Some(b"same\n".to_vec())), "{snap:?}");
+    let dir = snap
+        .keys()
+        .find(|k| k.starts_with("f1~") && !k.contains('/'))
+        .cloned()
+        .unwrap_or_else(|| panic!("no suffixed dir: {snap:?}"));
+    assert_eq!(snap.get(&dir), Some(&None));
+    assert_eq!(
+        snap.get(&format!("{dir}/keep")),
+        Some(&Some(b"mine\n".to_vec()))
+    );
+    assert_eq!(snap.len(), 3, "{snap:?}");
+    assert_eq!(ok(&a, &["record"]).trim(), "nothing to record");
+    sync(&a, &b);
+    ok(&b, &["checkout"]);
+    assert_eq!(snapshot(&a), snapshot(&b));
+}
+
+/// Issue #26 + #24: materializing the projection change would have to move
+/// a directory holding an ignored untracked file; record must refuse
+/// (append nothing, touch nothing) rather than delete it, and succeed once
+/// the ignored file is moved away.
+#[test]
+fn record_refuses_rename_that_would_delete_ignored_file() {
+    let (_t, a, _b) = collided("i26-ign");
+    fs::write(a.join(".hubignore"), "*.o\n").unwrap();
+    ok(&a, &["record"]);
+    let h = head(&a);
+    // As in record_suffixes_new_node_when_collision_appears, plus an
+    // ignored file inside the new directory.
+    fs::remove_file(a.join("f1")).unwrap();
+    fs::create_dir(a.join("f1")).unwrap();
+    fs::write(a.join("f1/keep"), "mine\n").unwrap();
+    fs::write(a.join("f1/cache.o"), "junk\n").unwrap();
+    let e = fail(&a, &["record"]);
+    assert!(e.contains("refusing to record"), "{e}");
+    assert_eq!(head(&a), h);
+    assert_eq!(fs::read(a.join("f1/cache.o")).unwrap(), b"junk\n");
+    assert_eq!(fs::read(a.join("f1/keep")).unwrap(), b"mine\n");
+    fs::remove_file(a.join("f1/cache.o")).unwrap();
+    ok(&a, &["record"]);
+    assert_eq!(fs::read(a.join("f1")).unwrap(), b"same\n");
+    assert_eq!(ok(&a, &["record"]).trim(), "nothing to record");
+}

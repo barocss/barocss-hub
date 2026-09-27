@@ -563,7 +563,11 @@ fn record(
         return Err(not_at_head(repo, &idx));
     }
     let mut ws = Vec::new();
-    let w = wd::scan(&root, &idx, &mut ws)?;
+    // `w_all` keeps untracked ignored paths so the rename plan below never
+    // clobbers or deletes them (#24); `w` is what record sees.
+    let (w_all, ignored) = wd::scan_all(&root, &idx, &mut ws)?;
+    let mut w = w_all.clone();
+    w.retain(|p, _| !ignored.contains(p));
     print_warnings(warn, &ws)?;
     let blocked = wd::blocked(&idx, &w);
     if !blocked.is_empty() {
@@ -580,6 +584,22 @@ fn record(
         return Ok(());
     }
     let old = |p: &str| idx.entries[p].0;
+    // Ops are built first and appended only after the working-directory
+    // plan succeeds (as in `mutate`), each depending on the previous one:
+    // exactly what successive `Repo::mint` calls would produce.
+    let mut ops: Vec<Op> = Vec::new();
+    let mut mint = |payload: Payload| -> Result<Op, Error> {
+        let op = match ops.last() {
+            None => repo.prepare(payload),
+            Some(prev) => Op {
+                id: NodeId::new(prev.id.counter + 1, prev.id.replica.0),
+                deps: BTreeSet::from([prev.id]),
+                payload,
+            },
+        };
+        ops.push(op.clone());
+        Ok(op)
+    };
     let mut created: BTreeMap<String, NodeId> = BTreeMap::new();
     let parent_of = |created: &BTreeMap<String, NodeId>, path: &str| -> (NodeId, String) {
         let (d, n) = path.rsplit_once('/').unwrap_or(("", path));
@@ -609,12 +629,12 @@ fn record(
         let (parent, name) = parent_of(&created, p);
         let is_dir = matches!(w[p], Entry::Dir);
         let kind = if is_dir { Kind::Directory } else { Kind::File };
-        let op = repo.mint(Payload::Create { kind, parent, name })?;
+        let op = mint(Payload::Create { kind, parent, name })?;
         created.insert(p.clone(), op.id);
         if !is_dir {
             let blob = put(p)?;
             if blob != BlobId::empty() {
-                repo.mint(Payload::SetContent { node: op.id, blob })?;
+                mint(Payload::SetContent { node: op.id, blob })?;
             }
         }
     }
@@ -622,7 +642,7 @@ fn record(
     for c in &changes {
         let Change::Renamed(a, b) = c else { continue };
         let (new_parent, new_name) = parent_of(&created, b);
-        repo.mint(Payload::Move {
+        mint(Payload::Move {
             node: old(a),
             new_parent,
             new_name,
@@ -632,7 +652,7 @@ fn record(
     for c in &changes {
         let Change::Modified(p) = c else { continue };
         let blob = put(p)?;
-        repo.mint(Payload::SetContent { node: old(p), blob })?;
+        mint(Payload::SetContent { node: old(p), blob })?;
     }
     // 4. Deletes, top-most only (a Delete trashes the whole subtree).
     let deleted: BTreeSet<&str> = changes
@@ -645,61 +665,72 @@ fn record(
     for p in &deleted {
         let covered = p.match_indices('/').any(|(i, _)| deleted.contains(&p[..i]));
         if !covered {
-            repo.mint(Payload::Delete { node: old(p) })?;
+            mint(Payload::Delete { node: old(p) })?;
         }
     }
-    // New index from the head projection plus the scanned stats.
-    let state = repo.state().clone();
-    let proj = project(&state);
-    let mut nidx = Index {
-        base: repo.head_frontier(),
+    let renamed: BTreeMap<&str, NodeId> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::Renamed(a, b) => Some((b.as_str(), old(a))),
+            _ => None,
+        })
+        .collect();
+    // Issue #26: the scanned working tree, indexed under the *new* state's
+    // nodes at the paths they occupy on disk now. Planning the new head
+    // projection against it materializes every projected-path change the
+    // user did not make on disk (collisions appearing or disappearing,
+    // suffix changes), with checkout's safety rules; everything scanned is
+    // recorded, so all of it is clean and nothing unrecorded is clobbered.
+    let mut mid = Index {
+        base: Vec::new(),
+        stamp: idx.stamp,
         ..Index::default()
     };
-    let unmat = wd::clashing(
-        proj.entries.keys().filter(|p| !p.is_empty()),
-        wd::case_insensitive(&repo.dir)?,
-    );
-    for (p, n) in &proj.entries {
-        if p.is_empty() {
-            continue;
+    for (p, (n, e)) in &idx.entries {
+        if *e == Entry::Unmaterialized {
+            mid.entries.insert(p.clone(), (*n, *e));
         }
-        if unmat.contains(p) {
-            nidx.entries.insert(p.clone(), (*n, Entry::Unmaterialized));
-            continue;
-        }
-        let e = match (state[n].kind, w.get(p)) {
-            (Kind::File, we) => {
-                let blob = proj.blobs.get(n).copied().unwrap_or_else(BlobId::empty);
-                match we {
-                    Some(Entry::File {
-                        blob: wb,
-                        size,
-                        mtime,
-                    }) if *wb == blob => Entry::File {
-                        blob,
-                        size: *size,
-                        mtime: *mtime,
-                    },
-                    _ => {
-                        writeln!(warn, "warning: '{p}' differs from the recorded tree")?;
-                        Entry::File {
-                            blob,
-                            size: 0,
-                            mtime: 0,
-                        }
-                    }
-                }
-            }
-            _ => Entry::Dir,
+    }
+    for (p, we) in &w {
+        let node = match (created.get(p), renamed.get(p.as_str()), idx.entries.get(p)) {
+            (Some(n), _, _) | (None, Some(n), _) => *n,
+            (None, None, Some((n, _))) => *n,
+            (None, None, None) => continue,
         };
-        nidx.entries.insert(p.clone(), (*n, e));
+        let e = match (we, stored.get(p.as_str())) {
+            // Changed between scan and read: keep the recorded blob, rehash.
+            (Entry::File { blob, .. }, Some(b)) if b != blob => Entry::File {
+                blob: *b,
+                size: 0,
+                mtime: 0,
+            },
+            _ => *we,
+        };
+        mid.entries.insert(p.clone(), (node, e));
     }
-    for p in w.keys() {
-        if !proj.entries.contains_key(p) {
-            writeln!(warn, "warning: '{p}' is not in the recorded tree")?;
-        }
+    let ev = evaluate(repo.store.values().chain(ops.iter()));
+    let proj = project(&ev.state);
+    let plan = wd::plan(
+        &Target {
+            state: &ev.state,
+            proj: &proj,
+            frontier: ops.last().map(|o| vec![o.id]).unwrap_or_default(),
+        },
+        &mid,
+        &w_all,
+        &blobs,
+        &PlanOpts {
+            force: false,
+            restore_missing: false,
+            case_insensitive: wd::case_insensitive(&repo.dir)?,
+            verb: "record",
+            ignored,
+        },
+    )?;
+    for op in ops {
+        repo.append_op(op)?;
     }
-    nidx.save(&repo.dir)?;
+    print_warnings(warn, &wd::apply(plan, &root, &repo.dir)?)?;
     writeln!(out, "recorded {} change(s):", changes.len())?;
     for l in wd::render_changes(&changes, &idx, &w) {
         writeln!(out, "  {l}")?;
