@@ -7,6 +7,7 @@ pub mod blobs;
 pub mod ignore;
 pub mod store;
 pub mod sync;
+pub mod watch;
 pub mod wd;
 
 use hub_core::checkpoint::{Checkpoint, Checkpoints, ResolveError, VersionId, VersionIndex};
@@ -238,6 +239,11 @@ impl Repo {
     /// Lamport counter.
     pub fn prepare(&self, payload: Payload) -> Op {
         let deps: BTreeSet<_> = self.head().frontier(&self.store).into_iter().collect();
+        self.prepare_on(deps, payload)
+    }
+
+    /// Build a local op over explicit `deps` (ops already in the store).
+    pub fn prepare_on(&self, deps: BTreeSet<NodeId>, payload: Payload) -> Op {
         let counter = 1 + self.store.keys().map(|o| o.counter).max().unwrap_or(1);
         Op {
             id: NodeId::new(counter, self.replica_id.0),
@@ -541,12 +547,20 @@ fn w_all_is_dir(root: &Path, p: &str) -> bool {
     fs::symlink_metadata(root.join(p)).is_ok_and(|m| m.is_dir())
 }
 
-fn record(
+/// Record the working directory. Ops depend on the index base (the version
+/// the user last saw on disk), which is the head for `hub record`. With
+/// `allow_behind` (only `hub watch`, Issue #25) the base may be behind head
+/// after a sync: the recorded ops are then concurrent with the incoming
+/// ones (so a same-file edit is a content conflict, never a silent causal
+/// overwrite), and the plan below materializes the merged head over the
+/// now fully recorded working tree. Returns whether anything was recorded.
+pub(crate) fn record(
     repo: &mut Repo,
     msg: Option<&str>,
+    allow_behind: bool,
     out: &mut dyn Write,
     warn: &mut dyn Write,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let root = repo.root();
     refuse_if_interrupted(repo)?;
     wd::sweep_tmp(&repo.dir)?;
@@ -559,7 +573,7 @@ fn record(
         )?;
     }
     let idx = load_index(repo, warn)?;
-    if idx.base != repo.head_frontier() {
+    if !allow_behind && idx.base != repo.head_frontier() {
         return Err(not_at_head(repo, &idx));
     }
     let mut ws = Vec::new();
@@ -581,7 +595,7 @@ fn record(
     let changes = wd::diff(&idx, &w);
     if changes.is_empty() {
         writeln!(out, "nothing to record")?;
-        return Ok(());
+        return Ok(false);
     }
     let old = |p: &str| idx.entries[p].0;
     // Ops are built first and appended only after the working-directory
@@ -590,7 +604,7 @@ fn record(
     let mut ops: Vec<Op> = Vec::new();
     let mut mint = |payload: Payload| -> Result<Op, Error> {
         let op = match ops.last() {
-            None => repo.prepare(payload),
+            None => repo.prepare_on(idx.base.iter().copied().collect(), payload),
             Some(prev) => Op {
                 id: NodeId::new(prev.id.counter + 1, prev.id.replica.0),
                 deps: BTreeSet::from([prev.id]),
@@ -710,11 +724,18 @@ fn record(
     }
     let ev = evaluate(repo.store.values().chain(ops.iter()));
     let proj = project(&ev.state);
+    let mut all = repo.store.clone();
+    for o in &ops {
+        all.insert(o.id, o.clone());
+    }
+    let frontier = Version::from_ops(&all, all.keys().copied().collect())
+        .expect("store is closed")
+        .frontier(&all);
     let plan = wd::plan(
         &Target {
             state: &ev.state,
             proj: &proj,
-            frontier: ops.last().map(|o| vec![o.id]).unwrap_or_default(),
+            frontier,
         },
         &mid,
         &w_all,
@@ -740,10 +761,10 @@ fn record(
         let ix = repo.index();
         writeln!(out, "[{}] {}", ix.short(&c.id()), c.message)?;
     }
-    Ok(())
+    Ok(true)
 }
 
-fn checkout(
+pub(crate) fn checkout(
     repo: &mut Repo,
     id: Option<&str>,
     force: bool,
@@ -850,6 +871,11 @@ Commands:
   sync <path>          exchange ops, blobs and published checkpoints with another
                        local repo (log only; run `hub checkout` afterwards)
   publish <short-id|message>  mark a local checkpoint published (sync sends it)
+  peer add|list|rm [<path>]  manage local peers for `hub watch` (.hub/peers,
+                       local config, not replicated)
+  watch [--poll <ms>] [--debounce <ms>] [--sync <ms>]
+                       foreground: auto-record working-directory changes,
+                       sync with every peer, apply incoming ops; Ctrl-C stops
   warnings             list sync warnings (D-008) and pending ops
   reid                 give this repo a fresh replica id (after copying a .hub/;
                        run it BEFORE recording in the copy); clears saved
@@ -890,6 +916,13 @@ pub fn run(
             r.replica_id.0
         )?;
         return Ok(());
+    }
+    if a[0] == "peer" {
+        return watch::peer_cmd(cwd, &a[1..], out);
+    }
+    if a[0] == "watch" {
+        let opts = watch::parse_opts(&a[1..])?;
+        return watch::watch_cmd(cwd, opts, out, warn);
     }
     if a[0] == "sync" {
         return match a.as_slice() {
@@ -963,8 +996,12 @@ pub fn run(
             }
             mutate(&mut repo, "rm", Payload::Delete { node }, warn)?;
         }
-        ["record"] => record(&mut repo, None, out, warn)?,
-        ["record", "-m", msg] => record(&mut repo, Some(msg), out, warn)?,
+        ["record"] => {
+            record(&mut repo, None, false, out, warn)?;
+        }
+        ["record", "-m", msg] => {
+            record(&mut repo, Some(msg), false, out, warn)?;
+        }
         ["checkout", rest @ ..] => {
             let force = rest.contains(&"--force");
             let ids: Vec<&str> = rest.iter().copied().filter(|x| *x != "--force").collect();
@@ -1022,6 +1059,16 @@ pub fn run(
                     out,
                     "pending ops: {npend} (missing deps; retried on the next sync)"
                 )?;
+            }
+            let peers = watch::read_peers(&repo.dir)?;
+            if !peers.is_empty() {
+                writeln!(out, "peers:")?;
+                for p in &peers {
+                    writeln!(out, "  {}", p.display())?;
+                }
+            }
+            if let Some(pid) = watch::active_watch(&repo.dir)? {
+                writeln!(out, "watch: active (pid {pid})")?;
             }
             if wd::interrupted(&repo.dir)?.is_some() {
                 writeln!(out, "interrupted checkout: run `hub checkout` to finish it")?;
