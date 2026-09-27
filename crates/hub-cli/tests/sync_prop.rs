@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
 use hub_cli::sync::Interrupt;
 use proptest::prelude::*;
-use proptest::test_runner::{TestCaseError, TestRunner};
+use proptest::test_runner::{RngAlgorithm, TestCaseError, TestRng, TestRunner};
 
 fn run(dir: &Path, args: &[&str]) -> String {
     let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -193,11 +193,16 @@ fn one_case(n: usize, steps: &[Step]) -> Result<(), TestCaseError> {
 
 #[test]
 fn random_sessions_and_syncs_converge() {
-    let mut runner = TestRunner::new(ProptestConfig {
-        cases: 64,
-        failure_persistence: None,
-        ..ProptestConfig::default()
-    });
+    // Seed pinned (deterministic ChaCha RNG) so the >= 20% interruption
+    // floor below cannot flake on an unlucky random seed (#23 review).
+    let mut runner = TestRunner::new_with_rng(
+        ProptestConfig {
+            cases: 64,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        },
+        TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+    );
     runner
         .run(&case(), |(n, steps)| one_case(n, &steps))
         .unwrap();

@@ -25,6 +25,7 @@ use hub_core::tree::BlobId;
 
 /// Test-only fault injection: when set, `put` writes half the bytes to the
 /// temp file and aborts the process before the rename.
+#[doc(hidden)]
 pub const CRASH_ENV: &str = "HUB_TEST_CRASH_IN_BLOB_PUT";
 
 #[derive(Debug)]
