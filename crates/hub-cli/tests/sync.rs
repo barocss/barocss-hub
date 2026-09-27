@@ -465,3 +465,81 @@ fn corrupt_local_blob_refuses_sync() {
     assert!(err.contains("corrupt blob"), "{err}");
     ok(b, &["status"]);
 }
+
+#[test]
+fn edit_vs_delete_revives_after_sync_d014() {
+    let (_t, r) = repos("revive", &["a", "b"]);
+    let (a, b) = (&r[0], &r[1]);
+    fs::write(a.join("f.txt"), "v1\n").unwrap();
+    ok(a, &["record"]);
+    sync(b, a);
+    ok(b, &["checkout"]);
+    fs::write(a.join("f.txt"), "v2 edited\n").unwrap();
+    ok(a, &["record"]);
+    ok(b, &["rm", "f.txt"]);
+    sync(b, a);
+    ok(a, &["checkout"]);
+    ok(b, &["checkout"]);
+    assert_eq!(snapshot(a), snapshot(b));
+    assert_eq!(fs::read(b.join("f.txt")).unwrap(), b"v2 edited\n");
+    let c = conflicts(b);
+    assert!(c.contains("edit-revived: "), "{c}");
+    assert_eq!(c, conflicts(a));
+}
+
+fn fs_case_insensitive(d: &Path) -> bool {
+    fs::write(d.join("probe"), "").unwrap();
+    let ci = d.join("PROBE").exists();
+    fs::remove_file(d.join("probe")).unwrap();
+    ci
+}
+
+#[test]
+fn case_clash_from_sync_is_unmaterialized_and_blocks_record_d019() {
+    let (t, r) = repos("clash", &["a", "b"]);
+    let (a, b) = (&r[0], &r[1]);
+    if !fs_case_insensitive(&t) {
+        eprintln!("skipped: case-sensitive filesystem");
+        return;
+    }
+    fs::write(a.join("Readme"), "from a\n").unwrap();
+    ok(a, &["record"]);
+    fs::write(b.join("README"), "from b\n").unwrap();
+    ok(b, &["record"]);
+    // A sync warning to show beside the blocked path.
+    let ops = op_bodies(a);
+    let rid = ops[0].split(' ').nth(1).unwrap().split('.').nth(1).unwrap();
+    let peer = "0000000000000000000000000000abcd";
+    write_pending(b, peer, &[format!("O 1.{peer} 2.{rid} D 1.{rid}")]);
+    sync(b, a);
+    let co = ok(b, &["checkout"]);
+    assert!(co.contains("checked out"), "{co}");
+    let st = ok(b, &["status"]);
+    assert!(st.contains("unmaterialized"), "{st}");
+    assert!(st.contains("sync warnings:"), "{st}");
+    // D-019: neither clashing name is written.
+    let names: Vec<String> = fs::read_dir(b)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n != ".hub")
+        .collect();
+    assert!(names.is_empty(), "{names:?}");
+    // A working file on the unmaterialized path is blocked; record refuses.
+    let unmat = st
+        .lines()
+        .skip_while(|l| !l.starts_with("unmaterialized"))
+        .nth(1)
+        .unwrap()
+        .trim()
+        .to_string();
+    fs::write(b.join(&unmat), "in the way\n").unwrap();
+    let st = ok(b, &["status"]);
+    assert!(
+        st.contains("blocked") && st.contains("sync warnings:"),
+        "{st}"
+    );
+    assert!(fail(b, &["record"]).contains("D-019"));
+    // The other repo converges to the same head.
+    ok(a, &["checkout"]);
+    assert_eq!(head(a), head(b));
+}
