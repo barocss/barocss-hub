@@ -307,15 +307,15 @@ fn persist(
         }
     }
     // 2. Ops in `<` order.
-    for o in &new_ops {
-        match stop {
-            Some(Interrupt::Abort(n)) if n == *appended => std::process::abort(),
-            Some(Interrupt::Return(n)) if n == *appended => return err(INTERRUPTED),
-            _ => {}
-        }
-        repo.append_op(o.clone())?;
-        *appended += 1;
-    }
+    // One batch, so the view is refreshed once (Issue #28).
+    let base = *appended;
+    let (n, res) = repo.append_ops_with(new_ops.iter().cloned(), |i| match stop {
+        Some(Interrupt::Abort(n)) if n == base + i => std::process::abort(),
+        Some(Interrupt::Return(n)) if n == base + i => err(INTERRUPTED),
+        _ => Ok(()),
+    });
+    *appended += n;
+    res?;
     // 3. Pending buffer and warnings.
     let ps: Vec<String> = pending
         .iter()

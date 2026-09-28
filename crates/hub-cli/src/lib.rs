@@ -155,8 +155,8 @@ impl Repo {
                 op.display()
             ));
         }
-        let mut replica = Replica::new();
         let mut st = Store::new();
+        let mut replay = Vec::with_capacity(ops.records.len());
         for (i, body) in ops.records.iter().enumerate() {
             let o = store::decode_op(body).map_err(|why| StoreError::Corrupt {
                 file: op.clone(),
@@ -182,8 +182,11 @@ impl Repo {
                 continue;
             }
             st.insert(o.id, o.clone());
-            replica.receive(o);
+            replay.push(o);
         }
+        // One batch: the view is refreshed once, not per op (Issue #28).
+        let mut replica = Replica::new();
+        replica.receive_all(replay);
         if replica.pending_len() != 0 {
             return err(format!(
                 "corrupt {}: {} op(s) with missing deps",
@@ -233,6 +236,39 @@ impl Repo {
         self.store.insert(op.id, op.clone());
         self.replica.receive(op);
         Ok(())
+    }
+
+    /// Persist then apply a batch of ops, refreshing the view once (Issue
+    /// #28). Each op is persisted as by [`Repo::append_op`].
+    pub fn append_ops(&mut self, ops: impl IntoIterator<Item = Op>) -> Result<(), Error> {
+        self.append_ops_with(ops, |_| Ok(())).1
+    }
+
+    /// [`Repo::append_ops`] with a hook run before persisting the `i`-th op
+    /// (crash/interrupt tests); an error stops the batch. Ops persisted
+    /// before an error are still applied. Returns how many were persisted.
+    pub fn append_ops_with(
+        &mut self,
+        ops: impl IntoIterator<Item = Op>,
+        mut before: impl FnMut(usize) -> Result<(), Error>,
+    ) -> (usize, Result<(), Error>) {
+        let log = self.dir.join("ops.log");
+        let mut done = Vec::new();
+        let mut res = Ok(());
+        for op in ops {
+            let r = before(done.len()).and_then(|()| {
+                store::append_record(&log, &store::encode_op(&op)).map_err(Error::from)
+            });
+            if let Err(e) = r {
+                res = Err(e);
+                break;
+            }
+            self.store.insert(op.id, op.clone());
+            done.push(op);
+        }
+        let n = done.len();
+        self.replica.receive_all(done);
+        (n, res)
     }
 
     /// Build (not persist) a local op over the current frontier with a
@@ -748,9 +784,7 @@ pub(crate) fn record(
             ignored,
         },
     )?;
-    for op in ops {
-        repo.append_op(op)?;
-    }
+    repo.append_ops(ops)?;
     print_warnings(warn, &wd::apply(plan, &root, &repo.dir)?)?;
     writeln!(out, "recorded {} change(s):", changes.len())?;
     for l in wd::render_changes(&changes, &idx, &w) {

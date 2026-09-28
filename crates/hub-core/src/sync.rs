@@ -27,7 +27,7 @@
 //! State is computed with the spec fold `tree::evaluate` over the applied
 //! set (§2.3); incremental application is an optimization out of scope here.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::checkpoint::{version_id, Checkpoint, VersionId};
 use crate::projection::{project, Projection};
@@ -136,6 +136,13 @@ pub struct SyncReplica {
     counter: u64,
     store: Store,
     pending: BTreeMap<OpId, (Op, PeerId)>,
+    /// Issue #28 ready index over `pending`: waiters per missing dep and per
+    /// missing blob, the count of unmet conditions per pending op, and the
+    /// pending ops that are ready (so draining is not a scan per op).
+    wait_dep: HashMap<OpId, Vec<OpId>>,
+    wait_blob: HashMap<BlobId, Vec<OpId>>,
+    unmet: HashMap<OpId, usize>,
+    ready_q: BTreeSet<OpId>,
     rejected: BTreeMap<OpId, Op>,
     blobs: BlobStore,
     warnings: Vec<RejectWarning>,
@@ -157,6 +164,10 @@ impl SyncReplica {
             counter: 0,
             store: Store::new(),
             pending: BTreeMap::new(),
+            wait_dep: HashMap::new(),
+            wait_blob: HashMap::new(),
+            unmet: HashMap::new(),
+            ready_q: BTreeSet::new(),
             rejected: BTreeMap::new(),
             blobs: BlobStore::new(),
             warnings: Vec::new(),
@@ -186,9 +197,12 @@ impl SyncReplica {
         r.blobs = blobs;
         r.warnings = warnings;
         r.published = published;
-        for (op, peer) in pending {
-            if !r.store.contains_key(&op.id) {
-                r.pending.insert(op.id, (op, peer));
+        // A repeated id keeps the last entry, as the pre-#28 insert did.
+        let pending: BTreeMap<OpId, (Op, PeerId)> =
+            pending.into_iter().map(|(o, p)| (o.id, (o, p))).collect();
+        for (id, (op, peer)) in pending {
+            if !r.store.contains_key(&id) {
+                r.enqueue(op, peer);
             }
         }
         r.drain();
@@ -261,13 +275,16 @@ impl SyncReplica {
         if let Payload::SetContent { blob, .. } = &op.payload {
             assert!(self.blobs.contains(blob), "put the blob before SetContent");
         }
-        self.store.insert(op.id, op.clone());
+        self.store_op(op.clone());
         op
     }
 
     /// Store blob bytes locally (before authoring a SetContent).
     pub fn put_blob(&mut self, bytes: &[u8]) -> BlobId {
-        self.blobs.put(bytes)
+        let id = self.blobs.put(bytes);
+        let w = self.wait_blob.remove(&id);
+        self.satisfied(w);
+        id
     }
 
     /// §4.2 `Have` for the current applied version.
@@ -377,7 +394,7 @@ impl SyncReplica {
             self.warn(peer, None, None, RejectReason::CorruptBlob, id.hex());
             return false;
         }
-        self.blobs.put(bytes);
+        self.put_blob(bytes);
         self.drain();
         true
     }
@@ -412,28 +429,59 @@ impl SyncReplica {
                 "op authored under our replica id that we never authored".into(),
             );
         }
-        self.pending.insert(op.id, (op, peer));
+        self.enqueue(op, peer);
         self.drain();
     }
 
-    fn ready(&self, op: &Op) -> bool {
-        op.deps.iter().all(|d| self.store.contains_key(d))
-            && match &op.payload {
-                Payload::SetContent { blob, .. } => self.blobs.contains(blob),
-                _ => true,
+    /// Buffer `op`, indexing what it still waits for: deps not in the store
+    /// and, for a SetContent, a missing blob. Ready iff it waits for nothing.
+    fn enqueue(&mut self, op: Op, peer: PeerId) {
+        let id = op.id;
+        let mut n = 0;
+        for d in &op.deps {
+            if !self.store.contains_key(d) {
+                self.wait_dep.entry(*d).or_default().push(id);
+                n += 1;
             }
+        }
+        if let Payload::SetContent { blob, .. } = &op.payload {
+            if !self.blobs.contains(blob) {
+                self.wait_blob.entry(*blob).or_default().push(id);
+                n += 1;
+            }
+        }
+        self.pending.insert(id, (op, peer));
+        if n == 0 {
+            self.ready_q.insert(id);
+        } else {
+            self.unmet.insert(id, n);
+        }
     }
 
+    /// One condition of each waiter became true.
+    fn satisfied(&mut self, waiters: Option<Vec<OpId>>) {
+        for w in waiters.unwrap_or_default() {
+            let m = self.unmet.get_mut(&w).expect("waiter is pending");
+            *m -= 1;
+            if *m == 0 {
+                self.unmet.remove(&w);
+                self.ready_q.insert(w);
+            }
+        }
+    }
+
+    /// Insert into the applied set and wake ops waiting on it.
+    fn store_op(&mut self, op: Op) {
+        let id = op.id;
+        self.store.insert(id, op);
+        let w = self.wait_dep.remove(&id);
+        self.satisfied(w);
+    }
+
+    /// Apply ready pending ops, smallest id first (the order the pre-#28
+    /// scan of `pending` used), until none is ready.
     fn drain(&mut self) {
-        loop {
-            let Some(id) = self
-                .pending
-                .values()
-                .find(|(o, _)| self.ready(o))
-                .map(|(o, _)| o.id)
-            else {
-                break;
-            };
+        while let Some(id) = self.ready_q.pop_first() {
             let (op, peer) = self.pending.remove(&id).unwrap();
             if let Some(d) = op.deps.iter().find(|d| **d >= op.id) {
                 let detail = format!("dep {d:?} is not < {:?}", op.id);
@@ -447,7 +495,7 @@ impl SyncReplica {
                 self.rejected.insert(op.id, op);
                 continue;
             }
-            self.store.insert(op.id, op);
+            self.store_op(op);
         }
     }
 
