@@ -1,0 +1,13 @@
+[package]
+name = "hub-bench"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Scale benchmarks and multi-replica scenario runner for barocss-hub (Issue #27). Not run by cargo test."
+
+[[bin]]
+name = "hub-bench"
+path = "src/main.rs"
+test = false
+bench = false

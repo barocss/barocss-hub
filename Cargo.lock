@@ -140,6 +140,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hub-bench"
+version = "0.0.0"
+
+[[package]]
 name = "hub-cli"
 version = "0.0.0"
 dependencies = [
