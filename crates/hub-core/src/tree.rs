@@ -924,12 +924,11 @@ pub struct Replica {
     log: Vec<(Op, Undo, Outcome)>,
     known: BTreeSet<OpId>,
     pending: BTreeMap<OpId, Op>,
-    /// Issue #28 ready index: pending ops waiting on each missing dep, the
-    /// number of missing deps per pending op, and the pending ops with none
-    /// (so draining is O(ops) instead of a scan of `pending` per op).
+    /// Issue #28 ready index: pending ops waiting on each missing dep and
+    /// the number of missing deps per pending op (so draining is O(ops)
+    /// instead of a scan of `pending` per op).
     waiting: HashMap<OpId, Vec<OpId>>,
     missing: HashMap<OpId, usize>,
-    ready: BTreeSet<OpId>,
     /// Fold state plus the D-014 edit revive (what [`Replica::state`]
     /// shows); `None` when the revive changes nothing (the common case).
     view: Option<State>,
@@ -953,7 +952,6 @@ impl Replica {
             pending: BTreeMap::new(),
             waiting: HashMap::new(),
             missing: HashMap::new(),
-            ready: BTreeSet::new(),
             view: None,
             revived: BTreeSet::new(),
         }
@@ -1204,29 +1202,17 @@ impl Replica {
     /// suffix and new ops in `<` order), so a batch of out-of-order ops
     /// costs O(suffix + batch) instead of O(suffix) per op.
     pub fn receive_all(&mut self, ops: impl IntoIterator<Item = Op>) {
-        for op in ops {
-            self.buffer(op);
-        }
         let mut batch = Vec::new();
-        while let Some(id) = self.ready.pop_first() {
-            let op = self.pending.remove(&id).unwrap();
-            self.known.insert(id);
-            for w in self.waiting.remove(&id).unwrap_or_default() {
-                let m = self.missing.get_mut(&w).expect("waiter is pending");
-                *m -= 1;
-                if *m == 0 {
-                    self.missing.remove(&w);
-                    self.ready.insert(w);
-                }
-            }
-            batch.push(op);
+        for op in ops {
+            self.buffer(op, &mut batch);
         }
         self.integrate_all(batch);
         self.refresh_view();
     }
 
-    /// Buffer one op: pending until every dep is known, then ready.
-    fn buffer(&mut self, op: Op) {
+    /// Buffer one op: pending until every dep is known. A ready op is
+    /// marked known and moved to `batch` (with every waiter it releases).
+    fn buffer(&mut self, op: Op, batch: &mut Vec<Op>) {
         if self.known.contains(&op.id) || self.pending.contains_key(&op.id) {
             return;
         }
@@ -1238,11 +1224,27 @@ impl Replica {
                 n += 1;
             }
         }
-        self.pending.insert(id, op);
-        if n == 0 {
-            self.ready.insert(id);
-        } else {
+        if n > 0 {
+            self.pending.insert(id, op);
             self.missing.insert(id, n);
+            return;
+        }
+        // Ready: known now; release the waiters it unblocks.
+        self.known.insert(id);
+        batch.push(op);
+        let mut stack = vec![id];
+        while let Some(done) = stack.pop() {
+            for w in self.waiting.remove(&done).unwrap_or_default() {
+                let m = self.missing.get_mut(&w).expect("waiter is pending");
+                *m -= 1;
+                if *m == 0 {
+                    self.missing.remove(&w);
+                    let o = self.pending.remove(&w).expect("waiter is pending");
+                    self.known.insert(w);
+                    batch.push(o);
+                    stack.push(w);
+                }
+            }
         }
     }
 

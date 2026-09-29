@@ -412,7 +412,6 @@ impl Replica {
             pending: BTreeMap::new(),
             waiting: HashMap::new(),
             missing: HashMap::new(),
-            ready: BTreeSet::new(),
             view,
             revived,
         })
