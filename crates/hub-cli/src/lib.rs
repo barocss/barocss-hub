@@ -818,6 +818,13 @@ pub(crate) fn record(
     Ok(true)
 }
 
+/// Issue #30: how to leave a pin when an edit made while pinned conflicts
+/// with head (until branches exist). Same text in the README.
+pub const PINNED_WAY_OUT: &str =
+    "hint: the working directory is pinned to an old version and an edit made \
+while pinned conflicts with head. To keep the edit: copy the file(s) aside, run \
+`hub checkout --force` (returns to head and unpins), copy them back, then `hub record`.";
+
 pub(crate) fn checkout(
     repo: &mut Repo,
     id: Option<&str>,
@@ -880,7 +887,13 @@ pub(crate) fn checkout(
             ignored,
             verb: "check out",
         },
-    )?;
+    );
+    let plan = match plan {
+        Err(Error(m)) if !force && crate::watch::pinned(&repo.dir)?.is_some() => {
+            return Err(Error(format!("{m}\n{PINNED_WAY_OUT}")));
+        }
+        p => p?,
+    };
     let (written, removed) = plan.counts();
     // Issue #25 repair (D-020): pinned iff the materialized version is not
     // head; `apply` writes or clears it before removing the marker.

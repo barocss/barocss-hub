@@ -368,3 +368,43 @@ fn status_renders_content_conflicts() {
     assert!(s.contains("despite delete"), "{s}");
     assert!(s.contains(" revived "), "{s}");
 }
+
+/// Issue #30: a plain `hub checkout` refused while pinned (an edit made
+/// while pinned conflicts with head) explains the way out, and the way out
+/// works: copy aside, `checkout --force`, restore, record.
+#[test]
+fn pinned_conflicting_checkout_explains_way_out() {
+    let d = tmp("pinwayout");
+    ok(&d, &["init"]);
+    fs::write(d.join("notes.txt"), b"v1").unwrap();
+    ok(&d, &["record", "-m", "cp1"]);
+    let cp1 = ok(&d, &["log"])
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    fs::write(d.join("notes.txt"), b"v2").unwrap();
+    ok(&d, &["record", "-m", "cp2"]);
+    ok(&d, &["checkout", &cp1]);
+    assert!(d.join(".hub/pinned").exists());
+    fs::write(d.join("notes.txt"), b"edited while pinned").unwrap();
+    let e = fail(&d, &["checkout"]);
+    assert!(e.contains("refusing to check out"), "{e}");
+    assert!(e.contains(hub_cli::PINNED_WAY_OUT), "{e}");
+    assert!(e.contains("hub checkout --force"), "{e}");
+    assert!(d.join(".hub/pinned").exists(), "refusal must not unpin");
+    // Not pinned: the plain hint only.
+    let aside = fs::read(d.join("notes.txt")).unwrap();
+    ok(&d, &["checkout", "--force"]);
+    assert!(!d.join(".hub/pinned").exists());
+    fs::write(d.join("notes.txt"), &aside).unwrap();
+    ok(&d, &["record", "-m", "restored"]);
+    assert_eq!(
+        fs::read(d.join("notes.txt")).unwrap(),
+        b"edited while pinned"
+    );
+    fs::write(d.join("notes.txt"), b"x").unwrap();
+    let e = fail(&d, &["checkout", &cp1]);
+    assert!(!e.contains("pinned to an old version"), "{e}");
+    let _ = fs::remove_dir_all(d);
+}
