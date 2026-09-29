@@ -17,9 +17,12 @@
 //! Checkpoint body: `K <author 32 hex> <frontier> <str message> <str note|->`.
 //! A string token is `s` followed by the escaped bytes (`s` alone = "").
 //!
-//! Appends write one whole line and `fsync` before returning. On open, a
-//! final record with no trailing newline or a bad checksum is a torn write:
-//! it is truncated away (file `set_len` + fsync) and reported. A bad record
+//! Appends write whole lines and `fsync` before returning (a batch is
+//! synced once, [`LogAppender`], Issue #29). On open, a final record with no
+//! trailing newline or a bad checksum is a torn write, and a record
+//! containing a NUL byte starts an un-synced tail (a zero-filled hole after
+//! a power loss): either is truncated away (file `set_len` + fsync) and
+//! reported. A bad record
 //! that is not the last line is corruption and opening fails. A repeated op
 //! id with a different op is corruption; an exact repeat is skipped.
 //!
@@ -289,6 +292,16 @@ pub fn read_log(path: &Path, header: &str) -> Result<LogRead, StoreError> {
                 torn = true;
                 break;
             }
+            // A NUL byte never occurs in a valid record: it is a zero-filled
+            // hole left by a power loss during an un-synced append (Issue
+            // #29, Appendix A.1). Everything from here was written in the
+            // same un-acknowledged batch; cut it like a torn tail. Only if
+            // no valid record follows anywhere after it: a later valid
+            // record means acknowledged data, so that is corruption.
+            _ if line.contains(&0) && !valid_record_after(&bytes[next..]) => {
+                torn = true;
+                break;
+            }
             _ => return Err(corrupt(lineno, "bad checksum or framing")),
         }
         pos = next;
@@ -304,10 +317,47 @@ pub fn read_log(path: &Path, header: &str) -> Result<LogRead, StoreError> {
     })
 }
 
+/// True if `rest` contains a complete, crc-valid `<body>\t<crc>\n` line.
+fn valid_record_after(rest: &[u8]) -> bool {
+    let Some(last_nl) = rest.iter().rposition(|&b| b == b'\n') else {
+        return false;
+    };
+    rest[..last_nl].split(|&b| b == b'\n').any(|l| {
+        std::str::from_utf8(l)
+            .ok()
+            .and_then(|s| s.rsplit_once('\t'))
+            .is_some_and(|(body, c)| !body.is_empty() && c == crc(body))
+    })
+}
+
 /// One framed record line: `<body>\t<crc>\n`.
 pub fn frame(body: &str) -> String {
     debug_assert!(!body.contains('\t') && !body.contains('\n'));
     format!("{body}\t{}\n", crc(body))
+}
+
+/// Group-commit appender (Issue #29): [`LogAppender::write`] writes whole
+/// framed lines; [`LogAppender::sync`] makes all of them durable at once.
+pub struct LogAppender {
+    f: File,
+}
+
+impl LogAppender {
+    pub fn open(path: &Path) -> io::Result<LogAppender> {
+        Ok(LogAppender {
+            f: OpenOptions::new().append(true).open(path)?,
+        })
+    }
+
+    /// Write one framed record (not yet durable).
+    pub fn write(&mut self, body: &str) -> io::Result<()> {
+        self.f.write_all(frame(body).as_bytes())
+    }
+
+    /// One log sync for everything written so far.
+    pub fn sync(&self) -> io::Result<()> {
+        self.f.sync_data()
+    }
 }
 
 /// Append one record and fsync.
@@ -435,6 +485,61 @@ impl RepoLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn log_with(n: usize, tag: &str) -> (PathBuf, Vec<u8>) {
+        let d = std::env::temp_dir().join(format!("hub-store-unit-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let p = d.join("x.log");
+        let mut s = format!("{OPLOG_HEADER}\n");
+        for i in 0..n {
+            s.push_str(&frame(&format!("R record-number-{i}")));
+        }
+        fs::write(&p, &s).unwrap();
+        (p, s.into_bytes())
+    }
+
+    fn line_start(b: &[u8], k: usize) -> usize {
+        // start of record k (0-based), after the header line
+        let mut pos = 0;
+        for _ in 0..=k {
+            pos += b[pos..].iter().position(|&c| c == b'\n').unwrap() + 1;
+        }
+        pos
+    }
+
+    /// #29 repair: NUL inside an acknowledged record that is followed by
+    /// valid records is corruption: hard error, file byte-identical.
+    #[test]
+    fn mid_log_nul_followed_by_valid_records_is_corruption() {
+        let (p, mut b) = log_with(8, "midnul");
+        let at = line_start(&b, 2) + 5;
+        b[at..at + 8].fill(0);
+        fs::write(&p, &b).unwrap();
+        match read_log(&p, OPLOG_HEADER) {
+            Err(StoreError::Corrupt { line, .. }) => assert_eq!(line, 4),
+            other => panic!(
+                "expected corruption, got {:?}",
+                other.map(|r| r.records.len())
+            ),
+        }
+        assert_eq!(fs::read(&p).unwrap(), b, "file must be untouched");
+    }
+
+    /// A trailing zero hole (nothing valid after it) is an un-synced tail:
+    /// truncated to the prefix before it.
+    #[test]
+    fn trailing_nul_hole_is_truncated_to_the_prefix() {
+        let (p, mut b) = log_with(8, "tailnul");
+        let at = line_start(&b, 5) + 3;
+        let end = b.len() - 1; // keep the final newline: hole spans records 5..8
+        b[at..end].fill(0);
+        fs::write(&p, &b).unwrap();
+        let r = read_log(&p, OPLOG_HEADER).unwrap();
+        assert!(r.truncated_tail);
+        assert_eq!(r.records.len(), 5);
+        assert_eq!(fs::read(&p).unwrap(), b[..line_start(&b, 5)].to_vec());
+    }
 
     #[test]
     fn no_lock_warning_matches_target() {

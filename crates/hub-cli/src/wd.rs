@@ -969,13 +969,14 @@ fn fmt_frontier(f: &[OpId]) -> String {
     }
 }
 
-/// Crash-safe working-file write. The temp is a fresh, uniquely named file
+/// Crash-safe working-file temp. The temp is a fresh, uniquely named file
 /// in `.hub/tmp/` created with `create_new` (O_EXCL), so it never truncates
 /// or replaces anything, and is never part of the working directory (scans
-/// skip `.hub/`). It is fsynced, then renamed over the target. `.hub/` lives
-/// inside the working directory; [`apply`] checks both are on the same
-/// device so the rename is atomic.
-fn write_file(tmp_dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// skip `.hub/`). It is flushed but not barriered: [`apply`] issues one
+/// barrier over all temps, then renames each over its target (Issue #29).
+/// `.hub/` lives inside the working directory; [`apply`] checks both are on
+/// the same device so the rename is atomic.
+fn write_temp(tmp_dir: &Path, bytes: &[u8]) -> io::Result<(PathBuf, fs::File)> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -998,14 +999,12 @@ fn write_file(tmp_dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         };
-        let r = f
-            .write_all(bytes)
-            .and_then(|_| f.sync_all())
-            .and_then(|_| fs::rename(&tmp, path));
-        if r.is_err() {
+        let r = f.write_all(bytes).and_then(|_| crate::durable::flush(&f));
+        if let Err(e) = r {
             let _ = fs::remove_file(&tmp);
+            return Err(e);
         }
-        return r;
+        return Ok((tmp, f));
     }
 }
 
@@ -1074,11 +1073,109 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
     for path in &p.make_dirs {
         fs::create_dir_all(root.join(path))?;
     }
-    for (path, bytes) in &p.write_files {
-        write_file(&tmp_dir, &root.join(path), bytes)?;
-        if crash {
-            std::process::abort();
+    // #29 repair: every directory whose entries this apply changes. A
+    // removed path changes its parent; a created directory changes the
+    // parent of every level of its chain (create_dir_all may create them
+    // all); a written file changes its parent. Flushed before the index.
+    let mut dirty: BTreeSet<PathBuf> = BTreeSet::new();
+    let parent_of = |rel: &str| -> PathBuf {
+        match rel.rsplit_once('/') {
+            Some((d, _)) => root.join(d),
+            None => root.to_path_buf(),
         }
+    };
+    for rel in p
+        .force_remove
+        .iter()
+        .chain(&p.remove_files)
+        .chain(&p.remove_dirs)
+    {
+        dirty.insert(parent_of(rel));
+    }
+    for rel in &p.make_dirs {
+        for (i, _) in rel.match_indices('/') {
+            dirty.insert(parent_of(&rel[..i]));
+        }
+        dirty.insert(parent_of(rel));
+    }
+    for (rel, _) in &p.write_files {
+        dirty.insert(parent_of(rel));
+    }
+    // Group commit (Issue #29, Appendix A.1): write and flush every temp,
+    // one barrier, rename each over its target, flush the renamed entries'
+    // directories (and every other directory this apply changed), one more
+    // barrier; all before the index save. A rename
+    // therefore never exposes un-barriered data, and until the index is
+    // saved the marker guards everything.
+    if !p.write_files.is_empty() {
+        use crate::durable;
+        let mut temps: Vec<PathBuf> = Vec::with_capacity(p.write_files.len());
+        let mut last = None;
+        for (_, bytes) in &p.write_files {
+            match write_temp(&tmp_dir, bytes) {
+                Ok((t, f)) => {
+                    temps.push(t);
+                    last = Some(f);
+                }
+                Err(e) => {
+                    for t in &temps {
+                        let _ = fs::remove_file(t);
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+        durable::crash_point(durable::FILES_WRITTEN);
+        if let Some(f) = last {
+            durable::barrier(&f)?;
+        }
+        durable::crash_point(durable::FILES_BARRIERED);
+        for (i, (path, _)) in p.write_files.iter().enumerate() {
+            let target = root.join(path);
+            if let Err(e) = fs::rename(&temps[i], &target) {
+                for t in &temps[i..] {
+                    let _ = fs::remove_file(t);
+                }
+                return Err(e.into());
+            }
+            if crash {
+                std::process::abort();
+            }
+        }
+        durable::crash_point(durable::FILES_RENAMED);
+    }
+    if !dirty.is_empty() {
+        use crate::durable;
+        // A dirty dir that no longer exists as a directory (removed, or an
+        // ancestor became a file: NotFound / ENOTDIR) is skipped, and its
+        // nearest existing ancestor directory is flushed instead (whose
+        // entry for the removed/replaced child changed).
+        let mut done: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut queue: Vec<PathBuf> = dirty.iter().rev().cloned().collect();
+        while let Some(d) = queue.pop() {
+            if done.contains(&d) {
+                continue;
+            }
+            let gone = match fs::symlink_metadata(&d) {
+                Ok(m) => !m.is_dir(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(20) => {
+                    true
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if gone {
+                done.insert(d.clone());
+                if d != root {
+                    if let Some(up) = d.parent() {
+                        queue.push(up.to_path_buf());
+                    }
+                }
+                continue;
+            }
+            durable::flush_dir(&d, &fs::File::open(&d)?)?;
+            done.insert(d);
+        }
+        durable::barrier(&fs::File::open(&tmp_dir)?)?;
     }
     let mut idx = Index {
         base: p.base,
@@ -1086,14 +1183,24 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
     };
     for (path, (node, e, refresh)) in p.index {
         let e = match (e, refresh) {
-            (Entry::File { blob, .. }, true) => {
-                let md = fs::metadata(root.join(&path))?;
-                Entry::File {
+            (Entry::File { blob, .. }, true) => match fs::metadata(root.join(&path)) {
+                Ok(md) => Entry::File {
                     blob,
                     size: md.len(),
                     mtime: mtime_ns(&md),
-                }
-            }
+                },
+                // Removed by the user while we applied (e.g. under `hub
+                // watch`): keep the entry with unknown stat ("rehash"), so
+                // the next scan reports it deleted instead of this apply
+                // failing and leaving the marker, whose resume would
+                // resurrect the file (#29 repair).
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Entry::File {
+                    blob,
+                    size: 0,
+                    mtime: 0,
+                },
+                Err(e) => return Err(e.into()),
+            },
             (e, _) => e,
         };
         idx.entries.insert(path, (node, e));

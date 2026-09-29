@@ -4,8 +4,10 @@
 //! header or compression. Only a file whose name is exactly 64 hex digits is
 //! a blob.
 //!
-//! Writes: bytes go to `.hub/blobs/tmp-<pid>-<nanos>` (never a valid blob
-//! name), `fsync`, `rename` to the final name, then `fsync` of `.hub/blobs/`.
+//! Writes: bytes go to `.hub/blobs/tmp-<pid>-<nanos>-<seq>` (never a valid
+//! blob name), `fsync`, `rename` to the final name, then `fsync` of
+//! `.hub/blobs/`. Several blobs are group-committed by [`BlobBatch`]: one
+//! barrier and one directory fsync for the whole batch (Issue #29).
 //! A crash before the rename leaves only a `tmp-*` file, which is invisible
 //! to readers and removed by [`Blobs::sweep_temps`] (called by writers holding
 //! the exclusive repo lock).
@@ -16,12 +18,15 @@
 //! The empty blob is implicit: [`Blobs::get`] of `BlobId::empty()` succeeds
 //! without a file.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hub_core::tree::BlobId;
+
+use crate::durable;
 
 /// Test-only fault injection: when set, `put` writes half the bytes to the
 /// temp file and aborts the process before the rename.
@@ -77,13 +82,28 @@ impl Blobs {
         self.dir.join(id.hex())
     }
 
-    /// Write `bytes` to a fresh temp file and fsync it. Not visible as a blob.
+    /// Write `bytes` to a fresh temp file and make it durable. Not visible
+    /// as a blob.
     pub fn write_temp(&self, bytes: &[u8]) -> io::Result<PathBuf> {
+        let (tmp, f) = self.write_temp_flushed(bytes)?;
+        durable::barrier(&f)?;
+        Ok(tmp)
+    }
+
+    /// Write `bytes` to a fresh, uniquely named temp file and
+    /// [`durable::flush`] it (no barrier: see [`BlobBatch`]).
+    fn write_temp_flushed(&self, bytes: &[u8]) -> io::Result<(PathBuf, File)> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let tmp = self.dir.join(format!("tmp-{}-{nanos}", std::process::id()));
+        let tmp = self.dir.join(format!(
+            "tmp-{}-{nanos}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         let mut f = File::create(&tmp)?;
         if std::env::var_os(CRASH_ENV).is_some() {
             f.write_all(&bytes[..bytes.len() / 2])?;
@@ -91,25 +111,26 @@ impl Blobs {
             std::process::abort();
         }
         f.write_all(bytes)?;
-        f.sync_all()?;
-        Ok(tmp)
+        durable::flush(&f)?;
+        Ok((tmp, f))
     }
 
     /// Store `bytes`; idempotent. Returns their id.
     pub fn put(&self, bytes: &[u8]) -> Result<BlobId, BlobError> {
-        let id = BlobId::of(bytes);
-        if id == BlobId::empty() {
-            return Ok(id);
-        }
-        match self.get(&id) {
-            Ok(_) => return Ok(id),
-            Err(BlobError::Missing(_) | BlobError::Corrupt { .. }) => {}
-            Err(e) => return Err(e),
-        }
-        let tmp = self.write_temp(bytes)?;
-        fs::rename(&tmp, self.path(&id))?;
-        File::open(&self.dir)?.sync_all()?;
+        let mut b = self.batch();
+        let id = b.add(bytes)?;
+        b.commit()?;
         Ok(id)
+    }
+
+    /// Start a group commit of several blobs (Issue #29).
+    pub fn batch(&self) -> BlobBatch<'_> {
+        BlobBatch {
+            blobs: self,
+            temps: Vec::new(),
+            seen: BTreeSet::new(),
+            last: None,
+        }
     }
 
     /// Read and verify a blob.
@@ -164,6 +185,57 @@ impl Blobs {
             }
         }
         Ok(n)
+    }
+}
+
+/// A group commit of blobs (Issue #29, Wiki Appendix A.1): every
+/// [`BlobBatch::add`] writes and flushes a temp; [`BlobBatch::commit`] issues
+/// one barrier, renames every temp to its blob name and fsyncs `blobs/`
+/// once. Until `commit` returns, no new blob is guaranteed visible, so
+/// callers append ops naming these blobs only afterwards. Dropping a batch
+/// without committing leaves `tmp-*` files for the next sweep.
+pub struct BlobBatch<'a> {
+    blobs: &'a Blobs,
+    temps: Vec<(PathBuf, BlobId)>,
+    seen: BTreeSet<BlobId>,
+    last: Option<File>,
+}
+
+impl BlobBatch<'_> {
+    /// Stage `bytes` (skipped if empty, already stored, or already staged).
+    pub fn add(&mut self, bytes: &[u8]) -> Result<BlobId, BlobError> {
+        let id = BlobId::of(bytes);
+        if id == BlobId::empty() || self.seen.contains(&id) {
+            return Ok(id);
+        }
+        match self.blobs.get(&id) {
+            Ok(_) => return Ok(id),
+            Err(BlobError::Missing(_) | BlobError::Corrupt { .. }) => {}
+            Err(e) => return Err(e),
+        }
+        let (tmp, f) = self.blobs.write_temp_flushed(bytes)?;
+        self.temps.push((tmp, id));
+        self.seen.insert(id);
+        self.last = Some(f);
+        Ok(id)
+    }
+
+    /// Barrier, renames, one directory fsync. Returns how many blobs were
+    /// written.
+    pub fn commit(self) -> Result<usize, BlobError> {
+        let Some(last) = self.last else {
+            return Ok(0);
+        };
+        durable::crash_point(durable::BLOBS_WRITTEN);
+        durable::barrier(&last)?;
+        drop(last);
+        durable::crash_point(durable::BLOBS_BARRIERED);
+        for (tmp, id) in &self.temps {
+            fs::rename(tmp, self.blobs.path(id))?;
+        }
+        durable::crash_point(durable::BLOBS_RENAMED);
+        File::open(&self.blobs.dir)?.sync_all()?;
+        Ok(self.temps.len())
     }
 }
 
