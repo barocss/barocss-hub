@@ -277,10 +277,11 @@ fn interrupted_sync_is_valid_and_rerun_completes() {
     ok(a, &["status"]);
     ok(b, &["status"]);
     let partial = ok(b, &["status"]);
-    // b had 2 ops and got exactly 5 of a's 12 before the crash.
-    assert!(partial.contains("(7 ops"), "{partial}");
+    // Format v1 (#33): the crash hit before the batch's commit record, so
+    // none of the 5 written ops count; b still has its own 2.
+    assert!(partial.contains("(2 ops"), "{partial}");
     let s = sync(b, a);
-    assert!(s.contains("received 7 op(s)"), "{s}");
+    assert!(s.contains("received 12 op(s)"), "{s}");
     ok(a, &["checkout"]);
     ok(b, &["checkout"]);
     assert_eq!(snapshot(a), snapshot(b));
@@ -431,6 +432,7 @@ fn op_bodies(d: &Path) -> Vec<String> {
         .unwrap()
         .lines()
         .skip(1)
+        .filter(|l| l.starts_with("O ")) // v1 (#33): skip commit records
         .map(|l| l.rsplit_once('\t').unwrap().0.to_string())
         .collect()
 }

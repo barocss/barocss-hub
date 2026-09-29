@@ -552,6 +552,13 @@ pub fn sync_with(
             "note: the working directory is not updated by sync; run `hub checkout` to bring it to head"
         )?;
     }
+    // Issue #33: both sides refresh `.hub/snapshot` when due.
+    for w in [a.maybe_snapshot(), b.maybe_snapshot()]
+        .into_iter()
+        .flatten()
+    {
+        writeln!(warn, "warning: {w}")?;
+    }
     Ok(())
 }
 

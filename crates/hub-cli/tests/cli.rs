@@ -233,6 +233,7 @@ fn parallel_writers_do_not_lose_ops() {
     let ids: Vec<&str> = log
         .lines()
         .skip(1)
+        .filter(|l| l.starts_with("O "))
         .map(|l| l.split(' ').nth(1).unwrap())
         .collect();
     let uniq: std::collections::BTreeSet<_> = ids.iter().collect();
@@ -240,12 +241,28 @@ fn parallel_writers_do_not_lose_ops() {
     assert_eq!(uniq.len(), N, "duplicate OpIds in log");
 }
 
-fn crc8(body: &str) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(body.as_bytes())[..4]
+/// A committed v1 batch (Appendix A.2.2) of `bodies`, appended after `log`.
+fn batch(log: &str, bodies: &[&str]) -> String {
+    use hub_cli::store::{batch_chain, commit_body, frame, CHAIN0};
+    let last = log.lines().rev().find(|l| l.starts_with("B "));
+    let (seq, chain) = match last {
+        Some(l) => {
+            let t: Vec<&str> = l.split(['\t', ' ']).collect();
+            (t[1].parse::<u64>().unwrap(), t[3].to_string())
+        }
+        None => (0, CHAIN0.to_string()),
+    };
+    let lines: Vec<String> = bodies.iter().map(|b| frame(b)).collect();
+    let crcs: Vec<String> = lines
         .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .map(|l| l[l.len() - 9..l.len() - 1].to_string())
+        .collect();
+    let ch = batch_chain(&chain, crcs.iter().map(String::as_str));
+    format!(
+        "{}{}",
+        lines.concat(),
+        frame(&commit_body(seq + 1, bodies.len() as u64, &ch))
+    )
 }
 
 /// Same OpId, different payload: corruption, file untouched.
@@ -259,18 +276,19 @@ fn conflicting_duplicate_op_id_is_corruption() {
     let body = s.lines().nth(1).unwrap().rsplit_once('\t').unwrap().0;
     assert!(body.ends_with(" sa"));
     let other = format!("{} sb", &body[..body.len() - 3]);
-    let bad = format!("{s}{other}\t{}\n", crc8(&other));
+    // Format v1 (#33): the duplicate arrives in its own committed batch.
+    let bad = format!("{s}{}", batch(&s, &[&other]));
     fs::write(&log, &bad).unwrap();
     let e = fail(&d, &["ls"]);
     assert!(
-        e.contains("corrupt") && e.contains("line 3") && e.contains("duplicate op id"),
+        e.contains("corrupt") && e.contains("line 4:") && e.contains("duplicate op id"),
         "{e}"
     );
     assert!(fail(&d, &["mkdir", "c"]).contains("duplicate op id"));
     assert_eq!(fs::read_to_string(&log).unwrap(), bad, "must not rewrite");
 
     // An exact duplicate record is idempotent.
-    let exact = format!("{s}{body}\t{}\n", crc8(body));
+    let exact = format!("{s}{}", batch(&s, &[body]));
     fs::write(&log, &exact).unwrap();
     assert_eq!(ok(&d, &["ls"]), "a/\n");
 }

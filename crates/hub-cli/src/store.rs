@@ -1,4 +1,6 @@
-//! On-disk `.hub/` storage (Issue #16, format v0 [decision-proposal]).
+//! On-disk `.hub/` storage (Issue #16; format v1 since Issue #33, Wiki
+//! Appendix A.2: `ops.log` batches with `B` commit records, see
+//! [`read_oplog`]; the notes below describe the v0 framing it keeps).
 //!
 //! Layout:
 //! - `.hub/replica`      `barocss-hub/replica/v0\n<32 hex digits>\n`, written
@@ -41,9 +43,19 @@ use hub_core::tree::{BlobId, Kind, NodeId, Op, Payload, ReplicaId};
 #[cfg(test)]
 use hub_core::version::Store;
 
-pub const OPLOG_HEADER: &str = "barocss-hub/oplog/v0";
+/// v0 op log header (read only by the v0 -> v1 migration, Issue #33).
+pub const OPLOG_HEADER_V0: &str = "barocss-hub/oplog/v0";
+/// v1 op log header: `O` records grouped in batches ended by `B` records.
+pub const OPLOG_HEADER: &str = "barocss-hub/oplog/v1";
 pub const CKPT_HEADER: &str = "barocss-hub/checkpoints/v0";
-pub const REPLICA_HEADER: &str = "barocss-hub/replica/v0";
+/// v0 replica header (a v0 repository, migrated on open).
+pub const REPLICA_HEADER_V0: &str = "barocss-hub/replica/v0";
+/// v1 replica header: the format version marker (Appendix A.2.1).
+pub const REPLICA_HEADER: &str = "barocss-hub/replica/v1";
+/// Common prefix of every replica header (to name unknown versions).
+pub const REPLICA_HEADER_PREFIX: &str = "barocss-hub/replica/";
+/// `.hub/format` contents in v1.
+pub const FORMAT_V1: &str = "barocss-hub/format/v1\n";
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -283,6 +295,12 @@ pub struct LogRead {
 
 /// Read a log, validating header and checksums; truncate a torn final record.
 pub fn read_log(path: &Path, header: &str) -> Result<LogRead, StoreError> {
+    read_log_with(path, header, true)
+}
+
+/// [`read_log`]; with `truncate = false` a torn tail is only left out of
+/// the result, the file is not changed (the v0 -> v1 migration, #33).
+pub fn read_log_with(path: &Path, header: &str, truncate: bool) -> Result<LogRead, StoreError> {
     let bytes = fs::read(path)?;
     let corrupt = |line: usize, why: &str| StoreError::Corrupt {
         file: path.to_path_buf(),
@@ -334,7 +352,7 @@ pub fn read_log(path: &Path, header: &str) -> Result<LogRead, StoreError> {
         }
         pos = next;
     }
-    if torn {
+    if torn && truncate {
         let f = OpenOptions::new().write(true).open(path)?;
         f.set_len(good_end as u64)?;
         f.sync_all()?;
@@ -358,6 +376,220 @@ fn valid_record_after(rest: &[u8]) -> bool {
     })
 }
 
+/// A committed position in a v1 `ops.log` (Appendix A.2.2): the byte
+/// offset just after batch `seq`'s commit record, that batch's `count`
+/// and `chain`, and the number of `O` records up to there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogPos {
+    pub offset: u64,
+    pub seq: u64,
+    pub count: u64,
+    pub chain: String,
+    pub ops: u64,
+}
+
+pub const CHAIN0: &str = "0000000000000000";
+
+impl LogPos {
+    /// The position of an empty v1 log (just the header).
+    pub fn start() -> LogPos {
+        LogPos {
+            offset: (OPLOG_HEADER.len() + 1) as u64,
+            seq: 0,
+            count: 0,
+            chain: CHAIN0.into(),
+            ops: 0,
+        }
+    }
+
+    /// The framed commit record ending at `offset` (`None` for seq 0).
+    pub fn commit_line(&self) -> Option<String> {
+        (self.seq > 0).then(|| frame(&commit_body(self.seq, self.count, &self.chain)))
+    }
+}
+
+pub fn commit_body(seq: u64, count: u64, chain: &str) -> String {
+    format!("B {seq} {count} {chain}")
+}
+
+/// Batch chain (Appendix A.2.2): first 8 bytes of SHA-256(prev ‖ crcs).
+pub fn batch_chain<'a>(prev: &str, crcs: impl IntoIterator<Item = &'a str>) -> String {
+    let mut h = Sha256::new();
+    h.update(prev.as_bytes());
+    for c in crcs {
+        h.update(c.as_bytes());
+    }
+    h.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Result of reading a v1 op log.
+pub struct OpLogRead {
+    /// Bodies of the committed `O` records after the start position.
+    pub records: Vec<String>,
+    /// Physical line number of each record (exact when read from the header).
+    pub lines: Vec<usize>,
+    /// Position after the last committed batch.
+    pub pos: LogPos,
+    /// An uncommitted tail was truncated.
+    pub truncated_tail: bool,
+}
+
+enum Line<'a> {
+    Op(&'a str, &'a str),
+    Commit(u64, u64, &'a str),
+    Bad,
+}
+
+fn parse_line(line: &[u8], complete: bool) -> Line<'_> {
+    if !complete {
+        return Line::Bad;
+    }
+    let Some((body, c)) = std::str::from_utf8(line)
+        .ok()
+        .and_then(|s| s.rsplit_once('\t'))
+    else {
+        return Line::Bad;
+    };
+    if c != crc(body) {
+        return Line::Bad;
+    }
+    if body.starts_with("O ") {
+        return Line::Op(body, c);
+    }
+    let t: Vec<&str> = body.split(' ').collect();
+    if let ["B", seq, count, chain] = t.as_slice() {
+        if let (Ok(s), Ok(n)) = (seq.parse::<u64>(), count.parse::<u64>()) {
+            if n > 0 && chain.len() == 16 && format!("B {s} {n} {chain}") == body {
+                return Line::Commit(s, n, chain);
+            }
+        }
+    }
+    // A crc-valid record of unknown shape: not a torn write.
+    Line::Op(body, c)
+}
+
+/// Read a v1 `ops.log` (Appendix A.2.2). `from`: start after this
+/// committed position (a snapshot's; the caller has checked that its
+/// commit record is in place), else from the header. The committed batches
+/// are returned; an uncommitted tail is truncated unless it contains a
+/// self-consistent batch (corruption: error, file untouched). Line numbers
+/// in errors are exact only when reading from the header.
+pub fn read_oplog(path: &Path, from: Option<&LogPos>) -> Result<OpLogRead, StoreError> {
+    let mut f = File::open(path)?;
+    let mut bytes = Vec::new();
+    let start = match from {
+        Some(p) => {
+            use std::io::{Read, Seek, SeekFrom};
+            f.seek(SeekFrom::Start(p.offset))?;
+            f.read_to_end(&mut bytes)?;
+            p.clone()
+        }
+        None => {
+            use std::io::Read;
+            f.read_to_end(&mut bytes)?;
+            let head = format!("{OPLOG_HEADER}\n");
+            if !bytes.starts_with(head.as_bytes()) {
+                return Err(StoreError::Corrupt {
+                    file: path.to_path_buf(),
+                    line: 1,
+                    why: "missing or wrong header".into(),
+                });
+            }
+            bytes.drain(..head.len());
+            LogPos::start()
+        }
+    };
+    let base = start.offset as usize;
+    let lines_before = if from.is_none() { 1 } else { 0 };
+    // Phase 1: the committed prefix.
+    let mut pos = start.clone();
+    let mut records = Vec::new();
+    let mut batch: Vec<(&str, &str)> = Vec::new();
+    let mut lines = Vec::new();
+    let mut committed_lines = 0usize;
+    let mut i = 0usize;
+    let mut nlines = 0usize;
+    while i < bytes.len() {
+        let nl = bytes[i..].iter().position(|&b| b == b'\n');
+        let (line, next, complete) = match nl {
+            Some(k) => (&bytes[i..i + k], i + k + 1, true),
+            None => (&bytes[i..], bytes.len(), false),
+        };
+        nlines += 1;
+        match parse_line(line, complete) {
+            Line::Op(b, c) => batch.push((b, c)),
+            Line::Commit(s, n, ch)
+                if s == pos.seq + 1
+                    && n as usize == batch.len()
+                    && ch == batch_chain(&pos.chain, batch.iter().map(|x| x.1)) =>
+            {
+                pos = LogPos {
+                    offset: (base + next) as u64,
+                    seq: s,
+                    count: n,
+                    chain: ch.to_string(),
+                    ops: pos.ops + n,
+                };
+                let first = lines_before + committed_lines + 1;
+                lines.extend(first..first + batch.len());
+                records.extend(batch.drain(..).map(|x| x.0.to_string()));
+                committed_lines = nlines;
+            }
+            _ => break,
+        }
+        i = next;
+    }
+    let cut = pos.offset as usize - base;
+    if cut == bytes.len() {
+        return Ok(OpLogRead {
+            records,
+            lines,
+            pos,
+            truncated_tail: false,
+        });
+    }
+    // Phase 2: is there a self-consistent batch in the tail?
+    let rest = &bytes[cut..];
+    let mut run: Vec<&str> = Vec::new();
+    let mut j = 0usize;
+    while j < rest.len() {
+        let nl = rest[j..].iter().position(|&b| b == b'\n');
+        let (line, next, complete) = match nl {
+            Some(k) => (&rest[j..j + k], j + k + 1, true),
+            None => (&rest[j..], rest.len(), false),
+        };
+        match parse_line(line, complete) {
+            Line::Op(b, c) if b.starts_with("O ") => run.push(c),
+            Line::Commit(s, n, ch) => {
+                let consistent = n as usize == run.len()
+                    && (s != pos.seq + 1 || ch == batch_chain(&pos.chain, run.iter().copied()));
+                if consistent {
+                    return Err(StoreError::Corrupt {
+                        file: path.to_path_buf(),
+                        line: lines_before + committed_lines + 1,
+                        why: "damaged records before a committed batch".into(),
+                    });
+                }
+                run.clear();
+            }
+            _ => run.clear(),
+        }
+        j = next;
+    }
+    let f = OpenOptions::new().write(true).open(path)?;
+    f.set_len(pos.offset)?;
+    f.sync_all()?;
+    Ok(OpLogRead {
+        records,
+        lines,
+        pos,
+        truncated_tail: true,
+    })
+}
+
 /// One framed record line: `<body>\t<crc>\n`.
 pub fn frame(body: &str) -> String {
     debug_assert!(!body.contains('\t') && !body.contains('\n'));
@@ -368,18 +600,47 @@ pub fn frame(body: &str) -> String {
 /// framed lines; [`LogAppender::sync`] makes all of them durable at once.
 pub struct LogAppender {
     f: File,
+    crcs: Vec<String>,
 }
 
 impl LogAppender {
     pub fn open(path: &Path) -> io::Result<LogAppender> {
         Ok(LogAppender {
             f: OpenOptions::new().append(true).open(path)?,
+            crcs: Vec::new(),
         })
     }
 
     /// Write one framed record (not yet durable).
     pub fn write(&mut self, body: &str) -> io::Result<()> {
-        self.f.write_all(frame(body).as_bytes())
+        let line = frame(body);
+        self.crcs
+            .push(line[line.len() - 9..line.len() - 1].to_string());
+        self.f.write_all(line.as_bytes())
+    }
+
+    /// Records written since the last [`LogAppender::commit`].
+    pub fn pending(&self) -> usize {
+        self.crcs.len()
+    }
+
+    /// Write the commit record for the records written since the last
+    /// commit, after `at` (Issue #33); returns the new position. Not yet
+    /// durable: [`LogAppender::sync`] follows.
+    pub fn commit(&mut self, at: &LogPos) -> io::Result<LogPos> {
+        let n = self.crcs.len() as u64;
+        let chain = batch_chain(&at.chain, self.crcs.iter().map(String::as_str));
+        let line = frame(&commit_body(at.seq + 1, n, &chain));
+        self.f.write_all(line.as_bytes())?;
+        self.crcs.clear();
+        let offset = self.f.metadata()?.len();
+        Ok(LogPos {
+            offset,
+            seq: at.seq + 1,
+            count: n,
+            chain,
+            ops: at.ops + n,
+        })
     }
 
     /// One log sync for everything written so far.

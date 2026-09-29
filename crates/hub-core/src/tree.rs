@@ -465,10 +465,16 @@ pub fn causal_past(ops: &BTreeMap<OpId, Op>) -> BTreeMap<OpId, BTreeSet<OpId>> {
 /// Memory is O(ops × replicas); a query is O(1) under §2.6 #7.
 #[derive(Clone, Debug)]
 pub struct Causality {
-    index: HashMap<OpId, usize>,
-    /// Kept edges (`d` in the set, `d < o`) as indices, per op in `<` order.
-    deps: Vec<Vec<usize>>,
+    /// Op ids in `<` order; an op's index is its position (Issue #33: a
+    /// sorted vector instead of a hash map, deps in CSR form).
+    ids: Vec<OpId>,
+    /// Kept edges (`d` in the set, `d < o`) as indices, per op in `<` order:
+    /// `dep_list[dep_off[i]..dep_off[i + 1]]`.
+    dep_off: Vec<u32>,
+    dep_list: Vec<u32>,
     slot: HashMap<ReplicaId, usize>,
+    /// Slot of each op's replica.
+    op_slot: Vec<u32>,
     width: usize,
     /// Row-major `ops × width` version vectors (counter + 1, 0 = none).
     vv: Vec<u64>,
@@ -479,24 +485,43 @@ pub struct Causality {
 impl Causality {
     /// Build over `ops` (keys are the op ids, ascending).
     pub fn new(ops: &BTreeMap<OpId, Op>) -> Self {
-        let index: HashMap<OpId, usize> = ops.keys().enumerate().map(|(i, id)| (*id, i)).collect();
+        let ids: Vec<OpId> = ops.keys().copied().collect();
         let mut slot: HashMap<ReplicaId, usize> = HashMap::new();
-        for id in ops.keys() {
-            let n = slot.len();
-            slot.entry(id.replica).or_insert(n);
+        let mut op_slot = Vec::with_capacity(ids.len());
+        let mut cache: Option<(ReplicaId, usize)> = None;
+        for id in &ids {
+            let s = match cache {
+                Some((r, s)) if r == id.replica => s,
+                _ => {
+                    let n = slot.len();
+                    let s = *slot.entry(id.replica).or_insert(n);
+                    cache = Some((id.replica, s));
+                    s
+                }
+            };
+            op_slot.push(s as u32);
         }
         let width = slot.len().max(1);
-        let mut vv = vec![0u64; ops.len() * width];
+        let mut vv = vec![0u64; ids.len() * width];
         let mut chain = vec![true; width];
         let mut last: Vec<u64> = vec![0; width];
-        let mut deps = Vec::with_capacity(ops.len());
+        let mut dep_off = Vec::with_capacity(ids.len() + 1);
+        let mut dep_list: Vec<u32> = Vec::with_capacity(ids.len());
+        dep_off.push(0u32);
+        let mut ds: Vec<usize> = Vec::new();
         for (i, op) in ops.values().enumerate() {
-            let ds: Vec<usize> = op
-                .deps
-                .iter()
-                .filter_map(|d| index.get(d).copied())
-                .filter(|&j| j < i)
-                .collect();
+            ds.clear();
+            for d in &op.deps {
+                // Fast path: the previous op; else a search below `i`.
+                let j = if i > 0 && ids[i - 1] == *d {
+                    Some(i - 1)
+                } else {
+                    ids[..i].binary_search(d).ok()
+                };
+                if let Some(j) = j {
+                    ds.push(j);
+                }
+            }
             let (done, rest) = vv.split_at_mut(i * width);
             let row = &mut rest[..width];
             for &j in &ds {
@@ -504,7 +529,7 @@ impl Causality {
                     *x = (*x).max(y);
                 }
             }
-            let s = slot[&op.id.replica];
+            let s = op_slot[i] as usize;
             // The previous op of this replica (greatest smaller counter) must
             // be in deps*(op). While the replica's chain holds, that is
             // exactly `vv over deps >= prev + 1`.
@@ -513,12 +538,15 @@ impl Causality {
             }
             last[s] = op.id.counter + 1;
             row[s] = op.id.counter + 1;
-            deps.push(ds);
+            dep_list.extend(ds.iter().map(|&j| j as u32));
+            dep_off.push(dep_list.len() as u32);
         }
         Causality {
-            index,
-            deps,
+            ids,
+            dep_off,
+            dep_list,
             slot,
+            op_slot,
             width,
             vv,
             chain,
@@ -529,16 +557,30 @@ impl Causality {
         &self.vv[i * self.width..(i + 1) * self.width]
     }
 
+    fn deps_of(&self, i: usize) -> &[u32] {
+        &self.dep_list[self.dep_off[i] as usize..self.dep_off[i + 1] as usize]
+    }
+
+    fn idx(&self, id: OpId) -> Option<usize> {
+        self.ids.binary_search(&id).ok()
+    }
+
     /// `a ∈ deps*(b)` (strict), i.e. `causal_past(ops)[b].contains(a)`.
     /// False if either id is not in the set.
     pub fn precedes(&self, a: OpId, b: OpId) -> bool {
-        let (Some(&ia), Some(&ib)) = (self.index.get(&a), self.index.get(&b)) else {
+        let (Some(ia), Some(ib)) = (self.idx(a), self.idx(b)) else {
             return false;
         };
+        self.precedes_at(ia, ib)
+    }
+
+    /// [`Causality::precedes`] by index (the op's position in `<` order).
+    pub fn precedes_at(&self, ia: usize, ib: usize) -> bool {
         if ia >= ib {
             return false;
         }
-        let s = self.slot[&a.replica];
+        let a = self.ids[ia];
+        let s = self.op_slot[ia] as usize;
         let need = a.counter + 1;
         if self.row(ib)[s] < need {
             return false;
@@ -551,7 +593,8 @@ impl Causality {
         let mut stack = vec![ib];
         let mut seen = HashSet::new();
         while let Some(x) = stack.pop() {
-            for &d in &self.deps[x] {
+            for &d in self.deps_of(x) {
+                let d = d as usize;
                 if d == ia {
                     return true;
                 }
@@ -580,10 +623,27 @@ impl Causality {
                 out[k] = acc[s] >= need
                     && (self.chain[s] || xs[k + 1..].iter().any(|&y| self.precedes(x, y)));
             }
-            if let Some(&i) = self.index.get(&x) {
+            if let Some(i) = self.idx(x) {
                 for (a, &v) in acc.iter_mut().zip(self.row(i)) {
                     *a = (*a).max(v);
                 }
+            }
+        }
+        out
+    }
+
+    /// [`Causality::overwritten`] for ops given by index (ascending).
+    fn overwritten_at(&self, xs: &[usize]) -> Vec<bool> {
+        let mut out = vec![false; xs.len()];
+        let mut acc = vec![0u64; self.width];
+        for k in (0..xs.len()).rev() {
+            let i = xs[k];
+            let s = self.op_slot[i] as usize;
+            let need = self.ids[i].counter + 1;
+            out[k] = acc[s] >= need
+                && (self.chain[s] || xs[k + 1..].iter().any(|&j| self.precedes_at(i, j)));
+            for (a, &v) in acc.iter_mut().zip(self.row(i)) {
+                *a = (*a).max(v);
             }
         }
         out
@@ -864,12 +924,11 @@ pub struct Replica {
     log: Vec<(Op, Undo, Outcome)>,
     known: BTreeSet<OpId>,
     pending: BTreeMap<OpId, Op>,
-    /// Issue #28 ready index: pending ops waiting on each missing dep, the
-    /// number of missing deps per pending op, and the pending ops with none
-    /// (so draining is O(ops) instead of a scan of `pending` per op).
+    /// Issue #28 ready index: pending ops waiting on each missing dep and
+    /// the number of missing deps per pending op (so draining is O(ops)
+    /// instead of a scan of `pending` per op).
     waiting: HashMap<OpId, Vec<OpId>>,
     missing: HashMap<OpId, usize>,
-    ready: BTreeSet<OpId>,
     /// Fold state plus the D-014 edit revive (what [`Replica::state`]
     /// shows); `None` when the revive changes nothing (the common case).
     view: Option<State>,
@@ -893,7 +952,6 @@ impl Replica {
             pending: BTreeMap::new(),
             waiting: HashMap::new(),
             missing: HashMap::new(),
-            ready: BTreeSet::new(),
             view: None,
             revived: BTreeSet::new(),
         }
@@ -975,10 +1033,12 @@ impl Replica {
         let causal = || causal.get_or_init(|| Causality::new(ops));
         let mut conflicts = BTreeSet::new();
         // Fold conflicts: the logged outcome is the sorted-fold outcome.
-        let mut applied: BTreeMap<NodeId, Vec<OpId>> = BTreeMap::new();
-        let mut sets: BTreeMap<NodeId, Vec<(OpId, BlobId)>> = BTreeMap::new();
+        // Issue #33: log positions are the Causality indices (the store is
+        // exactly the applied set, in the same `<` order).
+        let mut applied: BTreeMap<NodeId, Vec<(OpId, usize)>> = BTreeMap::new();
+        let mut sets: BTreeMap<NodeId, Vec<(OpId, BlobId, usize)>> = BTreeMap::new();
         let mut moves: Vec<(OpId, NodeId)> = Vec::new();
-        for (op, _, out) in &self.log {
+        for (pos, (op, _, out)) in self.log.iter().enumerate() {
             match out {
                 Outcome::Invalid => {
                     conflicts.insert(Conflict::InvalidOp { op: op.id });
@@ -992,11 +1052,11 @@ impl Replica {
                 }
                 Outcome::Applied => {
                     if let Some(n) = op.moved_node() {
-                        applied.entry(n).or_default().push(op.id);
+                        applied.entry(n).or_default().push((op.id, pos));
                     }
                     match &op.payload {
                         Payload::SetContent { node, blob } => {
-                            sets.entry(*node).or_default().push((op.id, *blob))
+                            sets.entry(*node).or_default().push((op.id, *blob, pos))
                         }
                         Payload::Move { node, .. } => moves.push((op.id, *node)),
                         _ => {}
@@ -1008,9 +1068,10 @@ impl Replica {
             if ms.len() < 2 {
                 continue;
             }
-            let winner = *ms.last().unwrap();
-            let over = causal().overwritten(ms);
-            for (i, &m) in ms[..ms.len() - 1].iter().enumerate() {
+            let winner = ms.last().unwrap().0;
+            let ps: Vec<usize> = ms.iter().map(|&(_, p)| p).collect();
+            let over = causal().overwritten_at(&ps);
+            for (i, &(m, _)) in ms[..ms.len() - 1].iter().enumerate() {
                 if !over[i] {
                     conflicts.insert(Conflict::SameNodeMove {
                         winner,
@@ -1024,10 +1085,10 @@ impl Replica {
             if es.len() < 2 {
                 continue;
             }
-            let (winner, winner_blob) = *es.last().unwrap();
-            let ids: Vec<OpId> = es.iter().map(|&(e, _)| e).collect();
-            let over = causal().overwritten(&ids);
-            for (i, &(e, loser_blob)) in es[..es.len() - 1].iter().enumerate() {
+            let (winner, winner_blob, _) = *es.last().unwrap();
+            let ps: Vec<usize> = es.iter().map(|&(_, _, p)| p).collect();
+            let over = causal().overwritten_at(&ps);
+            for (i, &(e, loser_blob, _)) in es[..es.len() - 1].iter().enumerate() {
                 if !over[i] {
                     conflicts.insert(Conflict::Content {
                         node: *n,
@@ -1056,7 +1117,7 @@ impl Replica {
                     continue;
                 };
                 let did = op.id;
-                if *out != Outcome::Applied || applied[&d].last() != Some(&did) {
+                if *out != Outcome::Applied || applied[&d].last().map(|x| x.0) != Some(did) {
                     continue;
                 }
                 for &(mid, x) in &moves {
@@ -1136,16 +1197,22 @@ impl Replica {
 
     /// Receive a batch of ops (e.g. a whole op log on open), then refresh
     /// the view once (Issue #28). Same result as receiving them one by one.
+    /// Issue #33: every op that becomes ready is integrated in one merged
+    /// pass (undo the log suffix above the smallest new id once, then redo
+    /// suffix and new ops in `<` order), so a batch of out-of-order ops
+    /// costs O(suffix + batch) instead of O(suffix) per op.
     pub fn receive_all(&mut self, ops: impl IntoIterator<Item = Op>) {
+        let mut batch = Vec::new();
         for op in ops {
-            self.buffer(op);
+            self.buffer(op, &mut batch);
         }
+        self.integrate_all(batch);
         self.refresh_view();
     }
 
-    /// Buffer one op and integrate every op that became ready, smallest id
-    /// first (the order the pre-#28 scan of `pending` used).
-    fn buffer(&mut self, op: Op) {
+    /// Buffer one op: pending until every dep is known. A ready op is
+    /// marked known and moved to `batch` (with every waiter it releases).
+    fn buffer(&mut self, op: Op, batch: &mut Vec<Op>) {
         if self.known.contains(&op.id) || self.pending.contains_key(&op.id) {
             return;
         }
@@ -1157,40 +1224,64 @@ impl Replica {
                 n += 1;
             }
         }
-        self.pending.insert(id, op);
-        if n == 0 {
-            self.ready.insert(id);
-        } else {
+        if n > 0 {
+            self.pending.insert(id, op);
             self.missing.insert(id, n);
+            return;
         }
-        while let Some(id) = self.ready.pop_first() {
-            let op = self.pending.remove(&id).unwrap();
-            self.integrate(op);
-            for w in self.waiting.remove(&id).unwrap_or_default() {
+        // Ready: known now; release the waiters it unblocks.
+        self.known.insert(id);
+        batch.push(op);
+        let mut stack = vec![id];
+        while let Some(done) = stack.pop() {
+            for w in self.waiting.remove(&done).unwrap_or_default() {
                 let m = self.missing.get_mut(&w).expect("waiter is pending");
                 *m -= 1;
                 if *m == 0 {
                     self.missing.remove(&w);
-                    self.ready.insert(w);
+                    let o = self.pending.remove(&w).expect("waiter is pending");
+                    self.known.insert(w);
+                    batch.push(o);
+                    stack.push(w);
                 }
             }
         }
     }
 
-    fn integrate(&mut self, op: Op) {
-        let pos = self.log.partition_point(|(o, _, _)| o.id < op.id);
+    /// Integrate ready ops (ids new, deps known): undo the log above the
+    /// smallest, then apply suffix and batch merged in `<` order.
+    fn integrate_all(&mut self, mut batch: Vec<Op>) {
+        if batch.is_empty() {
+            return;
+        }
+        batch.sort_by_key(|o| o.id);
+        let pos = self.log.partition_point(|(o, _, _)| o.id < batch[0].id);
         let tail: Vec<(Op, Undo, Outcome)> = self.log.drain(pos..).collect();
         let mut redo = Vec::with_capacity(tail.len());
         for (o, u, _) in tail.into_iter().rev() {
             self.work.undo(u);
             redo.push(o);
         }
-        self.known.insert(op.id);
-        let (out, u) = self.work.apply(&op);
-        self.log.push((op, u, out));
-        for o in redo.into_iter().rev() {
-            let (out, u) = self.work.apply(&o);
-            self.log.push((o, u, out));
+        redo.reverse();
+        self.log.reserve(redo.len() + batch.len());
+        let mut a = redo.into_iter().peekable();
+        let mut b = batch.into_iter().peekable();
+        loop {
+            let next = match (a.peek(), b.peek()) {
+                (Some(x), Some(y)) => {
+                    if x.id < y.id {
+                        a.next()
+                    } else {
+                        b.next()
+                    }
+                }
+                (Some(_), None) => a.next(),
+                (None, Some(_)) => b.next(),
+                (None, None) => break,
+            }
+            .unwrap();
+            let (out, u) = self.work.apply(&next);
+            self.log.push((next, u, out));
         }
     }
 }
@@ -1266,3 +1357,6 @@ pub fn check_invariants<'a>(
 #[cfg(any(test, feature = "oracle"))]
 #[path = "tree_oracle.rs"]
 pub mod oracle;
+
+#[path = "tree_snapshot.rs"]
+mod snapshot;

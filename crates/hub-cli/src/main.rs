@@ -9,6 +9,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // One command per process: skip freeing the replayed repository (#33).
+    hub_cli::set_fast_exit();
     let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
     match hub_cli::run(&args, &cwd, &mut out, &mut err) {
         Ok(()) => ExitCode::SUCCESS,

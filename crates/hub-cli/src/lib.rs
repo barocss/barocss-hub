@@ -6,6 +6,8 @@
 pub mod blobs;
 pub mod durable;
 pub mod ignore;
+pub mod migrate;
+pub mod snapshot;
 pub mod store;
 pub mod sync;
 pub mod watch;
@@ -64,6 +66,21 @@ impl From<std::io::Error> for Error {
     }
 }
 
+static FAST_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// For a process that runs one command and exits (`main.rs`, Issue #33):
+/// the opened repository is not freed at the end of [`run`] (at 1M ops
+/// dropping it costs ~0.2 s); the OS reclaims it, and the repo lock (an
+/// open file) is released at exit as before. Never set by in-process
+/// callers (tests), which would otherwise keep the lock.
+pub fn set_fast_exit() {
+    FAST_EXIT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn fast_exit() -> bool {
+    FAST_EXIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn err<T>(s: impl Into<String>) -> Result<T, Error> {
     Err(Error(s.into()))
 }
@@ -79,6 +96,12 @@ pub struct Repo {
     pub warnings: Vec<String>,
     /// `.hub/lock`, held for the lifetime of the `Repo`.
     _lock: RepoLock,
+    /// Lock mode held (snapshots are written only under `Exclusive`).
+    mode: LockMode,
+    /// End of the committed `ops.log` (Issue #33).
+    pos: store::LogPos,
+    /// Ops covered by the current valid `.hub/snapshot` (0 = none).
+    snap_ops: u64,
     /// Issue #32 per-command memos, keyed by `store.len()` (the store only
     /// grows) and cleared by every append: head frontier + max counter,
     /// and the `FrontierCheck::scan` result.
@@ -132,6 +155,10 @@ impl Repo {
         let (rp, op, cp) = Self::paths(&dir);
         store::write_atomic(&op, format!("{}\n", store::OPLOG_HEADER).as_bytes())?;
         store::write_atomic(&cp, format!("{}\n", store::CKPT_HEADER).as_bytes())?;
+        // Format v1 (Issue #33, Appendix A.2.7): v1 peers, watch.lock, format.
+        watch::write_peers(&dir, &[])?;
+        fs::File::create(dir.join(watch::LOCK_FILE))?;
+        store::write_atomic(&dir.join("format"), store::FORMAT_V1.as_bytes())?;
         let rid = hub_core::sync::new_replica_id();
         // Replica file last: its presence marks a complete init.
         store::write_atomic(
@@ -168,65 +195,137 @@ impl Repo {
     /// file is read and held until the `Repo` is dropped, so a writer's
     /// replay -> mint -> append is atomic with respect to other processes.
     pub fn open_dir_with(dir: PathBuf, mode: LockMode) -> Result<Repo, Error> {
-        let lock = RepoLock::acquire(&dir, mode)
-            .map_err(|e| Error(format!("cannot lock {}: {e}", dir.join("lock").display())))?;
-        let (rp, op, cp) = Self::paths(&dir);
-        let rtext = fs::read_to_string(&rp)
-            .map_err(|e| Error(format!("cannot read {}: {e}", rp.display())))?;
-        let replica_id = match rtext.lines().collect::<Vec<_>>().as_slice() {
-            [h, id] if *h == store::REPLICA_HEADER && id.len() == 32 => {
-                ReplicaId(u128::from_str_radix(id, 16).map_err(|_| Error("bad replica id".into()))?)
-            }
-            _ => return err(format!("corrupt {}", rp.display())),
+        let acquire = |m: LockMode| {
+            RepoLock::acquire(&dir, m)
+                .map_err(|e| Error(format!("cannot lock {}: {e}", dir.join("lock").display())))
         };
+        let mut lock = acquire(mode)?;
         let mut warnings = Vec::new();
+        let mut migrated = None;
+        // Format v1 (Issue #33): migrate a v0 repository, or finish an
+        // interrupted migration, under the exclusive lock.
+        let (fmt, _) = migrate::read_replica(&dir)?;
+        if fmt == migrate::Format::V0 || migrate::needs_finish(&dir) {
+            if mode != LockMode::Exclusive {
+                drop(lock);
+                lock = acquire(LockMode::Exclusive)?;
+            }
+            match migrate::read_replica(&dir)?.0 {
+                migrate::Format::V0 => {
+                    let (r, p) = migrate::migrate(&dir)?;
+                    // Step 5, still under the exclusive lock.
+                    let mut covered = 0;
+                    if snapshot::due(0, p.ops) {
+                        if let Some(img) =
+                            snapshot::encode(&r, &p, &head_of(&r.ops().collect::<Vec<_>>()))
+                        {
+                            match snapshot::write(&dir, &img) {
+                                Ok(()) => covered = p.ops,
+                                Err(e) => warnings.push(format!(
+                                    "could not write {}: {e}",
+                                    dir.join(snapshot::FILE).display()
+                                )),
+                            }
+                        }
+                    }
+                    migrated = Some((r, p, covered));
+                    warnings.push(format!("migrated {} to on-disk format v1", dir.display()));
+                }
+                migrate::Format::V1 => migrate::finish(&dir)?,
+            }
+            if mode != LockMode::Exclusive {
+                drop(lock);
+                lock = acquire(mode)?;
+            }
+        }
+        let (fmt, rid) = migrate::read_replica(&dir)?;
+        if fmt != migrate::Format::V1 {
+            return err(format!("corrupt {}", dir.join("replica").display()));
+        }
+        migrate::check_format(&dir)?;
+        let replica_id = ReplicaId(rid);
+        let (_, op, cp) = Self::paths(&dir);
         if !store::LOCKING_AVAILABLE {
             warnings.push(store::NO_LOCK_WARNING.to_string());
         }
-        let ops = store::read_log(&op, store::OPLOG_HEADER)?;
+        // Snapshot (Appendix A.2.3): validated, else ignored with a warning.
+        let mut base: Option<(Replica, store::LogPos)> = None;
+        let mut snap_head: Option<snapshot::Head> = None;
+        let mut mig_covered = 0;
+        let was_migrated = migrated.is_some();
+        if let Some((r, p, c)) = migrated.take() {
+            mig_covered = c;
+            base = Some((r, p));
+        } else if !snapshot::disabled() {
+            match snapshot::load(&dir) {
+                Ok(Some((r, p, h))) => {
+                    base = Some((r, p));
+                    snap_head = Some(h);
+                }
+                Ok(None) => {}
+                Err(why) => {
+                    warnings.push(format!(
+                        "ignoring {} ({why}); replaying {}",
+                        dir.join(snapshot::FILE).display(),
+                        op.display()
+                    ));
+                    if mode == LockMode::Exclusive {
+                        let _ = fs::remove_file(dir.join(snapshot::FILE));
+                    }
+                }
+            }
+        }
+        let (snap_pos, replica0) = match base {
+            Some((r, p)) => (Some(p), Some(r)),
+            None => (None, None),
+        };
+        let full = || -> Result<(store::OpLogRead, Store, Replica), Error> {
+            let all = store::read_oplog(&op, None)?;
+            let (st, r) = replay_records(&op, &all.records, &|i| all.lines[i], None)?;
+            Ok((all, st, r))
+        };
+        let mut new_ids: Vec<NodeId> = Vec::new();
+        let tail =
+            |new_ids: &mut Vec<NodeId>| -> Result<(store::OpLogRead, Store, Replica), Error> {
+                let t = store::read_oplog(&op, snap_pos.as_ref())?;
+                let n0 = replica0.as_ref().map_or(0, |r| r.len());
+                let (st, r) = replay_records(&op, &t.records, &|i| t.lines[i], replica0)?;
+                // Ids replayed on top of the snapshot (duplicates skipped).
+                if st.len() > n0 {
+                    for body in &t.records {
+                        if let Ok(o) = store::decode_op(body) {
+                            new_ids.push(o.id);
+                        }
+                    }
+                }
+                Ok((t, st, r))
+            };
+        let (ops, st, replica, snap_ops) = if snap_pos.is_some() {
+            match tail(&mut new_ids) {
+                Ok((t, st, r)) => {
+                    let n = if was_migrated {
+                        mig_covered
+                    } else {
+                        t.pos.ops.min(snap_pos.as_ref().unwrap().ops)
+                    };
+                    (t, st, r, n)
+                }
+                // Damage after the snapshot: a full read gives the same
+                // error (line numbers) as without a snapshot.
+                Err(_) => {
+                    snap_head = None;
+                    let (t, st, r) = full()?;
+                    (t, st, r, 0)
+                }
+            }
+        } else {
+            let (t, st, r) = full()?;
+            (t, st, r, 0)
+        };
         if ops.truncated_tail {
             warnings.push(format!(
                 "recovered: dropped a truncated trailing record from {}",
                 op.display()
-            ));
-        }
-        let mut st = Store::new();
-        let mut replay = Vec::with_capacity(ops.records.len());
-        for (i, body) in ops.records.iter().enumerate() {
-            let o = store::decode_op(body).map_err(|why| StoreError::Corrupt {
-                file: op.clone(),
-                line: i + 2,
-                why,
-            })?;
-            // A repeated OpId must carry the identical op: a different
-            // payload/deps under one id is equivocation (e.g. two unlocked
-            // writers minting the same counter) and is corruption. An exact
-            // repeat is idempotent and skipped.
-            if let Some(prev) = st.get(&o.id) {
-                if *prev != o {
-                    return Err(StoreError::Corrupt {
-                        file: op.clone(),
-                        line: i + 2,
-                        why: format!(
-                            "duplicate op id {} with a different op",
-                            store::fmt_id(o.id)
-                        ),
-                    }
-                    .into());
-                }
-                continue;
-            }
-            st.insert(o.id, o.clone());
-            replay.push(o);
-        }
-        // One batch: the view is refreshed once, not per op (Issue #28).
-        let mut replica = Replica::new();
-        replica.receive_all(replay);
-        if replica.pending_len() != 0 {
-            return err(format!(
-                "corrupt {}: {} op(s) with missing deps",
-                op.display(),
-                replica.pending_len()
             ));
         }
         let cks = store::read_log(&cp, store::CKPT_HEADER)?;
@@ -248,7 +347,34 @@ impl Repo {
             checkpoints.add(c);
         }
         let st_len = st.len();
-        Ok(Repo {
+        // Head memo from the snapshot plus the tail (Issue #33): the store
+        // is closed, so F(store ∪ tail) = (F ∪ ids(tail)) − deps(tail).
+        let head_memo = match snap_head {
+            Some(h) if !oracle() => {
+                let mut f: BTreeSet<NodeId> = h.frontier.into_iter().collect();
+                let mut maxc = h.max_counter;
+                new_ids.sort_unstable();
+                new_ids.dedup();
+                for id in &new_ids {
+                    f.insert(*id);
+                    maxc = maxc.max(id.counter);
+                }
+                for id in &new_ids {
+                    for d in &st[id].deps {
+                        f.remove(d);
+                    }
+                }
+                Some((
+                    st_len,
+                    HeadMemo {
+                        frontier: f.into_iter().collect(),
+                        max_counter: Some(maxc),
+                    },
+                ))
+            }
+            _ => None,
+        };
+        let mut repo = Repo {
             dir,
             replica_id,
             replica,
@@ -256,9 +382,41 @@ impl Repo {
             checkpoints,
             warnings,
             _lock: lock,
-            head_memo: Default::default(),
+            mode,
+            pos: ops.pos,
+            snap_ops,
+            head_memo: std::cell::RefCell::new(head_memo),
             fast_memo: std::cell::Cell::new(Some((st_len, fast))),
-        })
+        };
+        // Step 5 of a migration; otherwise the policy (writers only).
+        if let Some(w) = repo.maybe_snapshot() {
+            repo.warnings.push(w);
+        }
+        Ok(repo)
+    }
+
+    /// Write `.hub/snapshot` if the policy says so (Appendix A.2.3). Only
+    /// under the exclusive lock; a failure is a warning, never an error.
+    pub fn maybe_snapshot(&mut self) -> Option<String> {
+        if self.mode != LockMode::Exclusive || !snapshot::due(self.snap_ops, self.pos.ops) {
+            return None;
+        }
+        let m = self.head_memo();
+        let head = snapshot::Head {
+            frontier: m.frontier,
+            max_counter: m.max_counter?,
+        };
+        let image = snapshot::encode(&self.replica, &self.pos, &head)?;
+        match snapshot::write(&self.dir, &image) {
+            Ok(()) => {
+                self.snap_ops = self.pos.ops;
+                None
+            }
+            Err(e) => Some(format!(
+                "could not write {}: {e}",
+                self.dir.join(snapshot::FILE).display()
+            )),
+        }
     }
 
     pub fn state(&self) -> &State {
@@ -357,11 +515,8 @@ impl Repo {
 
     /// Persist then apply an op (any author; used by tests and `mint`).
     pub fn append_op(&mut self, op: Op) -> Result<(), Error> {
-        store::append_record(&self.dir.join("ops.log"), &store::encode_op(&op))?;
-        self.invalidate();
-        self.store.insert(op.id, op.clone());
-        self.replica.receive(op);
-        Ok(())
+        let (_, r) = self.append_ops_with(std::iter::once(op), |_| Ok(()));
+        r
     }
 
     /// Persist then apply a batch of ops, refreshing the view once (Issue
@@ -399,11 +554,19 @@ impl Repo {
         }
         if !done.is_empty() {
             durable::crash_point(durable::OPS_APPENDED);
+            // One batch (Issue #33): the commit record covers exactly the
+            // lines written, also when the append stopped early.
+            let pos = match log.commit(&self.pos) {
+                Ok(p) => p,
+                Err(e) => return (0, Err(e.into())),
+            };
+            durable::crash_point(durable::COMMIT_WRITTEN);
             if let Err(e) = log.sync() {
                 // Nothing of this batch is known durable: apply none of it.
                 return (0, Err(e.into()));
             }
             durable::crash_point(durable::OPS_FSYNCED);
+            self.pos = pos;
         }
         self.invalidate();
         for op in &done {
@@ -481,6 +644,78 @@ impl Repo {
         ix.insert_frontier(self.head_frontier());
         ix
     }
+}
+
+/// Head frontier (ids no op depends on, `<` order) and max counter of a
+/// closed op set given in `<` order.
+fn head_of(ops: &[&Op]) -> snapshot::Head {
+    let mut deps: Vec<NodeId> = ops.iter().flat_map(|o| o.deps.iter().copied()).collect();
+    deps.sort_unstable();
+    deps.dedup();
+    snapshot::Head {
+        frontier: ops
+            .iter()
+            .map(|o| o.id)
+            .filter(|id| deps.binary_search(id).is_err())
+            .collect(),
+        max_counter: ops.iter().map(|o| o.id.counter).max().unwrap_or(1),
+    }
+}
+
+/// Decode `records` (op bodies of `file`; record `i` is at line `line_of(i)`)
+/// and replay them on top of `base` (a snapshot's replica) or from
+/// scratch. Exact repeats are skipped; a repeated id with a different op
+/// and ops with missing deps are corruption.
+pub(crate) fn replay_records(
+    file: &Path,
+    records: &[String],
+    line_of: &dyn Fn(usize) -> usize,
+    base: Option<Replica>,
+) -> Result<(Store, Replica), Error> {
+    let (mut st, mut replica) = match base {
+        Some(r) => (r.ops().map(|o| (o.id, o.clone())).collect::<Store>(), r),
+        None => (Store::new(), Replica::new()),
+    };
+    let mut replay = Vec::with_capacity(records.len());
+    for (i, body) in records.iter().enumerate() {
+        let o = store::decode_op(body).map_err(|why| StoreError::Corrupt {
+            file: file.to_path_buf(),
+            line: line_of(i),
+            why,
+        })?;
+        // A repeated OpId must carry the identical op: a different
+        // payload/deps under one id is equivocation (e.g. two unlocked
+        // writers minting the same counter) and is corruption. An exact
+        // repeat is idempotent and skipped.
+        if let Some(prev) = st.get(&o.id) {
+            if *prev != o {
+                return Err(StoreError::Corrupt {
+                    file: file.to_path_buf(),
+                    line: line_of(i),
+                    why: format!(
+                        "duplicate op id {} with a different op",
+                        store::fmt_id(o.id)
+                    ),
+                }
+                .into());
+            }
+            continue;
+        }
+        st.insert(o.id, o.clone());
+        replay.push(o);
+    }
+    // One batch: the view is refreshed once, not per op (Issue #28).
+    if !replay.is_empty() || replica.is_empty() {
+        replica.receive_all(replay);
+    }
+    if replica.pending_len() != 0 {
+        return err(format!(
+            "corrupt {}: {} op(s) with missing deps",
+            file.display(),
+            replica.pending_len()
+        ));
+    }
+    Ok((st, replica))
 }
 
 // ---------- path resolution ----------
@@ -1509,6 +1744,13 @@ pub fn run(
         }
         _ => return Err(usage(a[0])),
     }
+    // Issue #33: writers refresh `.hub/snapshot` when the policy says so.
+    if let Some(w) = repo.maybe_snapshot() {
+        writeln!(warn, "warning: {w}")?;
+    }
+    if fast_exit() {
+        std::mem::forget(repo);
+    }
     Ok(())
 }
 
@@ -1691,10 +1933,33 @@ mod perf32_tests {
         out
     }
 
-    fn run1(root: &Path, args: &[String], oracle_on: bool) -> (Result<(), String>, String, String) {
+    /// Snapshot mode of one copy (Issue #33): never, or after every write.
+    #[derive(Clone, Copy)]
+    enum Snap {
+        Off,
+        Always,
+    }
+
+    fn with_snap<T>(m: Snap, f: impl FnOnce() -> T) -> T {
+        match m {
+            Snap::Off => snapshot::TEST_OFF.with(|c| c.set(true)),
+            Snap::Always => snapshot::TEST_MIN.with(|c| c.set(Some(0))),
+        }
+        let r = f();
+        snapshot::TEST_OFF.with(|c| c.set(false));
+        snapshot::TEST_MIN.with(|c| c.set(None));
+        r
+    }
+
+    fn run1(
+        root: &Path,
+        args: &[String],
+        oracle_on: bool,
+        snap: Snap,
+    ) -> (Result<(), String>, String, String) {
         ORACLE.with(|o| o.set(oracle_on));
         let (mut o, mut w) = (Vec::new(), Vec::new());
-        let r = run(args, root, &mut o, &mut w).map_err(|e| e.0);
+        let r = with_snap(snap, || run(args, root, &mut o, &mut w).map_err(|e| e.0));
         ORACLE.with(|o| o.set(false));
         (
             r,
@@ -1703,14 +1968,87 @@ mod perf32_tests {
         )
     }
 
-    /// Run `args` in both copies (new in `a`, oracle in `b`) and compare.
+    /// Run `args` in every copy (new in `a`, oracle in `b`, both without
+    /// snapshots; new with a snapshot after every write in `c`, #33) and
+    /// compare stdout, stderr, results, working trees and logs.
     fn both(a: &Path, b: &Path, args: &[&str]) -> Result<String, TestCaseError> {
+        let c = a.parent().unwrap().join("c");
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        let x = run1(a, &args, false);
-        let y = run1(b, &args, true);
+        let x = run1(a, &args, false, Snap::Off);
+        let y = run1(b, &args, true, Snap::Off);
+        let z = run1(&c, &args, false, Snap::Always);
         prop_assert_eq!(&x, &y, "hub {:?}", args);
+        prop_assert_eq!(&x, &z, "hub {:?} (with snapshot)", args);
         prop_assert_eq!(snapshot(a), snapshot(b), "after hub {:?}", args);
+        prop_assert_eq!(
+            snapshot(a),
+            snapshot(&c),
+            "after hub {:?} (with snapshot)",
+            args
+        );
+        prop_assert!(!a.join(".hub/snapshot").exists());
         Ok(x.1)
+    }
+
+    /// Rewrite `d` as the v0 layout (#33 migration input).
+    fn to_v0(d: &Path) {
+        let h = d.join(HUB_DIR);
+        let log = fs::read_to_string(h.join("ops.log")).unwrap();
+        let mut out = format!("{}\n", store::OPLOG_HEADER_V0);
+        for l in log.lines().skip(1).filter(|l| l.starts_with("O ")) {
+            out.push_str(l);
+            out.push('\n');
+        }
+        fs::write(h.join("ops.log"), out).unwrap();
+        let r = fs::read_to_string(h.join("replica")).unwrap();
+        fs::write(
+            h.join("replica"),
+            r.replace(store::REPLICA_HEADER, store::REPLICA_HEADER_V0),
+        )
+        .unwrap();
+        for f in ["snapshot", "format", "watch.lock", "peers"] {
+            let _ = fs::remove_file(h.join(f));
+        }
+    }
+
+    /// A v0 copy of `a`, migrated by its first command, prints the same.
+    fn migrated_same(a: &Path, views: &[Vec<String>]) -> Result<(), TestCaseError> {
+        let m = a.parent().unwrap().join("m");
+        let _ = fs::remove_dir_all(&m);
+        copy_dir(a, &m);
+        to_v0(&m);
+        for (k, v) in views.iter().enumerate() {
+            let x = run1(a, v, false, Snap::Off);
+            let y = run1(
+                &m,
+                v,
+                false,
+                if k % 2 == 0 { Snap::Always } else { Snap::Off },
+            );
+            let strip = |e: &str| {
+                e.lines()
+                    .filter(|l| !l.contains("to on-disk format v1"))
+                    .map(|l| format!("{l}\n"))
+                    .collect::<String>()
+            };
+            prop_assert_eq!(&x.0, &y.0, "migrated hub {:?}", v);
+            prop_assert_eq!(&x.1, &y.1, "migrated hub {:?}", v);
+            prop_assert_eq!(strip(&x.2), strip(&y.2), "migrated hub {:?}", v);
+            if k == 0 {
+                prop_assert!(y.2.contains("to on-disk format v1"));
+            }
+        }
+        let ops = |d: &Path| -> Vec<String> {
+            fs::read_to_string(d.join(".hub/ops.log"))
+                .unwrap()
+                .lines()
+                .filter(|l| l.starts_with("O "))
+                .map(str::to_string)
+                .collect()
+        };
+        prop_assert_eq!(ops(a), ops(&m));
+        let _ = fs::remove_dir_all(&m);
+        Ok(())
     }
 
     /// The same foreign op appended to both copies.
@@ -1737,7 +2075,7 @@ mod perf32_tests {
         let payload = match rnd(4) {
             0 if !files.is_empty() => {
                 let bytes = format!("foreign {k}\n");
-                for d in [a, b] {
+                for d in [a, b, &a.parent().unwrap().join("c")] {
                     blobs::Blobs::open(&d.join(HUB_DIR))
                         .unwrap()
                         .put(bytes.as_bytes())
@@ -1777,9 +2115,13 @@ mod perf32_tests {
             deps,
             payload,
         };
-        for d in [a, b] {
-            let mut r = Repo::open_dir(d.join(HUB_DIR)).unwrap();
-            r.append_op(op.clone()).unwrap();
+        let c = a.parent().unwrap().join("c");
+        for (d, m) in [(a, Snap::Off), (b, Snap::Off), (&c, Snap::Always)] {
+            with_snap(m, || {
+                let mut r = Repo::open_dir(d.join(HUB_DIR)).unwrap();
+                r.append_op(op.clone()).unwrap();
+                r.maybe_snapshot();
+            });
         }
     }
 
@@ -1800,6 +2142,8 @@ mod perf32_tests {
         #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
 
         #[test]
+        /// Issue #33: also with a snapshot after every write (copy `c`) and
+        /// after a v0 -> v1 migration.
         fn cli_output_equals_pre32_oracle(seed in any::<u64>(), nsteps in 1usize..8) {
             let mut s = seed | 1;
             let mut rnd = move |n: usize| {
@@ -1814,6 +2158,7 @@ mod perf32_tests {
             fs::create_dir_all(&a).unwrap();
             drop(Repo::init(&a).unwrap());
             copy_dir(&a, &b);
+            copy_dir(&a, &base.join("c"));
             for step in 0..nsteps {
                 match rnd(8) {
                     0..=2 => {
@@ -1829,7 +2174,8 @@ mod perf32_tests {
                                 fs::write(&p, format!("v{}\n", rnd(5))).unwrap();
                             }
                         }
-                        for e in fs::read_dir(&b).unwrap() {
+                        for b in [&b, &base.join("c")] {
+                        for e in fs::read_dir(b).unwrap() {
                             let e = e.unwrap();
                             if e.file_name() == HUB_DIR {
                                 continue;
@@ -1851,6 +2197,7 @@ mod perf32_tests {
                             } else {
                                 fs::copy(e.path(), &t).unwrap();
                             }
+                        }
                         }
                         if rnd(2) == 0 {
                             both(&a, &b, &["record", "-m", &format!("m{step}")])?;
@@ -1894,6 +2241,18 @@ mod perf32_tests {
                 for id in short_ids(&log, &st) {
                     both(&a, &b, &["show", &id])?;
                     both(&a, &b, &["show", "-l", &id])?;
+                }
+                if step + 1 == nsteps || rnd(4) == 0 {
+                    let mut vs: Vec<Vec<String>> = [
+                        &["status"][..], &["log"], &["ls", "-l"], &["warnings"], &["status", "--ignored"],
+                    ]
+                    .iter()
+                    .map(|v| v.iter().map(|s| s.to_string()).collect())
+                    .collect();
+                    for id in short_ids(&log, &st) {
+                        vs.push(vec!["show".into(), "-l".into(), id]);
+                    }
+                    migrated_same(&a, &vs)?;
                 }
             }
             let _ = fs::remove_dir_all(&base);
