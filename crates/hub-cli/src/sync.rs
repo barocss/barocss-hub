@@ -164,7 +164,7 @@ pub fn read_warnings(dir: &Path) -> Result<Vec<RejectWarning>, Error> {
 pub fn read_published(repo: &Repo) -> Result<Vec<Checkpoint>, Error> {
     let p = repo.dir.join("published.log");
     let mut out: Vec<Checkpoint> = Vec::new();
-    let check = hub_core::checkpoint::FrontierCheck::new(&repo.store);
+    let check = repo.frontier_check();
     for (i, b) in read_opt(&p, PUBLISHED_HEADER)?.iter().enumerate() {
         let c = store::decode_ckpt(b, &check).map_err(|why| corrupt(&p, i, why))?;
         if !out.contains(&c) {
@@ -195,16 +195,40 @@ pub fn append_published_all(repo: &Repo, cs: &[&Checkpoint]) -> Result<(), Error
 }
 
 /// A core replica without blobs: enough to recompute warnings' `stuck`.
+///
+/// Issue #32: no clone of the whole store. The replica only ever asks
+/// whether a pending op or one of its deps is in the store, so a store of
+/// exactly those stored ops answers every query identically (the only other
+/// use of the store, the mint counter, is not read here).
 pub fn warnings_view(repo: &Repo) -> Result<(Vec<RejectWarning>, usize), Error> {
+    let pending = read_pending(&repo.dir)?;
+    let store = if crate::oracle() {
+        repo.store.clone()
+    } else {
+        pending_support(&repo.store, &pending)
+    };
     let r = SyncReplica::from_parts(
         repo.replica_id,
-        repo.store.clone(),
+        store,
         BlobStore::new(),
-        read_pending(&repo.dir)?,
+        pending,
         read_warnings(&repo.dir)?,
         Vec::new(),
     );
     Ok((r.warnings(), r.pending_len()))
+}
+
+/// The stored ops a set of pending ops can query: the pending ids and
+/// their deps.
+fn pending_support(
+    store: &hub_core::version::Store,
+    pending: &[(Op, PeerId)],
+) -> hub_core::version::Store {
+    pending
+        .iter()
+        .flat_map(|(o, _)| std::iter::once(o.id).chain(o.deps.iter().copied()))
+        .filter_map(|id| store.get(&id).map(|o| (id, o.clone())))
+        .collect()
 }
 
 pub fn render_warning(w: &RejectWarning) -> String {
@@ -576,4 +600,82 @@ pub fn reid(repo: &mut Repo, out: &mut dyn Write) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Issue #32: `warnings_view` over the pending-support sub-store equals the
+/// pre-#32 whole-store clone (warnings with recomputed `stuck`, pending
+/// count) for random pending buffers: deps present, missing, on other
+/// pending ops, not `<` the op (Lamport violations drained into warnings),
+/// and SetContent of present and absent blobs, with saved warnings of every
+/// reason.
+#[cfg(test)]
+mod warnings_view_tests {
+    use super::*;
+    use hub_core::tree::{Kind, NodeId, ROOT};
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+        #[test]
+        fn warnings_view_equals_full_clone(seed in any::<u64>(), nops in 1usize..12, npend in 0usize..10) {
+            let mut s = seed | 1;
+            let mut rnd = move |n: usize| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s % n.max(1) as u64) as usize
+            };
+            let root = std::env::temp_dir().join(format!("hub-wv32-{}-{seed:x}-{nops}-{npend}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let mut repo = Repo::init(&root).unwrap();
+            let mut ids = Vec::new();
+            for i in 0..nops {
+                let deps: BTreeSet<_> = (0..rnd(3)).filter(|_| !ids.is_empty()).map(|_| ids[rnd(ids.len())]).collect();
+                let id = NodeId::new(i as u64 + 2, 1 + rnd(2) as u128);
+                repo.append_op(Op { id, deps, payload: Payload::Create { kind: Kind::File, parent: ROOT, name: format!("f{i}") } }).unwrap();
+                ids.push(id);
+            }
+            let mut pend: Vec<Op> = Vec::new();
+            let blob = hub_core::tree::BlobId::of(b"absent");
+            for k in 0..npend {
+                let id = NodeId::new(100 + k as u64, 7);
+                let mut deps = BTreeSet::new();
+                match rnd(5) {
+                    0 => { deps.insert(ids[rnd(ids.len())]); }
+                    1 => { deps.insert(NodeId::new(50, 9)); }
+                    2 if !pend.is_empty() => { deps.insert(pend[rnd(pend.len())].id); }
+                    3 => { deps.insert(NodeId::new(200 + rnd(5) as u64, 7)); }
+                    _ => {}
+                }
+                let payload = if rnd(3) == 0 {
+                    Payload::SetContent { node: ids[rnd(ids.len())], blob: if rnd(2) == 0 { blob } else { hub_core::tree::BlobId::empty() } }
+                } else {
+                    Payload::Create { kind: Kind::Directory, parent: ROOT, name: format!("p{k}") }
+                };
+                pend.push(Op { id, deps, payload });
+            }
+            let peer = ReplicaId(0xbeef);
+            let ps: Vec<String> = pend.iter().map(|o| format!("P {:032x} {}", peer.0, store::encode_op(o))).collect();
+            rewrite(&repo.dir.join("pending.log"), PENDING_HEADER, &ps).unwrap();
+            let mut ws = Vec::new();
+            for (k, reason) in ["lamport-violation", "corrupt-blob", "equivocation"].iter().enumerate() {
+                if rnd(2) == 0 {
+                    let rej = if pend.is_empty() { "-".to_string() } else { store::fmt_id(pend[rnd(pend.len())].id) };
+                    let detail = if *reason == "corrupt-blob" { blob.hex() } else { format!("d{k}") };
+                    ws.push(format!("W {:032x} {:032x} {rej} {reason} {k} {}", peer.0, 7u128, store::esc(&detail)));
+                }
+            }
+            rewrite(&repo.dir.join("warnings.log"), WARNINGS_HEADER, &ws).unwrap();
+            let render = |v: (Vec<RejectWarning>, usize)| (v.0.iter().map(render_warning).collect::<Vec<_>>(), v.1);
+            let new = render(warnings_view(&repo).unwrap());
+            crate::ORACLE.with(|o| o.set(true));
+            let old = render(warnings_view(&repo).unwrap());
+            crate::ORACLE.with(|o| o.set(false));
+            drop(repo);
+            let _ = std::fs::remove_dir_all(&root);
+            prop_assert_eq!(new, old);
+        }
+    }
 }

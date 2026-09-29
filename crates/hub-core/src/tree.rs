@@ -839,13 +839,29 @@ fn revive_by_edits(
     }
 }
 
+/// Whether the D-014 edit revive can change `st`: some Applied SetContent
+/// (`Undo::Content`) targets a node that is not live.
+fn needs_revive<'a>(st: &State, log: impl Iterator<Item = (&'a Op, &'a Undo)>) -> bool {
+    let mut live: HashMap<NodeId, bool> = HashMap::new();
+    for (o, u) in log {
+        if let (Payload::SetContent { node, .. }, Undo::Content { .. }) = (&o.payload, u) {
+            if !*live.entry(*node).or_insert_with(|| is_live(st, *node)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// A replica receiving ops in arbitrary order (possibly duplicated), buffering
 /// until deps are present, applying incrementally with undo-do-redo (§2.3).
 #[derive(Clone, Debug)]
 pub struct Replica {
     work: Work,
-    /// Applied ops in `<` order with their undo records.
-    log: Vec<(Op, Undo)>,
+    /// Applied ops in `<` order with their undo records and fold outcome
+    /// (Issue #32: the outcome is what [`evaluate`] records for the op, so
+    /// [`Replica::conflicts`] needs no second fold).
+    log: Vec<(Op, Undo, Outcome)>,
     known: BTreeSet<OpId>,
     pending: BTreeMap<OpId, Op>,
     /// Issue #28 ready index: pending ops waiting on each missing dep, the
@@ -857,6 +873,9 @@ pub struct Replica {
     /// Fold state plus the D-014 edit revive (what [`Replica::state`]
     /// shows); `None` when the revive changes nothing (the common case).
     view: Option<State>,
+    /// The `(node, edit, delete)` triples the last view refresh revived
+    /// (the `EditRevived` conflicts of [`evaluate`]).
+    revived: BTreeSet<(NodeId, OpId, OpId)>,
 }
 
 impl Default for Replica {
@@ -876,6 +895,7 @@ impl Replica {
             missing: HashMap::new(),
             ready: BTreeSet::new(),
             view: None,
+            revived: BTreeSet::new(),
         }
     }
 
@@ -889,17 +909,15 @@ impl Replica {
         self.view = None;
         // Fast path: no Applied SetContent of a non-live file, nothing to do.
         let st = &self.work.state;
-        let needed = self.log.iter().any(|(o, u)| {
-            matches!((&o.payload, u), (Payload::SetContent { node, .. }, Undo::Content { .. }) if !is_live(st, *node))
-        });
-        if !needed {
+        if !needs_revive(st, self.log.iter().map(|(o, u, _)| (o, u))) {
+            self.revived.clear();
             return;
         }
-        let ops: BTreeMap<OpId, Op> = self.log.iter().map(|(o, _)| (o.id, o.clone())).collect();
+        let ops: BTreeMap<OpId, Op> = self.log.iter().map(|(o, _, _)| (o.id, o.clone())).collect();
         let causal = Causality::new(&ops);
         let mut pre = BTreeMap::new();
         let mut edits = Vec::new();
-        for (o, u) in &self.log {
+        for (o, u, _) in &self.log {
             match (&o.payload, u) {
                 (Payload::Delete { .. }, Undo::Restore { parent, setter, .. }) => {
                     let parent = parent.expect("non-reserved node has parent");
@@ -914,7 +932,7 @@ impl Replica {
         }
         edits.sort();
         let mut view = self.work.state.clone();
-        revive_by_edits(
+        self.revived = revive_by_edits(
             &mut view,
             &ops,
             &self.work.setter,
@@ -926,11 +944,189 @@ impl Replica {
     }
 
     pub fn ops(&self) -> impl Iterator<Item = &Op> {
-        self.log.iter().map(|(o, _)| o)
+        self.log.iter().map(|(o, _, _)| o)
     }
 
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Number of applied ops.
+    pub fn len(&self) -> usize {
+        self.log.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.log.is_empty()
+    }
+
+    /// The conflict set of the applied ops: equal to
+    /// `evaluate(self.ops()).conflicts` (Issue #32), derived from the undo
+    /// log and the view instead of a second full fold. `ops` must be the
+    /// applied set keyed by id (e.g. the CLI's op store); it is only used to
+    /// build [`Causality`] without cloning every op. Returns `None` if its
+    /// keys differ from the applied set (the caller then uses [`evaluate`]).
+    pub fn conflicts(&self, ops: &BTreeMap<OpId, Op>) -> Option<BTreeSet<Conflict>> {
+        if ops.len() != self.log.len() || !ops.keys().eq(self.log.iter().map(|(o, _, _)| &o.id)) {
+            return None;
+        }
+        let state = self.state();
+        let causal = std::cell::OnceCell::new();
+        let causal = || causal.get_or_init(|| Causality::new(ops));
+        let mut conflicts = BTreeSet::new();
+        // Fold conflicts: the logged outcome is the sorted-fold outcome.
+        let mut applied: BTreeMap<NodeId, Vec<OpId>> = BTreeMap::new();
+        let mut sets: BTreeMap<NodeId, Vec<(OpId, BlobId)>> = BTreeMap::new();
+        let mut moves: Vec<(OpId, NodeId)> = Vec::new();
+        for (op, _, out) in &self.log {
+            match out {
+                Outcome::Invalid => {
+                    conflicts.insert(Conflict::InvalidOp { op: op.id });
+                }
+                Outcome::Skipped { winner } => {
+                    conflicts.insert(Conflict::Cycle {
+                        winner: *winner,
+                        loser: op.id,
+                        node: op.moved_node().unwrap(),
+                    });
+                }
+                Outcome::Applied => {
+                    if let Some(n) = op.moved_node() {
+                        applied.entry(n).or_default().push(op.id);
+                    }
+                    match &op.payload {
+                        Payload::SetContent { node, blob } => {
+                            sets.entry(*node).or_default().push((op.id, *blob))
+                        }
+                        Payload::Move { node, .. } => moves.push((op.id, *node)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for (n, ms) in &applied {
+            if ms.len() < 2 {
+                continue;
+            }
+            let winner = *ms.last().unwrap();
+            let over = causal().overwritten(ms);
+            for (i, &m) in ms[..ms.len() - 1].iter().enumerate() {
+                if !over[i] {
+                    conflicts.insert(Conflict::SameNodeMove {
+                        winner,
+                        loser: m,
+                        node: *n,
+                    });
+                }
+            }
+        }
+        for (n, es) in &sets {
+            if es.len() < 2 {
+                continue;
+            }
+            let (winner, winner_blob) = *es.last().unwrap();
+            let ids: Vec<OpId> = es.iter().map(|&(e, _)| e).collect();
+            let over = causal().overwritten(&ids);
+            for (i, &(e, loser_blob)) in es[..es.len() - 1].iter().enumerate() {
+                if !over[i] {
+                    conflicts.insert(Conflict::Content {
+                        node: *n,
+                        winner,
+                        loser: e,
+                        winner_blob,
+                        loser_blob,
+                    });
+                }
+            }
+        }
+        for &(x, e, d) in &self.revived {
+            conflicts.insert(Conflict::EditRevived {
+                node: x,
+                edit: e,
+                delete: d,
+            });
+        }
+        // Revived (D-001), as in `evaluate`: winning Applied Deletes against
+        // concurrent Applied Moves of live nodes, checked on the fold state
+        // before the earlier of the two.
+        let mut candidates: BTreeMap<OpId, Vec<(OpId, OpId, NodeId, NodeId)>> = BTreeMap::new();
+        if !moves.is_empty() {
+            for (op, _, out) in &self.log {
+                let Payload::Delete { node: d } = op.payload else {
+                    continue;
+                };
+                let did = op.id;
+                if *out != Outcome::Applied || applied[&d].last() != Some(&did) {
+                    continue;
+                }
+                for &(mid, x) in &moves {
+                    if x != d && is_live(state, x) && causal().concurrent(did, mid) {
+                        candidates
+                            .entry(did.min(mid))
+                            .or_default()
+                            .push((did, mid, d, x));
+                    }
+                }
+            }
+        }
+        if !candidates.is_empty() {
+            let mut w2 = Work::new();
+            for (op, _, _) in &self.log {
+                if let Some(cs) = candidates.get(&op.id) {
+                    for &(did, mid, d, x) in cs {
+                        let first = &w2.state;
+                        if first.contains_key(&x) && is_ancestor_or_self(first, d, x) {
+                            conflicts.insert(Conflict::Revived {
+                                node: x,
+                                delete: did,
+                                mv: mid,
+                            });
+                        }
+                    }
+                }
+                w2.apply(op);
+            }
+        }
+        Some(conflicts)
+    }
+
+    /// The state [`Replica::state`] would show after receiving `tail`,
+    /// without changing `self` (Issue #32: `hub record` plans the new head
+    /// before appending). Only for a causally ready tail greater than every
+    /// applied op, in `<` order, when no D-014 revive is involved; `None`
+    /// otherwise (the caller then uses [`evaluate`]).
+    pub fn state_with_tail(&self, tail: &[Op]) -> Option<State> {
+        if !self.pending.is_empty() {
+            return None;
+        }
+        let mut last = self.log.last().map(|(o, _, _)| o.id);
+        let mut seen: BTreeSet<OpId> = BTreeSet::new();
+        for o in tail {
+            if last.is_some_and(|l| o.id <= l)
+                || !o
+                    .deps
+                    .iter()
+                    .all(|d| self.known.contains(d) || seen.contains(d))
+            {
+                return None;
+            }
+            last = Some(o.id);
+            seen.insert(o.id);
+        }
+        let mut w = Work {
+            state: self.work.state.clone(),
+            setter: self.work.setter.clone(),
+        };
+        let undo: Vec<Undo> = tail.iter().map(|o| w.apply(o).1).collect();
+        let all = self
+            .log
+            .iter()
+            .map(|(o, u, _)| (o, u))
+            .chain(tail.iter().zip(undo.iter()));
+        if needs_revive(&w.state, all) {
+            return None;
+        }
+        Some(w.state)
     }
 
     /// Receive an op. Duplicates are no-ops (§2.6 #6).
@@ -982,19 +1178,19 @@ impl Replica {
     }
 
     fn integrate(&mut self, op: Op) {
-        let pos = self.log.partition_point(|(o, _)| o.id < op.id);
-        let tail: Vec<(Op, Undo)> = self.log.drain(pos..).collect();
+        let pos = self.log.partition_point(|(o, _, _)| o.id < op.id);
+        let tail: Vec<(Op, Undo, Outcome)> = self.log.drain(pos..).collect();
         let mut redo = Vec::with_capacity(tail.len());
-        for (o, u) in tail.into_iter().rev() {
+        for (o, u, _) in tail.into_iter().rev() {
             self.work.undo(u);
             redo.push(o);
         }
         self.known.insert(op.id);
-        let (_, u) = self.work.apply(&op);
-        self.log.push((op, u));
+        let (out, u) = self.work.apply(&op);
+        self.log.push((op, u, out));
         for o in redo.into_iter().rev() {
-            let (_, u) = self.work.apply(&o);
-            self.log.push((o, u));
+            let (out, u) = self.work.apply(&o);
+            self.log.push((o, u, out));
         }
     }
 }

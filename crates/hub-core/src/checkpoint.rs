@@ -67,7 +67,11 @@ pub fn version_id(store: &Store, v: &Version) -> VersionId {
 /// D-004 checkpoint: `{message, frontier, author, note?}`.
 /// `frontier` is always canonical (`F(V)`), so two checkpoints on the same
 /// version carry the same frontier and the same id.
-#[derive(Clone, Debug)]
+///
+/// `Debug` and `PartialEq` show / compare the record fields only, never the
+/// memo (Issue #32). `Clone` resets the memo: a clone may be handed to
+/// another replica (sync), whose store is not the one the memo was
+/// computed against, so it recomputes (or fails with `Missing`) there.
 pub struct Checkpoint {
     pub message: String,
     frontier: Vec<OpId>,
@@ -87,6 +91,29 @@ impl PartialEq for Checkpoint {
     }
 }
 impl Eq for Checkpoint {}
+
+impl Clone for Checkpoint {
+    fn clone(&self) -> Self {
+        Checkpoint {
+            message: self.message.clone(),
+            frontier: self.frontier.clone(),
+            author: self.author,
+            note: self.note.clone(),
+            version: OnceLock::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Checkpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Checkpoint")
+            .field("message", &self.message)
+            .field("frontier", &self.frontier)
+            .field("author", &self.author)
+            .field("note", &self.note)
+            .finish()
+    }
+}
 
 /// Cheap frontier validation for decoding many checkpoints against one
 /// store (Issue #31). Replaces a per-checkpoint `Version::downclose`
@@ -108,14 +135,30 @@ pub struct FrontierCheck<'a> {
 
 impl<'a> FrontierCheck<'a> {
     pub fn new(store: &'a Store) -> Self {
-        let fast = store
+        Self::with_fast(store, Self::scan(store))
+    }
+
+    /// The one O(ops x deps) scan: the store is closed and Lamport.
+    pub fn scan(store: &Store) -> bool {
+        store
             .values()
-            .all(|o| o.deps.iter().all(|d| *d < o.id && store.contains_key(d)));
+            .all(|o| o.deps.iter().all(|d| *d < o.id && store.contains_key(d)))
+    }
+
+    /// A check reusing a [`FrontierCheck::scan`] result computed on this
+    /// same store (Issue #32: one scan per command, shared by every decode).
+    pub fn with_fast(store: &'a Store, fast: bool) -> Self {
+        debug_assert_eq!(fast, Self::scan(store));
         FrontierCheck {
             store,
             fast,
             causal: OnceCell::new(),
         }
+    }
+
+    /// The scan result (to share via [`FrontierCheck::with_fast`]).
+    pub fn is_fast(&self) -> bool {
+        self.fast
     }
 
     pub fn store(&self) -> &'a Store {
@@ -158,6 +201,24 @@ impl Checkpoint {
         Checkpoint {
             message: message.into(),
             frontier: v.frontier(store),
+            author,
+            note,
+            version: OnceLock::new(),
+        }
+    }
+
+    /// Label a version given its canonical frontier `F(V)` (sorted
+    /// antichain of ids in the store), e.g. a memoized head frontier (Issue
+    /// #32). The caller guarantees canonicity; `id()` hashes it as given.
+    pub fn from_canonical(
+        frontier: Vec<OpId>,
+        message: impl Into<String>,
+        author: ReplicaId,
+        note: Option<String>,
+    ) -> Self {
+        Checkpoint {
+            message: message.into(),
+            frontier,
             author,
             note,
             version: OnceLock::new(),
@@ -273,17 +334,63 @@ pub enum ResolveError {
 /// enumerable (exponential), so the index holds: genesis, the principal
 /// version `downclose({o})` of every op in the store, and any version added
 /// explicitly (checkpoints, current heads, merge results).
+///
+/// Issue #32: the principal versions (one per op, frontier `[o]`) live in a
+/// flat array sorted by id, hashed in parallel with no per-entry
+/// allocation; explicit versions stay in a map. Every query treats the two
+/// as one set (union by id), so `short` and `resolve` are exactly those of
+/// the pre-#32 single map ([`VersionIndex::new_single_map`], test oracle).
+/// The principal ids cannot be skipped: a short id's length depends on
+/// whether *any* indexed id shares its first 8+ hex digits (D-005).
 #[derive(Clone, Debug, Default)]
 pub struct VersionIndex {
     by_id: BTreeMap<VersionId, Vec<OpId>>,
+    /// `(id of [o], o)` for every op `o`, sorted by id.
+    principal: Vec<(VersionId, OpId)>,
 }
 
 impl VersionIndex {
     pub fn new(store: &Store) -> Self {
         let mut ix = VersionIndex::default();
         ix.insert_frontier(Vec::new());
+        let ids: Vec<OpId> = store.keys().copied().collect();
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(16);
+        let chunk = ids.len().div_ceil(threads).max(4096);
+        let mut principal: Vec<(VersionId, OpId)> = Vec::with_capacity(ids.len());
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = ids
+                .chunks(chunk)
+                .map(|c| {
+                    sc.spawn(move || {
+                        c.iter()
+                            .map(|&o| (VersionId::of_frontier(&[o]), o))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for h in hs {
+                principal.extend(h.join().expect("hash thread"));
+            }
+        });
+        principal.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        principal.dedup_by(|a, b| a.0 == b.0);
+        ix.principal = principal;
+        ix
+    }
+
+    /// Test-only oracle: the pre-#32 index, every version in one map.
+    #[cfg(any(test, feature = "oracle"))]
+    pub fn new_single_map(store: &Store, cps: &Checkpoints) -> Self {
+        let mut ix = VersionIndex::default();
+        ix.insert_frontier(Vec::new());
         for &o in store.keys() {
             ix.insert_frontier(vec![o]);
+        }
+        for c in cps.iter() {
+            ix.insert_frontier(c.frontier.clone());
         }
         ix
     }
@@ -301,17 +408,27 @@ impl VersionIndex {
         self.insert_frontier(v.frontier(store))
     }
 
-    fn insert_frontier(&mut self, f: Vec<OpId>) -> VersionId {
+    /// Insert a version by its canonical frontier `F(V)` (sorted antichain).
+    pub fn insert_frontier(&mut self, f: Vec<OpId>) -> VersionId {
         let id = VersionId::of_frontier(&f);
-        self.by_id.entry(id).or_insert(f);
+        if self.principal_get(&id).is_none() {
+            self.by_id.entry(id).or_insert(f);
+        }
         id
     }
 
+    fn principal_get(&self, id: &VersionId) -> Option<&OpId> {
+        self.principal
+            .binary_search_by(|p| p.0.cmp(id))
+            .ok()
+            .map(|i| &self.principal[i].1)
+    }
+
     pub fn len(&self) -> usize {
-        self.by_id.len()
+        self.by_id.len() + self.principal.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
+        self.len() == 0
     }
 
     /// Resolve a hex prefix (case-insensitive) to a known version's frontier.
@@ -327,15 +444,26 @@ impl VersionIndex {
             let d = (b as char).to_digit(16).expect("hex checked") as u8;
             lo[i / 2] |= if i % 2 == 0 { d << 4 } else { d };
         }
-        let hits: Vec<_> = self
+        let lo = VersionId(lo);
+        let mut hits: Vec<(VersionId, &[OpId])> = self
             .by_id
-            .range(VersionId(lo)..)
+            .range(lo..)
             .take_while(|(id, _)| hex_starts_with(id, &p))
+            .map(|(id, f)| (*id, f.as_slice()))
             .collect();
+        let start = self.principal.partition_point(|x| x.0 < lo);
+        hits.extend(
+            self.principal[start..]
+                .iter()
+                .take_while(|(id, _)| hex_starts_with(id, &p))
+                .map(|(id, o)| (*id, std::slice::from_ref(o))),
+        );
+        // The two parts are disjoint by construction (`insert_frontier`).
+        hits.sort_by(|a, b| a.0.cmp(&b.0));
         match hits.as_slice() {
             [] => Err(ResolveError::NotFound),
-            [(id, f)] => Ok((**id, f.as_slice())),
-            _ => Err(ResolveError::Ambiguous(hits.iter().map(|h| *h.0).collect())),
+            [(id, f)] => Ok((*id, f)),
+            _ => Err(ResolveError::Ambiguous(hits.iter().map(|h| h.0).collect())),
         }
     }
 
@@ -349,16 +477,25 @@ impl VersionIndex {
     /// display form (git-style lengthening when the default is ambiguous).
     pub fn short(&self, id: &VersionId) -> String {
         // The other key sharing the longest hex prefix with `id` is one of
-        // its sorted neighbours, so two range lookups replace the scan of
-        // every key (Issue #31). Same result as the pre-#31 loop
-        // ([`VersionIndex::short_scan`]).
+        // its sorted neighbours, so range lookups replace the scan of every
+        // key (Issue #31). With two parts (Issue #32), the union's
+        // neighbours are among the neighbours in each part. Same result as
+        // the pre-#31 loop ([`VersionIndex::short_scan`]).
         let before = self.by_id.range(..*id).next_back().map(|(k, _)| k);
         let after = self
             .by_id
             .range((std::ops::Bound::Excluded(*id), std::ops::Bound::Unbounded))
             .next()
             .map(|(k, _)| k);
-        let common = [before, after]
+        let i = self.principal.partition_point(|x| x.0 < *id);
+        let pbefore = i.checked_sub(1).map(|j| &self.principal[j].0);
+        let j = if self.principal.get(i).is_some_and(|x| x.0 == *id) {
+            i + 1
+        } else {
+            i
+        };
+        let pafter = self.principal.get(j).map(|x| &x.0);
+        let common = [before, after, pbefore, pafter]
             .into_iter()
             .flatten()
             .map(|k| common_hex_prefix(k, id))
@@ -368,6 +505,11 @@ impl VersionIndex {
         id.hex()[..n].to_string()
     }
 
+    #[cfg(any(test, feature = "oracle"))]
+    fn keys(&self) -> impl Iterator<Item = &VersionId> {
+        self.by_id.keys().chain(self.principal.iter().map(|x| &x.0))
+    }
+
     /// Test-only oracle: the pre-#31 `short` (hex-formats every key).
     #[cfg(any(test, feature = "oracle"))]
     pub fn short_scan(&self, id: &VersionId) -> String {
@@ -375,7 +517,6 @@ impl VersionIndex {
         let mut n = SHORT_LEN;
         while n < 64
             && self
-                .by_id
                 .keys()
                 .any(|k| k != id && k.hex().starts_with(&hex[..n]))
         {
@@ -388,11 +529,13 @@ impl VersionIndex {
     #[cfg(any(test, feature = "oracle"))]
     pub fn resolve_scan(&self, prefix: &str) -> Vec<VersionId> {
         let p = prefix.to_ascii_lowercase();
-        self.by_id
+        let mut v: Vec<VersionId> = self
             .keys()
             .filter(|id| id.hex().starts_with(&p))
             .copied()
-            .collect()
+            .collect();
+        v.sort();
+        v
     }
 }
 
@@ -460,5 +603,56 @@ mod tests {
         }
         assert_eq!(ix.short(&ids[0]).len(), 64);
         assert_eq!(ix.short(&ids[3]).len(), 20);
+    }
+
+    /// Issue #32: the same long-shared-prefix keys split between the
+    /// principal array and the explicit map (every split mask) give the
+    /// same `short` and `resolve` (ids and frontiers) as one map.
+    #[test]
+    fn split_index_equals_single_map() {
+        let base = [0xabu8; 32];
+        let mut ids = vec![VersionId(base)];
+        for (byte, x) in [
+            (4usize, 0x01u8),
+            (4, 0x10),
+            (9, 0x0f),
+            (31, 0x01),
+            (0, 0x10),
+            (3, 0x01),
+        ] {
+            let mut b = base;
+            b[byte] ^= x;
+            ids.push(VersionId(b));
+        }
+        let op = |i: usize| OpId::new(i as u64 + 2, 1);
+        let mut one = VersionIndex::default();
+        for (i, id) in ids.iter().enumerate() {
+            one.by_id.insert(*id, vec![op(i)]);
+        }
+        let mut probe = ids.clone();
+        let mut a = base;
+        a[20] ^= 0x40;
+        probe.push(VersionId(a));
+        for mask in 0u32..(1 << ids.len()) {
+            let mut two = VersionIndex::default();
+            for (i, id) in ids.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    two.principal.push((*id, op(i)));
+                } else {
+                    two.by_id.insert(*id, vec![op(i)]);
+                }
+            }
+            two.principal.sort();
+            assert_eq!(two.len(), one.len());
+            for id in &probe {
+                assert_eq!(two.short(id), one.short(id), "mask {mask:b} {}", id.hex());
+                for n in 4..=64 {
+                    let p = &id.hex()[..n];
+                    let r1 = one.resolve(p).map(|(i, f)| (i, f.to_vec()));
+                    let r2 = two.resolve(p).map(|(i, f)| (i, f.to_vec()));
+                    assert_eq!(r2, r1, "mask {mask:b} {p}");
+                }
+            }
+        }
     }
 }

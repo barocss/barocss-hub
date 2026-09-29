@@ -226,4 +226,42 @@ proptest! {
             }
         }
     }
+
+    /// Issue #32: the split index (principal array + explicit map) equals
+    /// the pre-#32 single map on length, `short` and `resolve` (id and
+    /// frontier), with checkpoints and explicitly inserted versions.
+    #[test]
+    fn split_index_equals_single_map((ops, _mode, seed) in history()) {
+        let store: Store = ops.iter().map(|o| (o.id, o.clone())).collect();
+        let mut rng = Xs(seed | 1);
+        let mut cps = Checkpoints::new();
+        let mut extra = Vec::new();
+        for k in 0..6 {
+            let f = frontier(&store, &mut rng);
+            if let Ok(c) = Checkpoint::from_frontier(&store, f, format!("c{k}"), ReplicaId(1), None) {
+                extra.push(c.frontier().to_vec());
+                cps.add(c);
+            }
+        }
+        let mut new = VersionIndex::with_checkpoints(&store, &cps);
+        let mut old = VersionIndex::new_single_map(&store, &cps);
+        for f in &extra {
+            prop_assert_eq!(new.insert_frontier(f.clone()), old.insert_frontier(f.clone()));
+        }
+        prop_assert_eq!(new.len(), old.len());
+        let mut probes: Vec<VersionId> = store.keys().map(|&o| VersionId::of_frontier(&[o])).collect();
+        probes.extend(cps.iter().map(|c| c.id()));
+        probes.push(VersionId::of_frontier(&[]));
+        probes.push(VersionId([rng.next() as u8; 32]));
+        for id in &probes {
+            prop_assert_eq!(new.short(id), old.short(id));
+            let h = id.hex();
+            for n in [3usize, 4, 5, 8, 64] {
+                let p = &h[..n];
+                let a = new.resolve(p).map(|(i, f)| (i, f.to_vec()));
+                let b = old.resolve(p).map(|(i, f)| (i, f.to_vec()));
+                prop_assert_eq!(a, b);
+            }
+        }
+    }
 }

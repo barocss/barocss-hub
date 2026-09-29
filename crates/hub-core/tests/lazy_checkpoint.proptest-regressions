@@ -4,5 +4,13 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
+#
+# Why these are kept (Issue #31 review, #32): shrunk inputs of
+# `lazy_decode_equals_eager_oracle` found while the eager oracle still
+# asserted `max_causal == frontier` (true only on Lamport stores; that assert
+# was removed). The first (mode 38, 38 % 4 = 2) may add a non-Lamport dep, so
+# it pins the eager-fallback path of `FrontierCheck` (fast = false); the
+# second (mode 21 % 4 = 1, extra smaller deps) is a minimal fast-path store.
+# They replay in microseconds, before the random cases.
 cc d429e9797256468bb0a8c525838b9920894909b656a9c95f87f4ad1a959ddec3 # shrinks to (ops, mode, seed) = ([Op { id: NodeId { counter: 2, replica: ReplicaId(1) }, deps: {}, payload: Create { kind: File, parent: NodeId { counter: 0, replica: ReplicaId(0) }, name: "n" } }, Op { id: NodeId { counter: 2, replica: ReplicaId(3) }, deps: {}, payload: Create { kind: File, parent: NodeId { counter: 0, replica: ReplicaId(0) }, name: "n" } }, Op { id: NodeId { counter: 3, replica: ReplicaId(3) }, deps: {NodeId { counter: 2, replica: ReplicaId(3) }}, payload: Move { node: NodeId { counter: 2, replica: ReplicaId(3) }, new_parent: NodeId { counter: 0, replica: ReplicaId(0) }, new_name: "n" } }, Op { id: NodeId { counter: 4, replica: ReplicaId(3) }, deps: {NodeId { counter: 3, replica: ReplicaId(3) }}, payload: Create { kind: File, parent: NodeId { counter: 0, replica: ReplicaId(0) }, name: "n" } }, Op { id: NodeId { counter: 5, replica: ReplicaId(3) }, deps: {NodeId { counter: 4, replica: ReplicaId(3) }}, payload: SetContent { node: NodeId { counter: 2, replica: ReplicaId(3) }, blob: BlobId(6e340b9cffb3) } }, Op { id: NodeId { counter: 6, replica: ReplicaId(3) }, deps: {NodeId { counter: 5, replica: ReplicaId(3) }}, payload: Create { kind: File, parent: NodeId { counter: 0, replica: ReplicaId(0) }, name: "n" } }, Op { id: NodeId { counter: 7, replica: ReplicaId(3) }, deps: {NodeId { counter: 6, replica: ReplicaId(3) }}, payload: Create { kind: File, parent: NodeId { counter: 0, replica: ReplicaId(0) }, name: "n" } }], 38, 10493336665446622528)
 cc 5cd72a4ed9e41a2861e6d72f40dc33ba269179ebe6362b2df80e92750c536597 # shrinks to (ops, mode, seed) = ([Op { id: NodeId { counter: 2, replica: ReplicaId(1) }, deps: {}, payload: Create { kind: File, parent: NodeId { counter: 0, replica: ReplicaId(0) }, name: "n" } }, Op { id: NodeId { counter: 2, replica: ReplicaId(2) }, deps: {}, payload: Create { kind: File, parent: NodeId { counter: 0, replica: ReplicaId(0) }, name: "n" } }], 21, 108173564964090)
