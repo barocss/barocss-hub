@@ -969,13 +969,14 @@ fn fmt_frontier(f: &[OpId]) -> String {
     }
 }
 
-/// Crash-safe working-file write. The temp is a fresh, uniquely named file
+/// Crash-safe working-file temp. The temp is a fresh, uniquely named file
 /// in `.hub/tmp/` created with `create_new` (O_EXCL), so it never truncates
 /// or replaces anything, and is never part of the working directory (scans
-/// skip `.hub/`). It is fsynced, then renamed over the target. `.hub/` lives
-/// inside the working directory; [`apply`] checks both are on the same
-/// device so the rename is atomic.
-fn write_file(tmp_dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// skip `.hub/`). It is flushed but not barriered: [`apply`] issues one
+/// barrier over all temps, then renames each over its target (Issue #29).
+/// `.hub/` lives inside the working directory; [`apply`] checks both are on
+/// the same device so the rename is atomic.
+fn write_temp(tmp_dir: &Path, bytes: &[u8]) -> io::Result<(PathBuf, fs::File)> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -998,14 +999,12 @@ fn write_file(tmp_dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         };
-        let r = f
-            .write_all(bytes)
-            .and_then(|_| f.sync_all())
-            .and_then(|_| fs::rename(&tmp, path));
-        if r.is_err() {
+        let r = f.write_all(bytes).and_then(|_| crate::durable::flush(&f));
+        if let Err(e) = r {
             let _ = fs::remove_file(&tmp);
+            return Err(e);
         }
-        return r;
+        return Ok((tmp, f));
     }
 }
 
@@ -1074,11 +1073,55 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
     for path in &p.make_dirs {
         fs::create_dir_all(root.join(path))?;
     }
-    for (path, bytes) in &p.write_files {
-        write_file(&tmp_dir, &root.join(path), bytes)?;
-        if crash {
-            std::process::abort();
+    // Group commit (Issue #29, Appendix A.1): write and flush every temp,
+    // one barrier, rename each over its target, flush the renamed entries'
+    // directories, one more barrier; all before the index save. A rename
+    // therefore never exposes un-barriered data, and until the index is
+    // saved the marker guards everything.
+    if !p.write_files.is_empty() {
+        use crate::durable;
+        let mut temps: Vec<PathBuf> = Vec::with_capacity(p.write_files.len());
+        let mut last = None;
+        for (_, bytes) in &p.write_files {
+            match write_temp(&tmp_dir, bytes) {
+                Ok((t, f)) => {
+                    temps.push(t);
+                    last = Some(f);
+                }
+                Err(e) => {
+                    for t in &temps {
+                        let _ = fs::remove_file(t);
+                    }
+                    return Err(e.into());
+                }
+            }
         }
+        durable::crash_point(durable::FILES_WRITTEN);
+        if let Some(f) = last {
+            durable::barrier(&f)?;
+        }
+        durable::crash_point(durable::FILES_BARRIERED);
+        let mut parents: BTreeSet<PathBuf> = BTreeSet::new();
+        for (i, (path, _)) in p.write_files.iter().enumerate() {
+            let target = root.join(path);
+            if let Err(e) = fs::rename(&temps[i], &target) {
+                for t in &temps[i..] {
+                    let _ = fs::remove_file(t);
+                }
+                return Err(e.into());
+            }
+            if crash {
+                std::process::abort();
+            }
+            if let Some(d) = target.parent() {
+                parents.insert(d.to_path_buf());
+            }
+        }
+        durable::crash_point(durable::FILES_RENAMED);
+        for d in &parents {
+            durable::flush(&fs::File::open(d)?)?;
+        }
+        durable::barrier(&fs::File::open(&tmp_dir)?)?;
     }
     let mut idx = Index {
         base: p.base,

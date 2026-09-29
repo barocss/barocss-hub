@@ -174,11 +174,23 @@ pub fn read_published(repo: &Repo) -> Result<Vec<Checkpoint>, Error> {
 }
 
 pub fn append_published(repo: &Repo, c: &Checkpoint) -> Result<(), Error> {
+    append_published_all(repo, &[c])
+}
+
+/// Append several published records with one sync (Issue #29).
+pub fn append_published_all(repo: &Repo, cs: &[&Checkpoint]) -> Result<(), Error> {
+    if cs.is_empty() {
+        return Ok(());
+    }
     let p = repo.dir.join("published.log");
     if !p.exists() {
         store::write_atomic(&p, format!("{PUBLISHED_HEADER}\n").as_bytes())?;
     }
-    Ok(store::append_record(&p, &store::encode_ckpt(c))?)
+    let mut log = store::LogAppender::open(&p)?;
+    for c in cs {
+        log.write(&store::encode_ckpt(c))?;
+    }
+    Ok(log.sync()?)
 }
 
 /// A core replica without blobs: enough to recompute warnings' `stuck`.
@@ -297,15 +309,18 @@ fn persist(
         .chain(pending.iter().map(|(o, _)| o))
         .filter_map(content_blob)
         .collect();
+    // Group commit (Issue #29): one barrier and one dir fsync for all.
+    let mut batch = disk.batch();
     for b in want {
         if disk.contains(&b) {
             continue;
         }
         if let Some(bytes) = s.blobs().get(&b) {
-            disk.put(bytes).map_err(|e| Error(e.to_string()))?;
+            batch.add(bytes).map_err(|e| Error(e.to_string()))?;
             nblobs += 1;
         }
     }
+    batch.commit().map_err(|e| Error(e.to_string()))?;
     // 2. Ops in `<` order.
     // One batch, so the view is refreshed once (Issue #28).
     let base = *appended;
@@ -325,13 +340,13 @@ fn persist(
     persist_warnings(repo, s)?;
     // 4. Published checkpoints.
     let have = read_published(repo)?;
-    let mut nck = 0;
-    for c in s.published() {
-        if !have.contains(c) && !s.checkpoint_pending(c) {
-            append_published(repo, c)?;
-            nck += 1;
-        }
-    }
+    let new: Vec<&Checkpoint> = s
+        .published()
+        .iter()
+        .filter(|c| !have.contains(c) && !s.checkpoint_pending(c))
+        .collect();
+    append_published_all(repo, &new)?;
+    let nck = new.len();
     Ok(Counts {
         ops: new_ops.len(),
         blobs: nblobs,

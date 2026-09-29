@@ -17,9 +17,12 @@
 //! Checkpoint body: `K <author 32 hex> <frontier> <str message> <str note|->`.
 //! A string token is `s` followed by the escaped bytes (`s` alone = "").
 //!
-//! Appends write one whole line and `fsync` before returning. On open, a
-//! final record with no trailing newline or a bad checksum is a torn write:
-//! it is truncated away (file `set_len` + fsync) and reported. A bad record
+//! Appends write whole lines and `fsync` before returning (a batch is
+//! synced once, [`LogAppender`], Issue #29). On open, a final record with no
+//! trailing newline or a bad checksum is a torn write, and a record
+//! containing a NUL byte starts an un-synced tail (a zero-filled hole after
+//! a power loss): either is truncated away (file `set_len` + fsync) and
+//! reported. A bad record
 //! that is not the last line is corruption and opening fails. A repeated op
 //! id with a different op is corruption; an exact repeat is skipped.
 //!
@@ -289,6 +292,14 @@ pub fn read_log(path: &Path, header: &str) -> Result<LogRead, StoreError> {
                 torn = true;
                 break;
             }
+            // A NUL byte never occurs in a valid record: it is a zero-filled
+            // hole left by a power loss during an un-synced append (Issue
+            // #29, Appendix A.1). Everything from here was written in the
+            // same un-acknowledged batch; cut it like a torn tail.
+            _ if line.contains(&0) => {
+                torn = true;
+                break;
+            }
             _ => return Err(corrupt(lineno, "bad checksum or framing")),
         }
         pos = next;
@@ -308,6 +319,30 @@ pub fn read_log(path: &Path, header: &str) -> Result<LogRead, StoreError> {
 pub fn frame(body: &str) -> String {
     debug_assert!(!body.contains('\t') && !body.contains('\n'));
     format!("{body}\t{}\n", crc(body))
+}
+
+/// Group-commit appender (Issue #29): [`LogAppender::write`] writes whole
+/// framed lines; [`LogAppender::sync`] makes all of them durable at once.
+pub struct LogAppender {
+    f: File,
+}
+
+impl LogAppender {
+    pub fn open(path: &Path) -> io::Result<LogAppender> {
+        Ok(LogAppender {
+            f: OpenOptions::new().append(true).open(path)?,
+        })
+    }
+
+    /// Write one framed record (not yet durable).
+    pub fn write(&mut self, body: &str) -> io::Result<()> {
+        self.f.write_all(frame(body).as_bytes())
+    }
+
+    /// One log sync for everything written so far.
+    pub fn sync(&self) -> io::Result<()> {
+        self.f.sync_data()
+    }
 }
 
 /// Append one record and fsync.

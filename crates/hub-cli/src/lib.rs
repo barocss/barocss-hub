@@ -4,6 +4,7 @@
 //! can be tested without spawning a process. `main.rs` is a thin wrapper.
 
 pub mod blobs;
+pub mod durable;
 pub mod ignore;
 pub mod store;
 pub mod sync;
@@ -247,24 +248,40 @@ impl Repo {
     /// [`Repo::append_ops`] with a hook run before persisting the `i`-th op
     /// (crash/interrupt tests); an error stops the batch. Ops persisted
     /// before an error are still applied. Returns how many were persisted.
+    ///
+    /// Group commit (Issue #29): all lines are written, then `ops.log` is
+    /// synced once. On an error the lines already written are still synced
+    /// before returning, so "persisted" means durable.
     pub fn append_ops_with(
         &mut self,
         ops: impl IntoIterator<Item = Op>,
         mut before: impl FnMut(usize) -> Result<(), Error>,
     ) -> (usize, Result<(), Error>) {
-        let log = self.dir.join("ops.log");
         let mut done = Vec::new();
         let mut res = Ok(());
+        let mut log = match store::LogAppender::open(&self.dir.join("ops.log")) {
+            Ok(l) => l,
+            Err(e) => return (0, Err(e.into())),
+        };
         for op in ops {
-            let r = before(done.len()).and_then(|()| {
-                store::append_record(&log, &store::encode_op(&op)).map_err(Error::from)
-            });
+            let r = before(done.len())
+                .and_then(|()| log.write(&store::encode_op(&op)).map_err(Error::from));
             if let Err(e) = r {
                 res = Err(e);
                 break;
             }
-            self.store.insert(op.id, op.clone());
             done.push(op);
+        }
+        if !done.is_empty() {
+            durable::crash_point(durable::OPS_APPENDED);
+            if let Err(e) = log.sync() {
+                // Nothing of this batch is known durable: apply none of it.
+                return (0, Err(e.into()));
+            }
+            durable::crash_point(durable::OPS_FSYNCED);
+        }
+        for op in &done {
+            self.store.insert(op.id, op.clone());
         }
         let n = done.len();
         self.replica.receive_all(done);
@@ -662,16 +679,19 @@ pub(crate) fn record(
     };
     // Store every new blob before appending any op, so a crash can never
     // leave an op that names a missing blob (or a half-recorded change).
+    // Group commit (Issue #29): one barrier for all of them.
     let mut stored: BTreeMap<&str, BlobId> = BTreeMap::new();
+    let mut batch = blobs.batch();
     for c in &changes {
         if let Change::Added(p) | Change::Modified(p) = c {
             if matches!(w[p], Entry::File { .. }) {
                 let bytes = fs::read(root.join(p))?;
-                let b = blobs.put(&bytes).map_err(|e| Error(e.to_string()))?;
+                let b = batch.add(&bytes).map_err(|e| Error(e.to_string()))?;
                 stored.insert(p, b);
             }
         }
     }
+    batch.commit().map_err(|e| Error(e.to_string()))?;
     let put = |path: &str| -> Result<BlobId, Error> { Ok(stored[path]) };
     // 1. Creates, parents first (a path sorts before its descendants).
     for c in &changes {
