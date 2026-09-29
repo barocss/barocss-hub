@@ -5,7 +5,7 @@
 //! incremental undo-do-redo optimization with causal buffering and duplicate
 //! suppression, and must agree with [`evaluate`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 
@@ -449,19 +449,166 @@ pub fn causal_past(ops: &BTreeMap<OpId, Op>) -> BTreeMap<OpId, BTreeSet<OpId>> {
     past
 }
 
+/// Exact causality over an op set without materializing `deps*` (Issue #28).
+///
+/// Same relation as [`causal_past`]: an edge `d -> o` counts iff `d` is in
+/// the set and `d < o` (other deps are ignored), and `a ≺ b` is its
+/// transitive closure. Each op carries a version vector `vv(o)[r]` = 1 + the
+/// greatest counter of a replica-`r` op in `{o} ∪ deps*(o)` (0 = none),
+/// computed as a pointwise max over its deps, so it is exact for any op set.
+///
+/// `vv(b)[a.replica] > a.counter` is necessary for `a ≺ b`. It is also
+/// sufficient when replica `a.replica`'s ops form one causal chain in counter
+/// order (§2.6 #7, own-chain), which is checked per replica while building.
+/// For a replica that violates §2.6 #7 (the VV is only a hint, Issue #12),
+/// [`Causality::precedes`] falls back to a pruned walk of the deps DAG.
+/// Memory is O(ops × replicas); a query is O(1) under §2.6 #7.
+#[derive(Clone, Debug)]
+pub struct Causality {
+    index: HashMap<OpId, usize>,
+    /// Kept edges (`d` in the set, `d < o`) as indices, per op in `<` order.
+    deps: Vec<Vec<usize>>,
+    slot: HashMap<ReplicaId, usize>,
+    width: usize,
+    /// Row-major `ops × width` version vectors (counter + 1, 0 = none).
+    vv: Vec<u64>,
+    /// Per replica slot: §2.6 #7 holds within the set.
+    chain: Vec<bool>,
+}
+
+impl Causality {
+    /// Build over `ops` (keys are the op ids, ascending).
+    pub fn new(ops: &BTreeMap<OpId, Op>) -> Self {
+        let index: HashMap<OpId, usize> = ops.keys().enumerate().map(|(i, id)| (*id, i)).collect();
+        let mut slot: HashMap<ReplicaId, usize> = HashMap::new();
+        for id in ops.keys() {
+            let n = slot.len();
+            slot.entry(id.replica).or_insert(n);
+        }
+        let width = slot.len().max(1);
+        let mut vv = vec![0u64; ops.len() * width];
+        let mut chain = vec![true; width];
+        let mut last: Vec<u64> = vec![0; width];
+        let mut deps = Vec::with_capacity(ops.len());
+        for (i, op) in ops.values().enumerate() {
+            let ds: Vec<usize> = op
+                .deps
+                .iter()
+                .filter_map(|d| index.get(d).copied())
+                .filter(|&j| j < i)
+                .collect();
+            let (done, rest) = vv.split_at_mut(i * width);
+            let row = &mut rest[..width];
+            for &j in &ds {
+                for (x, &y) in row.iter_mut().zip(&done[j * width..(j + 1) * width]) {
+                    *x = (*x).max(y);
+                }
+            }
+            let s = slot[&op.id.replica];
+            // The previous op of this replica (greatest smaller counter) must
+            // be in deps*(op). While the replica's chain holds, that is
+            // exactly `vv over deps >= prev + 1`.
+            if last[s] != 0 && row[s] < last[s] {
+                chain[s] = false;
+            }
+            last[s] = op.id.counter + 1;
+            row[s] = op.id.counter + 1;
+            deps.push(ds);
+        }
+        Causality {
+            index,
+            deps,
+            slot,
+            width,
+            vv,
+            chain,
+        }
+    }
+
+    fn row(&self, i: usize) -> &[u64] {
+        &self.vv[i * self.width..(i + 1) * self.width]
+    }
+
+    /// `a ∈ deps*(b)` (strict), i.e. `causal_past(ops)[b].contains(a)`.
+    /// False if either id is not in the set.
+    pub fn precedes(&self, a: OpId, b: OpId) -> bool {
+        let (Some(&ia), Some(&ib)) = (self.index.get(&a), self.index.get(&b)) else {
+            return false;
+        };
+        if ia >= ib {
+            return false;
+        }
+        let s = self.slot[&a.replica];
+        let need = a.counter + 1;
+        if self.row(ib)[s] < need {
+            return false;
+        }
+        if self.chain[s] {
+            return true;
+        }
+        // §2.6 #7 violated for a's replica: exact walk from b, pruning ops
+        // below a (edges only go down) and ops whose VV excludes a.
+        let mut stack = vec![ib];
+        let mut seen = HashSet::new();
+        while let Some(x) = stack.pop() {
+            for &d in &self.deps[x] {
+                if d == ia {
+                    return true;
+                }
+                if d > ia && self.row(d)[s] >= need && seen.insert(d) {
+                    stack.push(d);
+                }
+            }
+        }
+        false
+    }
+
+    /// Neither op precedes the other.
+    pub fn concurrent(&self, a: OpId, b: OpId) -> bool {
+        !self.precedes(a, b) && !self.precedes(b, a)
+    }
+
+    /// For ascending `xs`, whether each `x` precedes some later `y` in `xs`
+    /// (is overwritten causally). O(|xs| × replicas) under §2.6 #7.
+    fn overwritten(&self, xs: &[OpId]) -> Vec<bool> {
+        let mut out = vec![false; xs.len()];
+        let mut acc = vec![0u64; self.width];
+        for k in (0..xs.len()).rev() {
+            let x = xs[k];
+            if let Some(&s) = self.slot.get(&x.replica) {
+                let need = x.counter + 1;
+                out[k] = acc[s] >= need
+                    && (self.chain[s] || xs[k + 1..].iter().any(|&y| self.precedes(x, y)));
+            }
+            if let Some(&i) = self.index.get(&x) {
+                for (a, &v) in acc.iter_mut().zip(self.row(i)) {
+                    *a = (*a).max(v);
+                }
+            }
+        }
+        out
+    }
+}
+
 /// The specification: sorted fold (§2.3) plus derived conflicts (§2.4, §2.5).
+///
+/// Issue #28: same result as the pre-#28 form (kept as the `oracle` test
+/// module) without its O(n²) parts: causality via [`Causality`] instead of
+/// materialized predecessor sets, and no per-Move/Delete state snapshots
+/// (the pre-delete parent is read during the fold; the `Revived` ancestry
+/// check runs in a second fold only for concurrent delete/move pairs).
 pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
     let ops: BTreeMap<OpId, Op> = ops.into_iter().map(|o| (o.id, o.clone())).collect();
-    let past = causal_past(&ops);
-    let concurrent = |a: OpId, b: OpId| !past[&a].contains(&b) && !past[&b].contains(&a);
+    let causal = Causality::new(&ops);
 
     let mut w = Work::new();
     let mut outcomes = BTreeMap::new();
     let mut conflicts = BTreeSet::new();
-    let mut before: BTreeMap<OpId, State> = BTreeMap::new();
+    // Parent of the node just before each Delete (read before applying it).
+    let mut parent_before: BTreeMap<OpId, Option<NodeId>> = BTreeMap::new();
     for (id, op) in &ops {
-        if op.moved_node().is_some() {
-            before.insert(*id, w.state.clone());
+        if let Payload::Delete { node } = op.payload {
+            parent_before.insert(*id, w.state.get(&node).and_then(|n| n.parent));
         }
         let (out, _) = w.apply(op);
         match &out {
@@ -490,9 +637,9 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
     // Same-node-move losers (§2.4, 3+ moves rule).
     for (n, ms) in &applied {
         let winner = *ms.last().unwrap();
-        for &m in &ms[..ms.len() - 1] {
-            let overwritten_causally = ms.iter().any(|&m2| past[&m2].contains(&m));
-            if !overwritten_causally {
+        let over = causal.overwritten(ms);
+        for (i, &m) in ms[..ms.len() - 1].iter().enumerate() {
+            if !over[i] {
                 conflicts.insert(Conflict::SameNodeMove {
                     winner,
                     loser: m,
@@ -513,8 +660,10 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
     }
     for (n, es) in &sets {
         let (winner, winner_blob) = *es.last().unwrap();
-        for &(e, loser_blob) in &es[..es.len() - 1] {
-            if !es.iter().any(|&(e2, _)| past[&e2].contains(&e)) {
+        let ids: Vec<OpId> = es.iter().map(|&(e, _)| e).collect();
+        let over = causal.overwritten(&ids);
+        for (i, &(e, loser_blob)) in es[..es.len() - 1].iter().enumerate() {
+            if !over[i] {
                 conflicts.insert(Conflict::Content {
                     node: *n,
                     winner,
@@ -532,7 +681,7 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
         .collect();
     edits.sort();
     let mut pre = BTreeMap::new();
-    for (id, st) in &before {
+    for (id, parent) in &parent_before {
         if let (Payload::Delete { node }, Outcome::Applied) = (&ops[id].payload, &outcomes[id]) {
             let ms = &applied[node];
             let prev = ms
@@ -540,19 +689,37 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
                 .position(|m| m == id)
                 .and_then(|i| i.checked_sub(1));
             let prev = prev.map(|i| ms[i]);
-            let parent = st[node].parent.expect("non-reserved node has parent");
+            let parent = parent.expect("non-reserved node has parent");
             pre.insert(*id, pre_delete_parent(parent, prev, &pre));
         }
     }
-    for (x, e, d) in revive_by_edits(&mut w.state, &ops, &w.setter, &pre, &past, &edits) {
+    let revived = revive_by_edits(
+        &mut w.state,
+        &ops,
+        &w.setter,
+        &pre,
+        |e, d| causal.precedes(e, d),
+        &edits,
+    );
+    for (x, e, d) in revived {
         conflicts.insert(Conflict::EditRevived {
             node: x,
             edit: e,
             delete: d,
         });
     }
-    // Revived (D-001) liveness condition (f) is evaluated on the final
-    // (post-revive) state.
+    // Revived (D-001): for each winning Applied Delete of `d` and each
+    // concurrent Applied Move of `x != d`, `x` was under `d` in the state
+    // before the earlier of the two, and `x` is live in the final
+    // (post-revive) state (liveness condition (f)).
+    let mut moves: Vec<(OpId, NodeId)> = Vec::new();
+    for (&mid, mop) in &ops {
+        if let (Payload::Move { node: x, .. }, Outcome::Applied) = (&mop.payload, &outcomes[&mid]) {
+            moves.push((mid, *x));
+        }
+    }
+    // (point, delete, move, d, x): the check runs on the state before `point`.
+    let mut candidates: BTreeMap<OpId, Vec<(OpId, OpId, NodeId, NodeId)>> = BTreeMap::new();
     for (&did, dop) in &ops {
         let Payload::Delete { node: d } = dop.payload else {
             continue;
@@ -560,21 +727,31 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
         if outcomes[&did] != Outcome::Applied || applied[&d].last() != Some(&did) {
             continue;
         }
-        for (&mid, mop) in &ops {
-            let Payload::Move { node: x, .. } = mop.payload else {
-                continue;
-            };
-            if x == d || outcomes[&mid] != Outcome::Applied || !concurrent(did, mid) {
-                continue;
+        for &(mid, x) in &moves {
+            if x != d && is_live(&w.state, x) && causal.concurrent(did, mid) {
+                candidates
+                    .entry(did.min(mid))
+                    .or_default()
+                    .push((did, mid, d, x));
             }
-            let first = &before[&did.min(mid)];
-            if first.contains_key(&x) && is_ancestor_or_self(first, d, x) && is_live(&w.state, x) {
-                conflicts.insert(Conflict::Revived {
-                    node: x,
-                    delete: did,
-                    mv: mid,
-                });
+        }
+    }
+    if !candidates.is_empty() {
+        let mut w2 = Work::new();
+        for (id, op) in &ops {
+            if let Some(cs) = candidates.get(id) {
+                for &(did, mid, d, x) in cs {
+                    let first = &w2.state;
+                    if first.contains_key(&x) && is_ancestor_or_self(first, d, x) {
+                        conflicts.insert(Conflict::Revived {
+                            node: x,
+                            delete: did,
+                            mv: mid,
+                        });
+                    }
+                }
             }
+            w2.apply(op);
         }
     }
 
@@ -600,8 +777,9 @@ fn pre_delete_parent(parent: NodeId, prev: Option<OpId>, pre: &BTreeMap<OpId, No
 /// D-014 edit revive (Issue #20), shared by [`evaluate`] and [`Replica`].
 ///
 /// Input: the sorted-fold `state`, `setter` (op that last set each node's
-/// parent), `pre` (pre-delete parent per Applied Delete), causal `past`, and
-/// the Applied SetContent ops `edits` as `(edit, node)`. For each edit `E` of
+/// parent), `pre` (pre-delete parent per Applied Delete), the causality test
+/// `precedes(a, b)` (`a ∈ deps*(b)`), and the Applied SetContent ops `edits`
+/// as `(edit, node)`. For each edit `E` of
 /// `x` with `x` not live: walk `x`'s chain to the node `d` whose parent is
 /// TRASH; if `d`'s winning op is a `Delete` `D` with `E ∉ deps*(D)` (the
 /// delete did not see the edit: concurrent, or `E` causally after `D`),
@@ -615,7 +793,7 @@ fn revive_by_edits(
     ops: &BTreeMap<OpId, Op>,
     setter: &BTreeMap<NodeId, OpId>,
     pre: &BTreeMap<OpId, NodeId>,
-    past: &BTreeMap<OpId, BTreeSet<OpId>>,
+    precedes: impl Fn(OpId, OpId) -> bool,
     edits: &[(OpId, NodeId)],
 ) -> BTreeSet<(NodeId, OpId, OpId)> {
     let mut out = BTreeSet::new();
@@ -641,7 +819,7 @@ fn revive_by_edits(
             if !matches!(
                 ops.get(&d).map(|o| &o.payload),
                 Some(Payload::Delete { .. })
-            ) || past[&d].contains(&e)
+            ) || precedes(e, d)
             {
                 continue;
             }
@@ -670,6 +848,12 @@ pub struct Replica {
     log: Vec<(Op, Undo)>,
     known: BTreeSet<OpId>,
     pending: BTreeMap<OpId, Op>,
+    /// Issue #28 ready index: pending ops waiting on each missing dep, the
+    /// number of missing deps per pending op, and the pending ops with none
+    /// (so draining is O(ops) instead of a scan of `pending` per op).
+    waiting: HashMap<OpId, Vec<OpId>>,
+    missing: HashMap<OpId, usize>,
+    ready: BTreeSet<OpId>,
     /// Fold state plus the D-014 edit revive (what [`Replica::state`]
     /// shows); `None` when the revive changes nothing (the common case).
     view: Option<State>,
@@ -688,6 +872,9 @@ impl Replica {
             log: Vec::new(),
             known: BTreeSet::new(),
             pending: BTreeMap::new(),
+            waiting: HashMap::new(),
+            missing: HashMap::new(),
+            ready: BTreeSet::new(),
             view: None,
         }
     }
@@ -709,7 +896,7 @@ impl Replica {
             return;
         }
         let ops: BTreeMap<OpId, Op> = self.log.iter().map(|(o, _)| (o.id, o.clone())).collect();
-        let past = causal_past(&ops);
+        let causal = Causality::new(&ops);
         let mut pre = BTreeMap::new();
         let mut edits = Vec::new();
         for (o, u) in &self.log {
@@ -727,7 +914,14 @@ impl Replica {
         }
         edits.sort();
         let mut view = self.work.state.clone();
-        revive_by_edits(&mut view, &ops, &self.work.setter, &pre, &past, &edits);
+        revive_by_edits(
+            &mut view,
+            &ops,
+            &self.work.setter,
+            &pre,
+            |e, d| causal.precedes(e, d),
+            &edits,
+        );
         self.view = Some(view);
     }
 
@@ -741,21 +935,50 @@ impl Replica {
 
     /// Receive an op. Duplicates are no-ops (§2.6 #6).
     pub fn receive(&mut self, op: Op) {
+        self.receive_all(std::iter::once(op));
+    }
+
+    /// Receive a batch of ops (e.g. a whole op log on open), then refresh
+    /// the view once (Issue #28). Same result as receiving them one by one.
+    pub fn receive_all(&mut self, ops: impl IntoIterator<Item = Op>) {
+        for op in ops {
+            self.buffer(op);
+        }
+        self.refresh_view();
+    }
+
+    /// Buffer one op and integrate every op that became ready, smallest id
+    /// first (the order the pre-#28 scan of `pending` used).
+    fn buffer(&mut self, op: Op) {
         if self.known.contains(&op.id) || self.pending.contains_key(&op.id) {
             return;
         }
-        self.pending.insert(op.id, op);
-        loop {
-            let ready = self
-                .pending
-                .values()
-                .find(|o| o.deps.iter().all(|d| self.known.contains(d)))
-                .map(|o| o.id);
-            let Some(id) = ready else { break };
+        let id = op.id;
+        let mut n = 0;
+        for d in &op.deps {
+            if !self.known.contains(d) {
+                self.waiting.entry(*d).or_default().push(id);
+                n += 1;
+            }
+        }
+        self.pending.insert(id, op);
+        if n == 0 {
+            self.ready.insert(id);
+        } else {
+            self.missing.insert(id, n);
+        }
+        while let Some(id) = self.ready.pop_first() {
             let op = self.pending.remove(&id).unwrap();
             self.integrate(op);
+            for w in self.waiting.remove(&id).unwrap_or_default() {
+                let m = self.missing.get_mut(&w).expect("waiter is pending");
+                *m -= 1;
+                if *m == 0 {
+                    self.missing.remove(&w);
+                    self.ready.insert(w);
+                }
+            }
         }
-        self.refresh_view();
     }
 
     fn integrate(&mut self, op: Op) {
@@ -843,3 +1066,7 @@ pub fn check_invariants<'a>(
     }
     Ok(())
 }
+
+#[cfg(any(test, feature = "oracle"))]
+#[path = "tree_oracle.rs"]
+pub mod oracle;

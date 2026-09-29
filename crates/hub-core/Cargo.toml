@@ -9,5 +9,11 @@ publish = false
 getrandom = "0.2"
 sha2 = "0.10"
 
+[features]
+# Test-only: exposes `tree::oracle` (the pre-#28 O(n²) evaluate) for the
+# equivalence proptest. Enabled for this crate's own tests below.
+oracle = []
+
 [dev-dependencies]
 proptest = "1"
+hub-core = { path = ".", features = ["oracle"] }
