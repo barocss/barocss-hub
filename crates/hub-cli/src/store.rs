@@ -1,4 +1,6 @@
-//! On-disk `.hub/` storage (Issue #16, format v0 [decision-proposal]).
+//! On-disk `.hub/` storage (Issue #16; format v1 since Issue #33, Wiki
+//! Appendix A.2: `ops.log` batches with `B` commit records, see
+//! [`read_oplog`]; the notes below describe the v0 framing it keeps).
 //!
 //! Layout:
 //! - `.hub/replica`      `barocss-hub/replica/v0\n<32 hex digits>\n`, written

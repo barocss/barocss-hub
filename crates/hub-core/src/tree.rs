@@ -1199,15 +1199,33 @@ impl Replica {
 
     /// Receive a batch of ops (e.g. a whole op log on open), then refresh
     /// the view once (Issue #28). Same result as receiving them one by one.
+    /// Issue #33: every op that becomes ready is integrated in one merged
+    /// pass (undo the log suffix above the smallest new id once, then redo
+    /// suffix and new ops in `<` order), so a batch of out-of-order ops
+    /// costs O(suffix + batch) instead of O(suffix) per op.
     pub fn receive_all(&mut self, ops: impl IntoIterator<Item = Op>) {
         for op in ops {
             self.buffer(op);
         }
+        let mut batch = Vec::new();
+        while let Some(id) = self.ready.pop_first() {
+            let op = self.pending.remove(&id).unwrap();
+            self.known.insert(id);
+            for w in self.waiting.remove(&id).unwrap_or_default() {
+                let m = self.missing.get_mut(&w).expect("waiter is pending");
+                *m -= 1;
+                if *m == 0 {
+                    self.missing.remove(&w);
+                    self.ready.insert(w);
+                }
+            }
+            batch.push(op);
+        }
+        self.integrate_all(batch);
         self.refresh_view();
     }
 
-    /// Buffer one op and integrate every op that became ready, smallest id
-    /// first (the order the pre-#28 scan of `pending` used).
+    /// Buffer one op: pending until every dep is known, then ready.
     fn buffer(&mut self, op: Op) {
         if self.known.contains(&op.id) || self.pending.contains_key(&op.id) {
             return;
@@ -1226,34 +1244,42 @@ impl Replica {
         } else {
             self.missing.insert(id, n);
         }
-        while let Some(id) = self.ready.pop_first() {
-            let op = self.pending.remove(&id).unwrap();
-            self.integrate(op);
-            for w in self.waiting.remove(&id).unwrap_or_default() {
-                let m = self.missing.get_mut(&w).expect("waiter is pending");
-                *m -= 1;
-                if *m == 0 {
-                    self.missing.remove(&w);
-                    self.ready.insert(w);
-                }
-            }
-        }
     }
 
-    fn integrate(&mut self, op: Op) {
-        let pos = self.log.partition_point(|(o, _, _)| o.id < op.id);
+    /// Integrate ready ops (ids new, deps known): undo the log above the
+    /// smallest, then apply suffix and batch merged in `<` order.
+    fn integrate_all(&mut self, mut batch: Vec<Op>) {
+        if batch.is_empty() {
+            return;
+        }
+        batch.sort_by_key(|o| o.id);
+        let pos = self.log.partition_point(|(o, _, _)| o.id < batch[0].id);
         let tail: Vec<(Op, Undo, Outcome)> = self.log.drain(pos..).collect();
         let mut redo = Vec::with_capacity(tail.len());
         for (o, u, _) in tail.into_iter().rev() {
             self.work.undo(u);
             redo.push(o);
         }
-        self.known.insert(op.id);
-        let (out, u) = self.work.apply(&op);
-        self.log.push((op, u, out));
-        for o in redo.into_iter().rev() {
-            let (out, u) = self.work.apply(&o);
-            self.log.push((o, u, out));
+        redo.reverse();
+        self.log.reserve(redo.len() + batch.len());
+        let mut a = redo.into_iter().peekable();
+        let mut b = batch.into_iter().peekable();
+        loop {
+            let next = match (a.peek(), b.peek()) {
+                (Some(x), Some(y)) => {
+                    if x.id < y.id {
+                        a.next()
+                    } else {
+                        b.next()
+                    }
+                }
+                (Some(_), None) => a.next(),
+                (None, Some(_)) => b.next(),
+                (None, None) => break,
+            }
+            .unwrap();
+            let (out, u) = self.work.apply(&next);
+            self.log.push((next, u, out));
         }
     }
 }

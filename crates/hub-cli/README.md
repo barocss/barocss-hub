@@ -194,7 +194,18 @@ watch stopped
 
 ## Storage (`.hub/`)
 
-- `replica`, `ops.log`, `checkpoints.log`, `lock`: see Issue #16.
+- On-disk format **v1** (Issue #33): `replica` starts with
+  `barocss-hub/replica/v1` (the version marker; older binaries refuse the
+  repo before touching it), `format` repeats it. A v0 repository is migrated
+  automatically, crash-safely, on its first open by this binary.
+- `replica`, `ops.log`, `checkpoints.log`, `lock`: see Issue #16. In v1,
+  `ops.log` groups op records into batches, each ended by a
+  `B <seq> <count> <chain>` commit record; only committed batches count, and
+  an uncommitted tail (crash or power loss) is dropped on open.
+- `snapshot`: a validated cache of the replayed state bound to a log
+  position, so open replays only the ops after it. Deleting it changes
+  nothing observable. `HUB_NO_SNAPSHOT=1` disables it, `HUB_SNAPSHOT_MIN=<n>`
+  tunes when it is rewritten (default: every max(4096, ops/16) new ops).
 - `published.log`, `pending.log`, `warnings.log`: Issue #22 (optional,
   same record framing as `ops.log`).
 - `blobs/<sha256 hex>`: raw file bytes, written temp, fsync, rename, then the
@@ -212,4 +223,4 @@ watch stopped
 - Locking uses `flock` on unix. Other targets have no repository lock and
   every command prints a warning saying so.
 - The full layout is specified in the Wiki, Repository-Semantics,
-  "On-disk format v0".
+  Appendix A ("On-disk format v0", A.1 durability, A.2 "On-disk format v1").

@@ -649,7 +649,10 @@ fn v0_binary_refuses_v1_without_touching_it() {
     let h = d.join(".hub");
     {
         use std::io::Write;
-        let mut f = fs::OpenOptions::new().append(true).open(h.join("ops.log")).unwrap();
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(h.join("ops.log"))
+            .unwrap();
         f.write_all(b"O 99.torn-tail-without-newline").unwrap();
     }
     let before = files(&h);

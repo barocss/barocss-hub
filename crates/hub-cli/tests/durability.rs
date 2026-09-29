@@ -186,6 +186,7 @@ const RECORD_STAGES: &[&str] = &[
     durable::BLOBS_BARRIERED,
     durable::BLOBS_RENAMED,
     durable::OPS_APPENDED,
+    durable::COMMIT_WRITTEN,
     durable::OPS_FSYNCED,
 ];
 
@@ -198,7 +199,9 @@ fn record_crash_at_every_stage_recovers() {
         let ops_grew = ops_len(&d) > before;
         assert_eq!(
             ops_grew,
-            *st == durable::OPS_APPENDED || *st == durable::OPS_FSYNCED,
+            *st == durable::OPS_APPENDED
+                || *st == durable::COMMIT_WRITTEN
+                || *st == durable::OPS_FSYNCED,
             "{st}: ops must only reach the log after the blob barrier"
         );
         recover_and_check(&d, &acked, &format!("rec-{st}"));
