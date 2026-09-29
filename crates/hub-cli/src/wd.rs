@@ -1146,14 +1146,34 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
     }
     if !dirty.is_empty() {
         use crate::durable;
-        // Deepest first; a directory removed later in the plan (gone now)
-        // is covered by its own parent's flush.
-        for d in dirty.iter().rev() {
-            match fs::File::open(d) {
-                Ok(f) => durable::flush_dir(d, &f)?,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+        // A dirty dir that no longer exists as a directory (removed, or an
+        // ancestor became a file: NotFound / ENOTDIR) is skipped, and its
+        // nearest existing ancestor directory is flushed instead (whose
+        // entry for the removed/replaced child changed).
+        let mut done: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut queue: Vec<PathBuf> = dirty.iter().rev().cloned().collect();
+        while let Some(d) = queue.pop() {
+            if done.contains(&d) {
+                continue;
             }
+            let gone = match fs::symlink_metadata(&d) {
+                Ok(m) => !m.is_dir(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(20) => {
+                    true
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if gone {
+                done.insert(d.clone());
+                if d != root {
+                    if let Some(up) = d.parent() {
+                        queue.push(up.to_path_buf());
+                    }
+                }
+                continue;
+            }
+            durable::flush_dir(&d, &fs::File::open(&d)?)?;
+            done.insert(d);
         }
         durable::barrier(&fs::File::open(&tmp_dir)?)?;
     }

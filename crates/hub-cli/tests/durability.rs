@@ -455,3 +455,51 @@ fn checkout_flushes_created_chain_and_removed_parents() {
         "parent of removed keep/k not flushed: {text}"
     );
 }
+
+/// #29 re-review regression (pinned from wd_roundtrip): a removed path's
+/// parent `a/a` whose ancestor `a` becomes a file in the same apply. The
+/// flush skips the vanished dirs (ENOTDIR/NotFound) and flushes the nearest
+/// existing ancestor (the root, which holds the new file `a`).
+#[test]
+fn dir_replaced_by_file_in_same_apply() {
+    let d = tmp("dir2file");
+    ok(&d, &["init"]);
+    write(&d, "a/a/x", b"x\n");
+    ok(&d, &["record", "-m", "v1"]);
+    let v1 = ok(&d, &["log"])
+        .lines()
+        .find(|l| l.ends_with(" v1"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    fs::remove_dir_all(d.join("a")).unwrap();
+    write(&d, "a", b"now a file\n");
+    ok(&d, &["record", "-m", "v2"]);
+    let log = d.with_extension("flushlog");
+    let root = fs::canonicalize(&d).unwrap().display().to_string();
+    for (target, is_file) in [(v1.as_str(), false), ("", true)] {
+        let _ = fs::remove_file(&log);
+        let args: Vec<&str> = if target.is_empty() {
+            vec!["checkout"]
+        } else {
+            vec!["checkout", target]
+        };
+        let o = hub_env(
+            &d,
+            &args,
+            &[(durable::FLUSH_LOG_ENV, log.to_str().unwrap())],
+        );
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert!(!d.join(".hub/checkout-in-progress").exists());
+        assert_eq!(d.join("a").is_file(), is_file);
+        let text = fs::read_to_string(&log).unwrap();
+        assert!(text.lines().any(|l| l == root), "root not flushed: {text}");
+    }
+    assert!(ok(&d, &["record"]).contains("nothing to record"));
+}
