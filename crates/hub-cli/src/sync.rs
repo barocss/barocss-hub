@@ -164,8 +164,9 @@ pub fn read_warnings(dir: &Path) -> Result<Vec<RejectWarning>, Error> {
 pub fn read_published(repo: &Repo) -> Result<Vec<Checkpoint>, Error> {
     let p = repo.dir.join("published.log");
     let mut out: Vec<Checkpoint> = Vec::new();
+    let check = hub_core::checkpoint::FrontierCheck::new(&repo.store);
     for (i, b) in read_opt(&p, PUBLISHED_HEADER)?.iter().enumerate() {
-        let c = store::decode_ckpt(b, &repo.store).map_err(|why| corrupt(&p, i, why))?;
+        let c = store::decode_ckpt(b, &check).map_err(|why| corrupt(&p, i, why))?;
         if !out.contains(&c) {
             out.push(c);
         }

@@ -14,12 +14,14 @@
 //! Encoding (v0, [decision-proposal]):
 //! `"barocss-hub/version/v0\n" || u64_be(len F) || for f in F: u64_be(f.counter) || u128_be(f.replica)`.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 
-use crate::tree::{OpId, ReplicaId};
-use crate::version::{max_causal, Store, Version, VersionError};
+use crate::tree::{Causality, OpId, ReplicaId};
+use crate::version::{Store, Version, VersionError};
 
 /// Domain tag of the v0 frontier encoding.
 pub const DOMAIN: &[u8] = b"barocss-hub/version/v0\n";
@@ -65,12 +67,83 @@ pub fn version_id(store: &Store, v: &Version) -> VersionId {
 /// D-004 checkpoint: `{message, frontier, author, note?}`.
 /// `frontier` is always canonical (`F(V)`), so two checkpoints on the same
 /// version carry the same frontier and the same id.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Checkpoint {
     pub message: String,
     frontier: Vec<OpId>,
     pub author: ReplicaId,
     pub note: Option<String>,
+    /// Memoized down-closure (Issue #31): computed on the first
+    /// [`Checkpoint::version`] call, never at decode. Not part of equality.
+    version: OnceLock<Version>,
+}
+
+impl PartialEq for Checkpoint {
+    fn eq(&self, o: &Self) -> bool {
+        self.message == o.message
+            && self.frontier == o.frontier
+            && self.author == o.author
+            && self.note == o.note
+    }
+}
+impl Eq for Checkpoint {}
+
+/// Cheap frontier validation for decoding many checkpoints against one
+/// store (Issue #31). Replaces a per-checkpoint `Version::downclose`
+/// (O(ops) each, O(checkpoints x ops) at open) with:
+/// - one O(ops x deps) scan deciding whether the store is *closed* (every
+///   dep present) and *Lamport* (every dep `<` its op, §2.6 #2);
+/// - per frontier: every id is in the store (a closed store makes that the
+///   only way the down-closure can fail), then canonicalization by `max≺`
+///   with [`Causality`] (built once, only if some frontier has 2+ ids). An
+///   antichain is returned unchanged.
+///
+/// A store that is not closed or not Lamport falls back to the eager
+/// down-closure, so results (frontier or error) are identical in every case.
+pub struct FrontierCheck<'a> {
+    store: &'a Store,
+    fast: bool,
+    causal: OnceCell<Causality>,
+}
+
+impl<'a> FrontierCheck<'a> {
+    pub fn new(store: &'a Store) -> Self {
+        let fast = store
+            .values()
+            .all(|o| o.deps.iter().all(|d| *d < o.id && store.contains_key(d)));
+        FrontierCheck {
+            store,
+            fast,
+            causal: OnceCell::new(),
+        }
+    }
+
+    pub fn store(&self) -> &'a Store {
+        self.store
+    }
+
+    /// Canonical frontier `max≺(ids)` of the version `downclose(ids)`, or the
+    /// error `Version::downclose` would give.
+    pub fn canonical(&self, ids: &BTreeSet<OpId>) -> Result<Vec<OpId>, VersionError> {
+        if !self.fast {
+            let v = Version::downclose(self.store, ids.iter().copied())?;
+            return Ok(v.frontier(self.store));
+        }
+        // downclose pops the greatest id first; in a closed store only a
+        // frontier id can be missing, so its error names the greatest one.
+        if let Some(&m) = ids.iter().rev().find(|i| !self.store.contains_key(i)) {
+            return Err(VersionError::Missing(m));
+        }
+        if ids.len() <= 1 {
+            return Ok(ids.iter().copied().collect());
+        }
+        let c = self.causal.get_or_init(|| Causality::new(self.store));
+        Ok(ids
+            .iter()
+            .copied()
+            .filter(|&a| !ids.iter().any(|&b| b != a && c.precedes(a, b)))
+            .collect())
+    }
 }
 
 impl Checkpoint {
@@ -87,6 +160,7 @@ impl Checkpoint {
             frontier: v.frontier(store),
             author,
             note,
+            version: OnceLock::new(),
         }
     }
 
@@ -100,9 +174,43 @@ impl Checkpoint {
         author: ReplicaId,
         note: Option<String>,
     ) -> Result<Self, VersionError> {
+        Self::from_frontier_checked(&FrontierCheck::new(store), ids, message, author, note)
+    }
+
+    /// [`Checkpoint::from_frontier`] sharing one [`FrontierCheck`] across
+    /// many checkpoints (decode at open). Lazy: no down-closure.
+    pub fn from_frontier_checked(
+        check: &FrontierCheck<'_>,
+        ids: impl IntoIterator<Item = OpId>,
+        message: impl Into<String>,
+        author: ReplicaId,
+        note: Option<String>,
+    ) -> Result<Self, VersionError> {
+        let ids: BTreeSet<OpId> = ids.into_iter().collect();
+        Ok(Checkpoint {
+            message: message.into(),
+            frontier: check.canonical(&ids)?,
+            author,
+            note,
+            version: OnceLock::new(),
+        })
+    }
+
+    /// Test-only oracle (Issue #31): the pre-#31 eager decode, which
+    /// materializes the down-closure of every checkpoint.
+    #[cfg(any(test, feature = "oracle"))]
+    pub fn from_frontier_eager(
+        store: &Store,
+        ids: impl IntoIterator<Item = OpId>,
+        message: impl Into<String>,
+        author: ReplicaId,
+        note: Option<String>,
+    ) -> Result<Self, VersionError> {
         let ids: BTreeSet<OpId> = ids.into_iter().collect();
         let v = Version::downclose(store, ids.iter().copied())?;
-        debug_assert_eq!(max_causal(store, &ids), v.frontier(store));
+        // (The pre-#31 debug_assert `max_causal == frontier` is dropped: it
+        // only holds for Lamport stores, and the oracle must also run on
+        // the non-Lamport stores the equivalence test builds.)
         Ok(Checkpoint::new(store, &v, message, author, note))
     }
 
@@ -110,9 +218,15 @@ impl Checkpoint {
         &self.frontier
     }
 
-    /// The labelled version (down-closure of the frontier).
+    /// The labelled version (down-closure of the frontier), computed on
+    /// first use and memoized. The store may only have grown since (the
+    /// down-closure of a resolvable frontier never changes).
     pub fn version(&self, store: &Store) -> Result<Version, VersionError> {
-        Version::downclose(store, self.frontier.iter().copied())
+        if let Some(v) = self.version.get() {
+            return Ok(v.clone());
+        }
+        let v = Version::downclose(store, self.frontier.iter().copied())?;
+        Ok(self.version.get_or_init(|| v).clone())
     }
 
     pub fn id(&self) -> VersionId {
@@ -206,10 +320,17 @@ impl VersionIndex {
         if p.len() < MIN_PREFIX || p.len() > 64 || !p.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(ResolveError::InvalidPrefix);
         }
+        // Keys with hex prefix `p` are one contiguous range starting at `p`
+        // padded with zeros (byte order = hex order), Issue #31.
+        let mut lo = [0u8; 32];
+        for (i, b) in p.bytes().enumerate() {
+            let d = (b as char).to_digit(16).expect("hex checked") as u8;
+            lo[i / 2] |= if i % 2 == 0 { d << 4 } else { d };
+        }
         let hits: Vec<_> = self
             .by_id
-            .iter()
-            .filter(|(id, _)| id.hex().starts_with(&p))
+            .range(VersionId(lo)..)
+            .take_while(|(id, _)| hex_starts_with(id, &p))
             .collect();
         match hits.as_slice() {
             [] => Err(ResolveError::NotFound),
@@ -227,6 +348,29 @@ impl VersionIndex {
     /// Shortest unique prefix of `id`, at least [`SHORT_LEN`] digits: the
     /// display form (git-style lengthening when the default is ambiguous).
     pub fn short(&self, id: &VersionId) -> String {
+        // The other key sharing the longest hex prefix with `id` is one of
+        // its sorted neighbours, so two range lookups replace the scan of
+        // every key (Issue #31). Same result as the pre-#31 loop
+        // ([`VersionIndex::short_scan`]).
+        let before = self.by_id.range(..*id).next_back().map(|(k, _)| k);
+        let after = self
+            .by_id
+            .range((std::ops::Bound::Excluded(*id), std::ops::Bound::Unbounded))
+            .next()
+            .map(|(k, _)| k);
+        let common = [before, after]
+            .into_iter()
+            .flatten()
+            .map(|k| common_hex_prefix(k, id))
+            .max()
+            .unwrap_or(0);
+        let n = (common + 1).clamp(SHORT_LEN, 64);
+        id.hex()[..n].to_string()
+    }
+
+    /// Test-only oracle: the pre-#31 `short` (hex-formats every key).
+    #[cfg(any(test, feature = "oracle"))]
+    pub fn short_scan(&self, id: &VersionId) -> String {
         let hex = id.hex();
         let mut n = SHORT_LEN;
         while n < 64
@@ -238,5 +382,83 @@ impl VersionIndex {
             n += 1;
         }
         hex[..n].to_string()
+    }
+
+    /// Test-only oracle: the pre-#31 `resolve` hit list (full scan).
+    #[cfg(any(test, feature = "oracle"))]
+    pub fn resolve_scan(&self, prefix: &str) -> Vec<VersionId> {
+        let p = prefix.to_ascii_lowercase();
+        self.by_id
+            .keys()
+            .filter(|id| id.hex().starts_with(&p))
+            .copied()
+            .collect()
+    }
+}
+
+/// Number of leading hex digits `a` and `b` share (0..=64).
+fn common_hex_prefix(a: &VersionId, b: &VersionId) -> usize {
+    for i in 0..32 {
+        let x = a.0[i] ^ b.0[i];
+        if x != 0 {
+            return 2 * i + usize::from(x & 0xf0 == 0);
+        }
+    }
+    64
+}
+
+/// `id.hex().starts_with(p)` without formatting (`p` lowercase hex).
+fn hex_starts_with(id: &VersionId, p: &str) -> bool {
+    const D: &[u8; 16] = b"0123456789abcdef";
+    p.bytes().enumerate().all(|(i, c)| {
+        let b = id.0[i / 2];
+        D[usize::from(if i % 2 == 0 { b >> 4 } else { b & 0xf })] == c
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #31: keys sharing 8..64 hex digits (impossible to build from
+    /// real SHA-256 ids) lengthen `short` exactly as the pre-#31 scan, and
+    /// range `resolve` finds the same hits.
+    #[test]
+    fn short_and_resolve_with_long_shared_prefixes() {
+        let mut ix = VersionIndex::default();
+        let base = [0xabu8; 32];
+        let mut ids = vec![VersionId(base)];
+        for (byte, x) in [
+            (4usize, 0x01u8),
+            (4, 0x10),
+            (9, 0x0f),
+            (31, 0x01),
+            (0, 0x10),
+        ] {
+            let mut b = base;
+            b[byte] ^= x;
+            ids.push(VersionId(b));
+        }
+        for id in &ids {
+            ix.by_id.insert(*id, Vec::new());
+        }
+        let mut probe = ids.clone();
+        let mut a = base; // not in the index
+        a[20] ^= 0x40;
+        probe.push(VersionId(a));
+        for id in &probe {
+            assert_eq!(ix.short(id), ix.short_scan(id), "{}", id.hex());
+            for n in 4..=64 {
+                let p = &id.hex()[..n];
+                let hits = match ix.resolve(p) {
+                    Ok((i, _)) => vec![i],
+                    Err(ResolveError::Ambiguous(v)) => v,
+                    Err(_) => vec![],
+                };
+                assert_eq!(hits, ix.resolve_scan(p), "{p}");
+            }
+        }
+        assert_eq!(ix.short(&ids[0]).len(), 64);
+        assert_eq!(ix.short(&ids[3]).len(), 20);
     }
 }
