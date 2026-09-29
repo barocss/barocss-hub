@@ -79,6 +79,38 @@ pub struct Repo {
     pub warnings: Vec<String>,
     /// `.hub/lock`, held for the lifetime of the `Repo`.
     _lock: RepoLock,
+    /// Issue #32 per-command memos, keyed by `store.len()` (the store only
+    /// grows) and cleared by every append: head frontier + max counter,
+    /// and the `FrontierCheck::scan` result.
+    head_memo: std::cell::RefCell<Option<(usize, HeadMemo)>>,
+    fast_memo: std::cell::Cell<Option<(usize, bool)>>,
+}
+
+#[derive(Clone)]
+struct HeadMemo {
+    frontier: Vec<NodeId>,
+    max_counter: Option<u64>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch (Issue #32): run every command on the pre-#32 paths
+    /// (full `evaluate` for conflicts and for record/mutate planning, the
+    /// single-map index, `Version::from_ops` head, a fresh `FrontierCheck`
+    /// per decode, the store-cloning `warnings_view`).
+    pub static ORACLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the pre-#32 oracle paths are on (always false outside tests).
+pub(crate) fn oracle() -> bool {
+    #[cfg(test)]
+    {
+        ORACLE.with(|o| o.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 impl Repo {
@@ -206,6 +238,7 @@ impl Repo {
         }
         let mut checkpoints = Checkpoints::new();
         let check = FrontierCheck::new(&st);
+        let fast = check.is_fast();
         for (i, body) in cks.records.iter().enumerate() {
             let c = store::decode_ckpt(body, &check).map_err(|why| StoreError::Corrupt {
                 file: cp.clone(),
@@ -214,6 +247,7 @@ impl Repo {
             })?;
             checkpoints.add(c);
         }
+        let st_len = st.len();
         Ok(Repo {
             dir,
             replica_id,
@@ -222,6 +256,8 @@ impl Repo {
             checkpoints,
             warnings,
             _lock: lock,
+            head_memo: Default::default(),
+            fast_memo: std::cell::Cell::new(Some((st_len, fast))),
         })
     }
 
@@ -234,9 +270,95 @@ impl Repo {
             .expect("store is closed")
     }
 
+    /// Head frontier and greatest counter, memoized per store size (Issue
+    /// #32). Frontier = ids that are no op's dep (the store is closed), in
+    /// `<` order: the same list as `head().frontier(&store)`.
+    fn head_memo(&self) -> HeadMemo {
+        let n = self.store.len();
+        if !oracle() {
+            if let Some((len, m)) = &*self.head_memo.borrow() {
+                if *len == n {
+                    return m.clone();
+                }
+            }
+        }
+        let m = if oracle() {
+            HeadMemo {
+                frontier: self.head().frontier(&self.store),
+                max_counter: self.store.keys().map(|o| o.counter).max(),
+            }
+        } else {
+            let mut deps: Vec<NodeId> = self
+                .store
+                .values()
+                .flat_map(|o| o.deps.iter().copied())
+                .collect();
+            deps.sort_unstable();
+            deps.dedup();
+            let frontier = self
+                .store
+                .keys()
+                .filter(|id| deps.binary_search(id).is_err())
+                .copied()
+                .collect();
+            HeadMemo {
+                frontier,
+                max_counter: self.store.keys().map(|o| o.counter).max(),
+            }
+        };
+        *self.head_memo.borrow_mut() = Some((n, m.clone()));
+        m
+    }
+
+    /// A [`FrontierCheck`] over the current store, sharing one closed +
+    /// Lamport scan per store size (Issue #32).
+    pub fn frontier_check(&self) -> FrontierCheck<'_> {
+        let n = self.store.len();
+        if oracle() {
+            return FrontierCheck::new(&self.store);
+        }
+        match self.fast_memo.get() {
+            Some((len, fast)) if len == n => FrontierCheck::with_fast(&self.store, fast),
+            _ => {
+                let c = FrontierCheck::new(&self.store);
+                self.fast_memo.set(Some((n, c.is_fast())));
+                c
+            }
+        }
+    }
+
+    fn invalidate(&self) {
+        *self.head_memo.borrow_mut() = None;
+        self.fast_memo.set(None);
+    }
+
+    /// Conflicts of the head: derived from the replayed replica (Issue #32),
+    /// equal to `evaluate(store).conflicts`.
+    pub fn conflicts(&self) -> BTreeSet<Conflict> {
+        if !oracle() {
+            if let Some(c) = self.replica.conflicts(&self.store) {
+                return c;
+            }
+        }
+        evaluate(self.store.values()).conflicts
+    }
+
+    /// State after appending `ops` (greater than every stored op), for
+    /// planning before the append: the replica's tail preview, else a full
+    /// `evaluate` (Issue #32).
+    fn state_with(&self, ops: &[Op]) -> State {
+        if !oracle() {
+            if let Some(st) = self.replica.state_with_tail(ops) {
+                return st;
+            }
+        }
+        evaluate(self.store.values().chain(ops.iter())).state
+    }
+
     /// Persist then apply an op (any author; used by tests and `mint`).
     pub fn append_op(&mut self, op: Op) -> Result<(), Error> {
         store::append_record(&self.dir.join("ops.log"), &store::encode_op(&op))?;
+        self.invalidate();
         self.store.insert(op.id, op.clone());
         self.replica.receive(op);
         Ok(())
@@ -283,6 +405,7 @@ impl Repo {
             }
             durable::crash_point(durable::OPS_FSYNCED);
         }
+        self.invalidate();
         for op in &done {
             self.store.insert(op.id, op.clone());
         }
@@ -294,13 +417,13 @@ impl Repo {
     /// Build (not persist) a local op over the current frontier with a
     /// Lamport counter.
     pub fn prepare(&self, payload: Payload) -> Op {
-        let deps: BTreeSet<_> = self.head().frontier(&self.store).into_iter().collect();
+        let deps: BTreeSet<_> = self.head_memo().frontier.into_iter().collect();
         self.prepare_on(deps, payload)
     }
 
     /// Build a local op over explicit `deps` (ops already in the store).
     pub fn prepare_on(&self, deps: BTreeSet<NodeId>, payload: Payload) -> Op {
-        let counter = 1 + self.store.keys().map(|o| o.counter).max().unwrap_or(1);
+        let counter = 1 + self.head_memo().max_counter.unwrap_or(1);
         Op {
             id: NodeId::new(counter, self.replica_id.0),
             deps,
@@ -329,21 +452,33 @@ impl Repo {
 
     /// Sorted frontier of the head.
     pub fn head_frontier(&self) -> Vec<NodeId> {
-        let mut f = self.head().frontier(&self.store);
+        let mut f = self.head_memo().frontier;
         f.sort();
         f
     }
 
     pub fn commit(&mut self, message: &str) -> Result<Checkpoint, Error> {
-        let c = Checkpoint::new(&self.store, &self.head(), message, self.replica_id, None);
+        let c = if oracle() {
+            Checkpoint::new(&self.store, &self.head(), message, self.replica_id, None)
+        } else {
+            Checkpoint::from_canonical(self.head_frontier(), message, self.replica_id, None)
+        };
         store::append_record(&self.dir.join("checkpoints.log"), &store::encode_ckpt(&c))?;
         self.checkpoints.add(c.clone());
         Ok(c)
     }
 
+    /// Short-id index: built only by commands that print or resolve a
+    /// version id. Head is inserted by its memoized frontier.
     pub fn index(&self) -> VersionIndex {
+        #[cfg(test)]
+        if oracle() {
+            let mut ix = VersionIndex::new_single_map(&self.store, &self.checkpoints);
+            ix.insert(&self.store, &self.head());
+            return ix;
+        }
         let mut ix = VersionIndex::with_checkpoints(&self.store, &self.checkpoints);
-        ix.insert(&self.store, &self.head());
+        ix.insert_frontier(self.head_frontier());
         ix
     }
 }
@@ -573,13 +708,13 @@ fn mutate(
         return Err(not_at_head(repo, &idx));
     }
     let op = repo.prepare(payload);
-    let ev = evaluate(repo.store.values().chain(std::iter::once(&op)));
-    let proj = project(&ev.state);
+    let state = repo.state_with(std::slice::from_ref(&op));
+    let proj = project(&state);
     let mut ws = Vec::new();
     let (w, ignored) = wd::scan_all(&root, &idx, &mut ws)?;
     let plan = wd::plan(
         &Target {
-            state: &ev.state,
+            state: &state,
             proj: &proj,
             frontier: vec![op.id],
         },
@@ -781,18 +916,32 @@ pub(crate) fn record(
         };
         mid.entries.insert(p.clone(), (node, e));
     }
-    let ev = evaluate(repo.store.values().chain(ops.iter()));
-    let proj = project(&ev.state);
-    let mut all = repo.store.clone();
-    for o in &ops {
-        all.insert(o.id, o.clone());
-    }
-    let frontier = Version::from_ops(&all, all.keys().copied().collect())
-        .expect("store is closed")
-        .frontier(&all);
+    let state = repo.state_with(&ops);
+    let proj = project(&state);
+    let frontier = if oracle() {
+        let mut all = repo.store.clone();
+        for o in &ops {
+            all.insert(o.id, o.clone());
+        }
+        Version::from_ops(&all, all.keys().copied().collect())
+            .expect("store is closed")
+            .frontier(&all)
+    } else {
+        // F(store ∪ ops) = (F(store) ∪ ids(ops)) − deps(ops): the store's
+        // own deps are already absent from its frontier (Issue #32, no
+        // store clone).
+        let deps: BTreeSet<NodeId> = ops.iter().flat_map(|o| o.deps.iter().copied()).collect();
+        let f: BTreeSet<NodeId> = repo
+            .head_frontier()
+            .into_iter()
+            .chain(ops.iter().map(|o| o.id))
+            .filter(|i| !deps.contains(i))
+            .collect();
+        f.into_iter().collect()
+    };
     let plan = wd::plan(
         &Target {
-            state: &ev.state,
+            state: &state,
             proj: &proj,
             frontier,
         },
@@ -1105,8 +1254,7 @@ pub fn run(
         }
         ["status"] | ["status", "--ignored"] => {
             let ix = repo.index();
-            let head = repo.head();
-            let hid = hub_core::checkpoint::version_id(&repo.store, &head);
+            let hid = VersionId::of_frontier(&repo.head_frontier());
             writeln!(
                 out,
                 "head {} ({} ops, {} checkpoints, {} published)",
@@ -1115,8 +1263,7 @@ pub fn run(
                 repo.checkpoints.len(),
                 sync::read_published(&repo)?.len()
             )?;
-            let ev = evaluate(repo.store.values());
-            let cs = render_conflicts(&proj, &ev.conflicts);
+            let cs = render_conflicts(&proj, &repo.conflicts());
             if cs.is_empty() {
                 writeln!(out, "conflicts: none")?;
             } else {
@@ -1327,10 +1474,21 @@ pub fn run(
         ["show", id] | ["show", "-l", id] => {
             let long = a.len() == 3;
             let ix = repo.index();
-            let v = resolve(&repo, &ix, id)?;
-            let ev = evaluate(v.resolve(&repo.store));
-            let p = project(&ev.state);
-            let vid = hub_core::checkpoint::version_id(&repo.store, &v);
+            // Issue #32: head is shown from the replayed state (no
+            // down-closure, no evaluate); indexed frontiers are canonical,
+            // so the resolved key is the version id.
+            let (vid, f) = match ix.resolve(id) {
+                Ok((vid, f)) if !oracle() && f == repo.head_frontier().as_slice() => (vid, None),
+                _ => {
+                    let v = resolve(&repo, &ix, id)?;
+                    (hub_core::checkpoint::version_id(&repo.store, &v), Some(v))
+                }
+            };
+            let st = match &f {
+                None => repo.state().clone(),
+                Some(v) => evaluate(v.resolve(&repo.store)).state,
+            };
+            let p = project(&st);
             writeln!(out, "version {}", vid.hex())?;
             let msgs: BTreeMap<_, Vec<&str>> =
                 repo.checkpoints.iter().fold(BTreeMap::new(), |mut m, c| {
@@ -1341,9 +1499,9 @@ pub fn run(
                 writeln!(out, "    {m}")?;
             }
             let lines = if long {
-                render_long(&ev.state, &p)
+                render_long(&st, &p)
             } else {
-                render_tree(&ev.state, &p, hub_core::tree::ROOT)
+                render_tree(&st, &p, hub_core::tree::ROOT)
             };
             for l in lines {
                 writeln!(out, "{l}")?;
@@ -1475,6 +1633,270 @@ mod lazy_ckpt_tests {
             if unknown && nck > 0 {
                 prop_assert!(lazy[0].as_ref().is_err_and(|e| e.contains("checkpoint frontier not in op log")), "{:?}", lazy[0]);
             }
+        }
+    }
+}
+
+/// Issue #32: every command's output (stdout, stderr, result) and the
+/// resulting logs and working tree are byte-identical between the new paths
+/// and the pre-#32 oracle paths ([`ORACLE`]), over random repositories: two
+/// copies of one repo (same replica id) receive the same working-directory
+/// edits, commands and foreign concurrent ops (moves, deletes, content
+/// edits, so conflicts of several kinds and a head the working directory is
+/// behind), one copy run with the oracle on.
+#[cfg(test)]
+mod perf32_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn copy_dir(a: &Path, b: &Path) {
+        fs::create_dir_all(b).unwrap();
+        for e in fs::read_dir(a).unwrap() {
+            let e = e.unwrap();
+            let t = b.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_dir(&e.path(), &t);
+            } else {
+                fs::copy(e.path(), &t).unwrap();
+            }
+        }
+    }
+
+    /// Working tree (minus `.hub/`) plus the logs, as comparable text.
+    fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(base: &Path, d: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            let mut es: Vec<_> = fs::read_dir(d).unwrap().map(|e| e.unwrap()).collect();
+            es.sort_by_key(|e| e.file_name());
+            for e in es {
+                let p = e.path();
+                let rel = p.strip_prefix(base).unwrap().to_string_lossy().to_string();
+                if rel == HUB_DIR {
+                    continue;
+                }
+                if e.file_type().unwrap().is_dir() {
+                    out.insert(format!("{rel}/"), Vec::new());
+                    walk(base, &p, out);
+                } else {
+                    out.insert(rel, fs::read(&p).unwrap());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        for f in ["ops.log", "checkpoints.log", "published.log", "pinned"] {
+            if let Ok(b) = fs::read(root.join(HUB_DIR).join(f)) {
+                out.insert(format!(".hub/{f}"), b);
+            }
+        }
+        out
+    }
+
+    fn run1(root: &Path, args: &[String], oracle_on: bool) -> (Result<(), String>, String, String) {
+        ORACLE.with(|o| o.set(oracle_on));
+        let (mut o, mut w) = (Vec::new(), Vec::new());
+        let r = run(args, root, &mut o, &mut w).map_err(|e| e.0);
+        ORACLE.with(|o| o.set(false));
+        (
+            r,
+            String::from_utf8(o).unwrap(),
+            String::from_utf8(w).unwrap(),
+        )
+    }
+
+    /// Run `args` in both copies (new in `a`, oracle in `b`) and compare.
+    fn both(a: &Path, b: &Path, args: &[&str]) -> Result<String, TestCaseError> {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let x = run1(a, &args, false);
+        let y = run1(b, &args, true);
+        prop_assert_eq!(&x, &y, "hub {:?}", args);
+        prop_assert_eq!(snapshot(a), snapshot(b), "after hub {:?}", args);
+        Ok(x.1)
+    }
+
+    /// The same foreign op appended to both copies.
+    fn foreign(a: &Path, b: &Path, rnd: &mut dyn FnMut(usize) -> usize, k: usize) {
+        let r = Repo::open_dir(a.join(HUB_DIR)).unwrap();
+        let st = r.state().clone();
+        let nodes: Vec<NodeId> = project(&st)
+            .entries
+            .values()
+            .copied()
+            .filter(|n| *n != ROOT)
+            .collect();
+        let files: Vec<NodeId> = nodes
+            .iter()
+            .copied()
+            .filter(|n| st[n].kind == Kind::File)
+            .collect();
+        let ids: Vec<NodeId> = r.store.keys().copied().collect();
+        let counter = 1 + ids.iter().map(|i| i.counter).max().unwrap_or(1);
+        let mut deps = BTreeSet::new();
+        if !ids.is_empty() && rnd(3) != 0 {
+            deps.insert(ids[rnd(ids.len())]);
+        }
+        let payload = match rnd(4) {
+            0 if !files.is_empty() => {
+                let bytes = format!("foreign {k}\n");
+                for d in [a, b] {
+                    blobs::Blobs::open(&d.join(HUB_DIR))
+                        .unwrap()
+                        .put(bytes.as_bytes())
+                        .unwrap();
+                }
+                Payload::SetContent {
+                    node: files[rnd(files.len())],
+                    blob: BlobId::of(bytes.as_bytes()),
+                }
+            }
+            1 if !nodes.is_empty() => Payload::Move {
+                node: nodes[rnd(nodes.len())],
+                new_parent: ROOT,
+                new_name: format!("mv{}", rnd(3)),
+            },
+            2 if !nodes.is_empty() => Payload::Delete {
+                node: nodes[rnd(nodes.len())],
+            },
+            _ => Payload::Create {
+                kind: Kind::Directory,
+                parent: ROOT,
+                name: format!("fd{}", rnd(3)),
+            },
+        };
+        // Foreign ops must depend on the nodes they touch (causal delivery).
+        if let Payload::SetContent { node, .. }
+        | Payload::Move { node, .. }
+        | Payload::Delete { node } = &payload
+        {
+            if r.store.contains_key(node) {
+                deps.insert(*node);
+            }
+        }
+        drop(r);
+        let op = Op {
+            id: NodeId::new(counter, 0xf00d),
+            deps,
+            payload,
+        };
+        for d in [a, b] {
+            let mut r = Repo::open_dir(d.join(HUB_DIR)).unwrap();
+            r.append_op(op.clone()).unwrap();
+        }
+    }
+
+    fn short_ids(log: &str, status: &str) -> Vec<String> {
+        let mut v: Vec<String> = log
+            .lines()
+            .filter_map(|l| l.split(' ').next().map(str::to_string))
+            .collect();
+        if let Some(h) = status.lines().next().and_then(|l| l.split(' ').nth(1)) {
+            v.push(h.to_string());
+        }
+        v.push("zzzz".into());
+        v.push("0000".into());
+        v
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+        #[test]
+        fn cli_output_equals_pre32_oracle(seed in any::<u64>(), nsteps in 1usize..8) {
+            let mut s = seed | 1;
+            let mut rnd = move |n: usize| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s % n.max(1) as u64) as usize
+            };
+            let base = std::env::temp_dir().join(format!("hub-p32-{}-{seed:x}-{nsteps}", std::process::id()));
+            let _ = fs::remove_dir_all(&base);
+            let (a, b) = (base.join("a"), base.join("b"));
+            fs::create_dir_all(&a).unwrap();
+            drop(Repo::init(&a).unwrap());
+            copy_dir(&a, &b);
+            for step in 0..nsteps {
+                match rnd(8) {
+                    0..=2 => {
+                        // Working-directory edits in `a`, mirrored onto
+                        // `b`, then record (-m sometimes).
+                        fs::create_dir_all(a.join("d")).unwrap();
+                        for _ in 0..1 + rnd(3) {
+                            let dir = if rnd(3) == 0 { "d/" } else { "" };
+                            let p = a.join(format!("{dir}f{}", rnd(4)));
+                            if rnd(5) == 0 {
+                                let _ = fs::remove_file(&p);
+                            } else {
+                                fs::write(&p, format!("v{}\n", rnd(5))).unwrap();
+                            }
+                        }
+                        for e in fs::read_dir(&b).unwrap() {
+                            let e = e.unwrap();
+                            if e.file_name() == HUB_DIR {
+                                continue;
+                            }
+                            if e.file_type().unwrap().is_dir() {
+                                fs::remove_dir_all(e.path()).unwrap();
+                            } else {
+                                fs::remove_file(e.path()).unwrap();
+                            }
+                        }
+                        for e in fs::read_dir(&a).unwrap() {
+                            let e = e.unwrap();
+                            if e.file_name() == HUB_DIR {
+                                continue;
+                            }
+                            let t = b.join(e.file_name());
+                            if e.file_type().unwrap().is_dir() {
+                                copy_dir(&e.path(), &t);
+                            } else {
+                                fs::copy(e.path(), &t).unwrap();
+                            }
+                        }
+                        if rnd(2) == 0 {
+                            both(&a, &b, &["record", "-m", &format!("m{step}")])?;
+                        } else {
+                            both(&a, &b, &["record"])?;
+                        }
+                    }
+                    3 => foreign(&a, &b, &mut rnd, step),
+                    4 => {
+                        let log = both(&a, &b, &["log"])?;
+                        let st = both(&a, &b, &["status"])?;
+                        let ids = short_ids(&log, &st);
+                        let id = ids[rnd(ids.len())].clone();
+                        both(&a, &b, &["checkout", &id])?;
+                    }
+                    5 => {
+                        both(&a, &b, &["checkout"])?;
+                    }
+                    6 => {
+                        let p = format!("t{}", rnd(3));
+                        let cmd = ["mkdir", "touch", "rm", "mv"][rnd(4)];
+                        if cmd == "mv" {
+                            both(&a, &b, &["mv", &p, &format!("t{}", rnd(3) + 3)])?;
+                        } else {
+                            both(&a, &b, &[cmd, &p])?;
+                        }
+                    }
+                    _ => {
+                        both(&a, &b, &["commit", "-m", &format!("c{step}")])?;
+                        if rnd(2) == 0 {
+                            both(&a, &b, &["publish", &format!("c{step}")])?;
+                        }
+                    }
+                }
+                let log = both(&a, &b, &["log"])?;
+                let st = both(&a, &b, &["status"])?;
+                both(&a, &b, &["status", "--ignored"])?;
+                both(&a, &b, &["ls"])?;
+                both(&a, &b, &["ls", "-l"])?;
+                both(&a, &b, &["warnings"])?;
+                for id in short_ids(&log, &st) {
+                    both(&a, &b, &["show", &id])?;
+                    both(&a, &b, &["show", "-l", &id])?;
+                }
+            }
+            let _ = fs::remove_dir_all(&base);
         }
     }
 }

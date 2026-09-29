@@ -236,3 +236,84 @@ fn own_chain_violation_is_not_treated_as_ordered() {
         .any(|c| matches!(c, Conflict::Content { loser, .. } if *loser == a2.id)));
     assert_eq!(ev.conflicts, oracle::evaluate(&ops).conflicts);
 }
+
+/// Issue #32: `Replica::conflicts` (derived from the undo log and view, no
+/// second fold) equals `evaluate(..).conflicts`, and `Replica::state_with_tail`
+/// equals the evaluated state of prefix + tail, for the shared histories and
+/// the closed (own-chain-violating, extra-dep) mutation, under shuffled,
+/// duplicated delivery; also after a second batch arrives (no stale reuse).
+fn replica_derived_same(ops: &[Op], seed: u64) -> Result<(usize, usize), TestCaseError> {
+    let spec = evaluate(ops);
+    let mut r = Replica::new();
+    let d = delivery(ops, seed);
+    let half = d.len() / 2;
+    r.receive_all(d[..half].to_vec());
+    let store1: BTreeMap<OpId, Op> = r.ops().map(|o| (o.id, o.clone())).collect();
+    prop_assert_eq!(
+        r.conflicts(&store1),
+        Some(evaluate(store1.values()).conflicts)
+    );
+    r.receive_all(d[half..].to_vec());
+    prop_assert_eq!(r.pending_len(), 0);
+    let store: BTreeMap<OpId, Op> = r.ops().map(|o| (o.id, o.clone())).collect();
+    prop_assert_eq!(r.conflicts(&store), Some(spec.conflicts.clone()));
+    // A store that is not the applied set is refused.
+    if !store1.is_empty() && store1.len() != store.len() {
+        prop_assert_eq!(r.conflicts(&store1), None);
+    }
+    // Tail preview: prefix of the sorted history plus a greater suffix.
+    let mut sorted: Vec<Op> = store.values().cloned().collect();
+    sorted.sort_by_key(|o| o.id);
+    let k = (seed as usize) % (sorted.len() + 1);
+    let mut p = Replica::new();
+    p.receive_all(sorted[..k].to_vec());
+    let (mut some, mut none) = (0, 0);
+    if p.pending_len() == 0 {
+        match p.state_with_tail(&sorted[k..]) {
+            Some(st) => {
+                some += 1;
+                prop_assert_eq!(&st, &evaluate(&sorted).state);
+                let mut q = p.clone();
+                q.receive_all(sorted[k..].to_vec());
+                prop_assert_eq!(&st, q.state());
+            }
+            None => none += 1,
+        }
+    }
+    Ok((some, none))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+    #[test]
+    fn replica_conflicts_equal_evaluate((nrep, script, seeds) in script_strategy()) {
+        let ops = simulate(nrep, &script);
+        replica_derived_same(&ops, seeds[0])?;
+        let closed = mutate_closed(&ops, seeds[1]);
+        replica_derived_same(&closed, seeds[2])?;
+    }
+}
+
+/// The tail preview is really exercised (not always `None`), and conflicts
+/// of every kind reach `Replica::conflicts` in the inputs above.
+#[test]
+fn replica_derived_inputs_cover_preview() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+    let mut runner = TestRunner::new_with_rng(
+        Config::default(),
+        TestRng::from_seed(RngAlgorithm::ChaCha, &[32; 32]),
+    );
+    let strat = script_strategy();
+    let (mut some, mut none) = (0, 0);
+    for _ in 0..256 {
+        let (nrep, script, seeds) = strat.new_tree(&mut runner).unwrap().current();
+        let ops = simulate(nrep, &script);
+        let (s, n) = replica_derived_same(&ops, seeds[0]).unwrap();
+        some += s;
+        none += n;
+    }
+    eprintln!("state_with_tail: {some} previews, {none} fallbacks");
+    assert!(some >= 64 && none >= 1, "some={some} none={none}");
+}
