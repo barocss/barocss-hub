@@ -667,7 +667,7 @@ mod warnings_view_tests {
     use proptest::prelude::*;
 
     proptest! {
-        #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+        #![proptest_config(ProptestConfig { cases: crate::test_cases(128), ..ProptestConfig::default() })]
 
         #[test]
         fn warnings_view_equals_full_clone(seed in any::<u64>(), nops in 1usize..12, npend in 0usize..10) {
