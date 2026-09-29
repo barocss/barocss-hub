@@ -37,6 +37,10 @@ impl std::fmt::Debug for BlobId {
 #[derive(Clone, Debug, Default)]
 pub struct BlobStore {
     blobs: BTreeMap<BlobId, Vec<u8>>,
+    /// Issue #34: ids known to be held (for example on disk) whose bytes
+    /// are not loaded. [`BlobStore::contains`] is true for them,
+    /// [`BlobStore::get`] is `None`.
+    held: BTreeSet<BlobId>,
 }
 
 impl BlobStore {
@@ -55,7 +59,18 @@ impl BlobStore {
         self.blobs.get(id).map(|v| v.as_slice())
     }
     pub fn contains(&self, id: &BlobId) -> bool {
-        self.blobs.contains_key(id)
+        self.blobs.contains_key(id) || self.held.contains(id)
+    }
+    /// Record that `id` is held elsewhere without loading its bytes
+    /// (Issue #34: a sync never reads blobs it does not send).
+    pub fn mark_held(&mut self, id: BlobId) {
+        if !self.blobs.contains_key(&id) {
+            self.held.insert(id);
+        }
+    }
+    /// Ids whose bytes are loaded (excludes [`BlobStore::mark_held`] ids).
+    pub fn loaded(&self) -> impl Iterator<Item = (&BlobId, &[u8])> {
+        self.blobs.iter().map(|(k, v)| (k, v.as_slice()))
     }
     pub fn len(&self) -> usize {
         self.blobs.len()
