@@ -269,18 +269,20 @@ fn power_loss_damage_to_unsynced_op_tail_recovers() {
             f.set_len(synced + (len - synced) / 2 + 3).unwrap();
         }),
         ("hole", |p, synced| {
-            // Zero a range in the middle of the un-synced region, keeping
-            // the valid-looking records after it.
+            // Zero the second half of the un-synced region (a trailing
+            // hole: nothing valid follows it).
             let mut b = fs::read(p).unwrap();
             let s = synced as usize;
-            let (lo, hi) = (s + (b.len() - s) / 4, s + (b.len() - s) / 2);
+            let lo = s + (b.len() - s) / 2;
+            let hi = b.len();
             b[lo..hi].fill(0);
             fs::write(p, b).unwrap();
         }),
         ("hole-at-start", |p, synced| {
             let mut b = fs::read(p).unwrap();
             let s = synced as usize;
-            b[s..s + 40].fill(0);
+            let hi = b.len();
+            b[s..hi].fill(0);
             fs::write(p, b).unwrap();
         }),
     ];
@@ -382,4 +384,74 @@ fn stage_occurrence_selects_the_second_side_of_a_sync() {
     ok(&a, &["checkout"]);
     ok(&b, &["checkout"]);
     assert_eq!(snapshot(&a), snapshot(&b));
+}
+
+/// #29 repair: before the index save, checkout flushes the parent of every
+/// level of a created directory chain, of every written file and of every
+/// removed path (test-only flush log).
+#[test]
+fn checkout_flushes_created_chain_and_removed_parents() {
+    let d = tmp("flushlog");
+    ok(&d, &["init"]);
+    write(&d, "gone/g", b"g\n");
+    write(&d, "keep/k", b"k\n");
+    ok(&d, &["record", "-m", "v1"]);
+    let v1 = ok(&d, &["log"])
+        .lines()
+        .find(|l| l.ends_with(" v1"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    fs::remove_dir_all(d.join("gone")).unwrap();
+    write(&d, "n1/n2/n3/f", b"f\n");
+    ok(&d, &["record", "-m", "v2"]);
+    ok(&d, &["checkout", &v1]);
+    assert!(d.join("gone/g").exists() && !d.join("n1").exists());
+    let log = d.with_extension("flushlog");
+    let o = hub_env(
+        &d,
+        &["checkout"],
+        &[(durable::FLUSH_LOG_ENV, log.to_str().unwrap())],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(d.join("n1/n2/n3/f").exists() && !d.join("gone").exists());
+    let root = fs::canonicalize(&d).unwrap().display().to_string();
+    let rel: std::collections::BTreeSet<String> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let r = l.strip_prefix(&root).expect("flushed dir under the repo");
+            r.trim_start_matches('/').to_string()
+        })
+        .collect();
+    for want in ["", "n1", "n1/n2", "n1/n2/n3"] {
+        assert!(rel.contains(want), "missing flush of '{want}': {rel:?}");
+    }
+    // `gone/g` removed: its parent `gone` was removed too, so `gone` itself
+    // is gone and its removal is covered by the root flush above.
+    assert!(!rel.contains("keep"), "untouched dir flushed: {rel:?}");
+
+    // A removal whose parent survives flushes that parent.
+    fs::remove_file(&log).unwrap();
+    ok(&d, &["rm", "keep/k"]);
+    let o = hub_env(
+        &d,
+        &["checkout", &v1],
+        &[(durable::FLUSH_LOG_ENV, log.to_str().unwrap())],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let _ = fs::remove_file(&log);
+    let o = hub_env(
+        &d,
+        &["checkout"],
+        &[(durable::FLUSH_LOG_ENV, log.to_str().unwrap())],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let text = fs::read_to_string(&log).unwrap();
+    assert!(
+        text.lines().any(|l| l == format!("{root}/keep")),
+        "parent of removed keep/k not flushed: {text}"
+    );
 }

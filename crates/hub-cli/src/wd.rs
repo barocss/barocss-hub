@@ -1073,9 +1073,38 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
     for path in &p.make_dirs {
         fs::create_dir_all(root.join(path))?;
     }
+    // #29 repair: every directory whose entries this apply changes. A
+    // removed path changes its parent; a created directory changes the
+    // parent of every level of its chain (create_dir_all may create them
+    // all); a written file changes its parent. Flushed before the index.
+    let mut dirty: BTreeSet<PathBuf> = BTreeSet::new();
+    let parent_of = |rel: &str| -> PathBuf {
+        match rel.rsplit_once('/') {
+            Some((d, _)) => root.join(d),
+            None => root.to_path_buf(),
+        }
+    };
+    for rel in p
+        .force_remove
+        .iter()
+        .chain(&p.remove_files)
+        .chain(&p.remove_dirs)
+    {
+        dirty.insert(parent_of(rel));
+    }
+    for rel in &p.make_dirs {
+        for (i, _) in rel.match_indices('/') {
+            dirty.insert(parent_of(&rel[..i]));
+        }
+        dirty.insert(parent_of(rel));
+    }
+    for (rel, _) in &p.write_files {
+        dirty.insert(parent_of(rel));
+    }
     // Group commit (Issue #29, Appendix A.1): write and flush every temp,
     // one barrier, rename each over its target, flush the renamed entries'
-    // directories, one more barrier; all before the index save. A rename
+    // directories (and every other directory this apply changed), one more
+    // barrier; all before the index save. A rename
     // therefore never exposes un-barriered data, and until the index is
     // saved the marker guards everything.
     if !p.write_files.is_empty() {
@@ -1101,7 +1130,6 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
             durable::barrier(&f)?;
         }
         durable::crash_point(durable::FILES_BARRIERED);
-        let mut parents: BTreeSet<PathBuf> = BTreeSet::new();
         for (i, (path, _)) in p.write_files.iter().enumerate() {
             let target = root.join(path);
             if let Err(e) = fs::rename(&temps[i], &target) {
@@ -1113,13 +1141,19 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
             if crash {
                 std::process::abort();
             }
-            if let Some(d) = target.parent() {
-                parents.insert(d.to_path_buf());
-            }
         }
         durable::crash_point(durable::FILES_RENAMED);
-        for d in &parents {
-            durable::flush(&fs::File::open(d)?)?;
+    }
+    if !dirty.is_empty() {
+        use crate::durable;
+        // Deepest first; a directory removed later in the plan (gone now)
+        // is covered by its own parent's flush.
+        for d in dirty.iter().rev() {
+            match fs::File::open(d) {
+                Ok(f) => durable::flush_dir(d, &f)?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         durable::barrier(&fs::File::open(&tmp_dir)?)?;
     }

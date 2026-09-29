@@ -87,6 +87,26 @@ pub fn flush(f: &File) -> io::Result<()> {
     }
 }
 
+/// Test-only: when set, [`flush_dir`] appends each flushed directory path
+/// (one per line) to this file.
+#[doc(hidden)]
+pub const FLUSH_LOG_ENV: &str = "HUB_TEST_FLUSH_LOG";
+
+/// [`flush`] a directory (its entries). On Linux this is a real `fsync` of
+/// the directory; on macOS a plain fsync, made durable by the following
+/// [`barrier`].
+pub fn flush_dir(path: &std::path::Path, f: &File) -> io::Result<()> {
+    if let Some(log) = std::env::var_os(FLUSH_LOG_ENV) {
+        use std::io::Write;
+        let mut l = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)?;
+        writeln!(l, "{}", path.display())?;
+    }
+    flush(f)
+}
+
 /// Make everything flushed on `f`'s volume durable (see module docs).
 /// std's `sync_all` is `F_FULLFSYNC` on Apple targets and `fsync` elsewhere.
 pub fn barrier(f: &File) -> io::Result<()> {
