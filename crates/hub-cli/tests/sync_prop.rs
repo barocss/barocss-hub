@@ -239,7 +239,7 @@ fn random_sessions_and_syncs_converge() {
             failure_persistence: None,
             ..ProptestConfig::default()
         },
-        TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+        rng_from(&|k| std::env::var(k).ok()),
     );
     runner
         .run(&case(), |(n, steps)| one_case(n, &steps))
@@ -253,7 +253,77 @@ fn random_sessions_and_syncs_converge() {
          {si}/{s} syncs interrupted",
         100.0 * ci as f64 / c as f64
     );
-    assert!(ci * 5 >= c, "interrupted cases {ci}/{c} below 20%");
+    if seed_override(&|k| std::env::var(k).ok()).is_none() {
+        assert!(ci * 5 >= c, "interrupted cases {ci}/{c} below 20%");
+    } else if ci * 5 < c {
+        eprintln!(
+            "warning: interrupted cases {ci}/{c} below 20% (seed override; floor not enforced)"
+        );
+    }
+}
+
+/// Issue #30: seed override for exploration. The pinned deterministic
+/// ChaCha seed stays the default. `HUB_PROPTEST_SEED=<u64>` takes
+/// precedence over `PROPTEST_RNG_SEED=<u64>` (proptest's own variable name,
+/// which `TestRunner::new_with_rng` otherwise ignores). Returns the chosen
+/// (variable, seed), or None for the pinned default. A value that is not a
+/// u64 panics rather than silently falling back to the default.
+fn seed_override(get: &dyn Fn(&str) -> Option<String>) -> Option<(&'static str, u64)> {
+    ["HUB_PROPTEST_SEED", "PROPTEST_RNG_SEED"]
+        .into_iter()
+        .find_map(|k| {
+            get(k).map(|v| {
+                let n = v
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or_else(|_| panic!("{k}={v:?} is not a u64 seed"));
+                (k, n)
+            })
+        })
+}
+
+fn rng_from(get: &dyn Fn(&str) -> Option<String>) -> TestRng {
+    match seed_override(get) {
+        None => TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+        Some((k, n)) => {
+            eprintln!("sync_prop: seed override {k}={n}");
+            let mut seed = [0u8; 32];
+            seed[..8].copy_from_slice(&n.to_le_bytes());
+            TestRng::from_seed(RngAlgorithm::ChaCha, &seed)
+        }
+    }
+}
+
+#[test]
+fn seed_override_is_honored() {
+    use proptest::prelude::RngCore;
+    let env = |pairs: &'static [(&'static str, &'static str)]| {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    };
+    let draw = |mut r: TestRng| (r.next_u64(), r.next_u64());
+    let none = env(&[]);
+    assert_eq!(seed_override(&none), None);
+    let pinned = draw(rng_from(&none));
+    assert_eq!(
+        pinned,
+        draw(TestRng::deterministic_rng(RngAlgorithm::ChaCha))
+    );
+    let a = env(&[("PROPTEST_RNG_SEED", "7")]);
+    assert_eq!(seed_override(&a), Some(("PROPTEST_RNG_SEED", 7)));
+    assert_ne!(draw(rng_from(&a)), pinned);
+    assert_eq!(
+        draw(rng_from(&a)),
+        draw(rng_from(&a)),
+        "deterministic per seed"
+    );
+    let both = env(&[("PROPTEST_RNG_SEED", "7"), ("HUB_PROPTEST_SEED", "9")]);
+    assert_eq!(seed_override(&both), Some(("HUB_PROPTEST_SEED", 9)));
+    assert_ne!(draw(rng_from(&both)), draw(rng_from(&a)));
 }
 
 /// Issue #26: the shrunk seed from the #24 Review. Deleting the collision
