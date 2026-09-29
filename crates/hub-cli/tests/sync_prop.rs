@@ -263,23 +263,22 @@ fn random_sessions_and_syncs_converge() {
 }
 
 /// Issue #30: seed override for exploration. The pinned deterministic
-/// ChaCha seed stays the default. `HUB_PROPTEST_SEED=<u64>` takes
-/// precedence over `PROPTEST_RNG_SEED=<u64>` (proptest's own variable name,
-/// which `TestRunner::new_with_rng` otherwise ignores). Returns the chosen
+/// ChaCha seed stays the default. Only `HUB_PROPTEST_SEED=<u64>` is
+/// honoured (Issue #31): `PROPTEST_RNG_SEED` is proptest's global variable,
+/// and exporting it for another test must not silently switch this test to
+/// an override (which disables the 20% floor). Returns the chosen
 /// (variable, seed), or None for the pinned default. A value that is not a
 /// u64 panics rather than silently falling back to the default.
 fn seed_override(get: &dyn Fn(&str) -> Option<String>) -> Option<(&'static str, u64)> {
-    ["HUB_PROPTEST_SEED", "PROPTEST_RNG_SEED"]
-        .into_iter()
-        .find_map(|k| {
-            get(k).map(|v| {
-                let n = v
-                    .trim()
-                    .parse::<u64>()
-                    .unwrap_or_else(|_| panic!("{k}={v:?} is not a u64 seed"));
-                (k, n)
-            })
+    ["HUB_PROPTEST_SEED"].into_iter().find_map(|k| {
+        get(k).map(|v| {
+            let n = v
+                .trim()
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("{k}={v:?} is not a u64 seed"));
+            (k, n)
         })
+    })
 }
 
 fn rng_from(get: &dyn Fn(&str) -> Option<String>) -> TestRng {
@@ -313,8 +312,12 @@ fn seed_override_is_honored() {
         pinned,
         draw(TestRng::deterministic_rng(RngAlgorithm::ChaCha))
     );
-    let a = env(&[("PROPTEST_RNG_SEED", "7")]);
-    assert_eq!(seed_override(&a), Some(("PROPTEST_RNG_SEED", 7)));
+    // proptest's global variable is ignored: still the pinned default.
+    let global = env(&[("PROPTEST_RNG_SEED", "7")]);
+    assert_eq!(seed_override(&global), None);
+    assert_eq!(draw(rng_from(&global)), pinned);
+    let a = env(&[("HUB_PROPTEST_SEED", "7")]);
+    assert_eq!(seed_override(&a), Some(("HUB_PROPTEST_SEED", 7)));
     assert_ne!(draw(rng_from(&a)), pinned);
     assert_eq!(
         draw(rng_from(&a)),
@@ -322,6 +325,7 @@ fn seed_override_is_honored() {
         "deterministic per seed"
     );
     let both = env(&[("PROPTEST_RNG_SEED", "7"), ("HUB_PROPTEST_SEED", "9")]);
+    // Only HUB_PROPTEST_SEED counts when both are set.
     assert_eq!(seed_override(&both), Some(("HUB_PROPTEST_SEED", 9)));
     assert_ne!(draw(rng_from(&both)), draw(rng_from(&a)));
 }

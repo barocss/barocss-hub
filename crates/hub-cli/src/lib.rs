@@ -11,7 +11,9 @@ pub mod sync;
 pub mod watch;
 pub mod wd;
 
-use hub_core::checkpoint::{Checkpoint, Checkpoints, ResolveError, VersionId, VersionIndex};
+use hub_core::checkpoint::{
+    Checkpoint, Checkpoints, FrontierCheck, ResolveError, VersionId, VersionIndex,
+};
 use hub_core::projection::{project, short_id, Projection};
 use hub_core::tree::{
     evaluate, is_ancestor_or_self, valid_name, BlobId, Conflict, Kind, NodeId, Op, Payload,
@@ -203,8 +205,9 @@ impl Repo {
             ));
         }
         let mut checkpoints = Checkpoints::new();
+        let check = FrontierCheck::new(&st);
         for (i, body) in cks.records.iter().enumerate() {
-            let c = store::decode_ckpt(body, &st).map_err(|why| StoreError::Corrupt {
+            let c = store::decode_ckpt(body, &check).map_err(|why| StoreError::Corrupt {
                 file: cp.clone(),
                 line: i + 2,
                 why,
@@ -1349,4 +1352,129 @@ pub fn run(
         _ => return Err(usage(a[0])),
     }
     Ok(())
+}
+
+/// Issue #31: the lazy checkpoint decode gives the same `hub` output as the
+/// pre-#31 eager oracle (`store::decode_ckpt_eager`, switched on with
+/// `store::EAGER`): open errors for invalid stored frontiers, `log`,
+/// `status`, `show` and resolution errors, over random multi-replica
+/// histories with random local and published checkpoints.
+#[cfg(test)]
+mod lazy_ckpt_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn run_all(root: &Path, ids: &[String], eager: bool) -> Vec<Result<String, String>> {
+        store::EAGER.with(|e| e.set(eager));
+        let mut cmds: Vec<Vec<String>> = vec![vec!["log".into()], vec!["status".into()]];
+        for id in ids {
+            cmds.push(vec!["show".into(), id.clone()]);
+        }
+        let out = cmds
+            .iter()
+            .map(|c| {
+                let (mut o, mut w) = (Vec::new(), Vec::new());
+                run(c, root, &mut o, &mut w)
+                    .map(|()| {
+                        String::from_utf8(o).unwrap() + "\n--\n" + &String::from_utf8(w).unwrap()
+                    })
+                    .map_err(|e| e.0)
+            })
+            .collect();
+        store::EAGER.with(|e| e.set(false));
+        out
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+        #[test]
+        fn cli_lazy_decode_equals_eager(
+            nops in 1usize..24,
+            seed in any::<u64>(),
+            nck in 0usize..6,
+        ) {
+            let mut s = seed | 1;
+            let mut rnd = move |n: usize| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s % n.max(1) as u64) as usize
+            };
+            let root = std::env::temp_dir().join(format!(
+                "hub-lazyck-{}-{seed:x}-{nops}-{nck}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            let mut repo = Repo::init(&root).unwrap();
+            // Lamport, closed, multi-replica history: counter = index + 2.
+            let mut ids: Vec<NodeId> = Vec::new();
+            for i in 0..nops {
+                let mut deps = BTreeSet::new();
+                for _ in 0..rnd(3) {
+                    if !ids.is_empty() {
+                        deps.insert(ids[rnd(ids.len())]);
+                    }
+                }
+                let id = NodeId::new(i as u64 + 2, 1 + rnd(3) as u128);
+                repo.append_op(Op {
+                    id,
+                    deps,
+                    payload: Payload::Create {
+                        kind: Kind::Directory,
+                        parent: hub_core::tree::ROOT,
+                        name: format!("d{i}"),
+                    },
+                })
+                .unwrap();
+                ids.push(id);
+            }
+            let unknown = rnd(4) == 0;
+            let mut shows = vec!["zzzz".to_string(), "0000".to_string()];
+            let mut published = Vec::new();
+            for k in 0..nck {
+                // Often non-antichain (comparable ids), sometimes empty.
+                let mut f: Vec<NodeId> = (0..rnd(4)).map(|_| ids[rnd(ids.len())]).collect();
+                if unknown && k == nck - 1 {
+                    f.push(NodeId::new(999, 0xbad));
+                }
+                f.sort();
+                f.dedup();
+                let body = format!(
+                    "K {:032x} {} {} -",
+                    rnd(3) + 1,
+                    if f.is_empty() {
+                        "-".to_string()
+                    } else {
+                        f.iter().map(|i| store::fmt_id(*i)).collect::<Vec<_>>().join(",")
+                    },
+                    store::esc(&format!("m{k}"))
+                );
+                store::append_record(&repo.dir.join("checkpoints.log"), &body).unwrap();
+                if let Ok(c) = store::decode_ckpt_eager(&body, &repo.store) {
+                    shows.push(c.id().hex()[..8].to_string());
+                    shows.push(c.id().hex()[..4].to_string());
+                }
+                if rnd(2) == 0 && !(unknown && k == nck - 1) {
+                    published.push(body);
+                }
+            }
+            if !published.is_empty() {
+                let p = repo.dir.join("published.log");
+                store::write_atomic(&p, format!("{}\n", sync::PUBLISHED_HEADER).as_bytes()).unwrap();
+                for b in &published {
+                    store::append_record(&p, b).unwrap();
+                }
+            }
+            drop(repo);
+            let lazy = run_all(&root, &shows, false);
+            let eager = run_all(&root, &shows, true);
+            let _ = fs::remove_dir_all(&root);
+            prop_assert_eq!(&lazy, &eager);
+            if unknown && nck > 0 {
+                prop_assert!(lazy[0].as_ref().is_err_and(|e| e.contains("checkpoint frontier not in op log")), "{:?}", lazy[0]);
+            }
+        }
+    }
 }

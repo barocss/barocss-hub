@@ -36,8 +36,9 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use hub_core::checkpoint::Checkpoint;
+use hub_core::checkpoint::{Checkpoint, FrontierCheck};
 use hub_core::tree::{BlobId, Kind, NodeId, Op, Payload, ReplicaId};
+#[cfg(test)]
 use hub_core::version::Store;
 
 pub const OPLOG_HEADER: &str = "barocss-hub/oplog/v0";
@@ -232,7 +233,35 @@ pub fn encode_ckpt(c: &Checkpoint) -> String {
     )
 }
 
-pub fn decode_ckpt(body: &str, store: &Store) -> Result<Checkpoint, String> {
+/// Decode one checkpoint record. Lazy (Issue #31): the frontier is
+/// validated with `check` (ids present, canonical), no down-closure.
+pub fn decode_ckpt(body: &str, check: &FrontierCheck<'_>) -> Result<Checkpoint, String> {
+    #[cfg(test)]
+    if EAGER.with(|e| e.get()) {
+        return decode_ckpt_eager(body, check.store());
+    }
+    let (ids, msg, author, note) = split_ckpt(body)?;
+    Checkpoint::from_frontier_checked(check, ids, msg, author, note)
+        .map_err(|e| format!("checkpoint frontier not in op log: {e:?}"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch: decode with the pre-#31 eager oracle.
+    pub static EAGER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only oracle: the pre-#31 eager decode (down-closure per record).
+#[cfg(test)]
+pub fn decode_ckpt_eager(body: &str, store: &Store) -> Result<Checkpoint, String> {
+    let (ids, msg, author, note) = split_ckpt(body)?;
+    Checkpoint::from_frontier_eager(store, ids, msg, author, note)
+        .map_err(|e| format!("checkpoint frontier not in op log: {e:?}"))
+}
+
+type CkptFields = (Vec<NodeId>, String, ReplicaId, Option<String>);
+
+fn split_ckpt(body: &str) -> Result<CkptFields, String> {
     let t: Vec<&str> = body.split(' ').collect();
     let ["K", author, frontier, msg, note] = t.as_slice() else {
         return Err("not a checkpoint record".into());
@@ -243,8 +272,7 @@ pub fn decode_ckpt(body: &str, store: &Store) -> Result<Checkpoint, String> {
     } else {
         Some(unesc(note)?)
     };
-    Checkpoint::from_frontier(store, parse_ids(frontier)?, unesc(msg)?, author, note)
-        .map_err(|e| format!("checkpoint frontier not in op log: {e:?}"))
+    Ok((parse_ids(frontier)?, unesc(msg)?, author, note))
 }
 
 /// Result of reading a log: record bodies plus whether a torn tail was cut.
