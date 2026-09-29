@@ -894,7 +894,11 @@ fn torn_direct_blob_writes_after_crash_recover() {
         let p = b
             .join(".hub/blobs")
             .join(hub_core::tree::BlobId::of(bytes.as_bytes()).hex());
-        assert_eq!(fs::read(p).unwrap(), bytes.as_bytes(), "record reused a torn blob");
+        assert_eq!(
+            fs::read(p).unwrap(),
+            bytes.as_bytes(),
+            "record reused a torn blob"
+        );
     }
     // The rerun re-fetches the 6 blobs that are still torn (an unreferenced
     // file is never counted as held) and converges.
