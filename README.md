@@ -27,6 +27,7 @@ default, so CI is reproducible. To explore other seeds, set a u64:
 
     HUB_PROPTEST_SEED=12345 cargo test -p hub-cli --test sync_prop
 
-`PROPTEST_RNG_SEED` is also accepted; `HUB_PROPTEST_SEED` takes precedence
-when both are set. Under an override the 20% interruption floor is reported
+Only `HUB_PROPTEST_SEED` is read. proptest's global `PROPTEST_RNG_SEED` is
+ignored by this test, so exporting it elsewhere never disables the floor
+below. Under an override the 20% interruption floor is reported
 but not enforced.
