@@ -137,7 +137,10 @@ pub fn pinned(hub: &Path) -> Result<Option<Vec<hub_core::tree::OpId>>, Error> {
     }
 }
 
-pub const PEERS_HEADER: &str = "barocss-hub/peers/v0";
+/// v1 peers header (Issue #33: always present, so v0 binaries refuse).
+pub const PEERS_HEADER: &str = "barocss-hub/peers/v1";
+/// v0 peers header, still read (a repository mid-migration).
+pub const PEERS_HEADER_V0: &str = "barocss-hub/peers/v0";
 pub const PID_FILE: &str = "watch.pid";
 pub const LOCK_FILE: &str = "watch.lock";
 
@@ -151,13 +154,13 @@ pub fn read_peers(hub: &Path) -> Result<Vec<PathBuf>, Error> {
         Err(e) => return Err(e.into()),
     };
     let mut lines = text.lines();
-    if lines.next() != Some(PEERS_HEADER) {
+    if !matches!(lines.next(), Some(PEERS_HEADER | PEERS_HEADER_V0)) {
         return err(format!("corrupt {}", p.display()));
     }
     Ok(lines.filter(|l| !l.is_empty()).map(PathBuf::from).collect())
 }
 
-fn write_peers(hub: &Path, peers: &[PathBuf]) -> Result<(), Error> {
+pub(crate) fn write_peers(hub: &Path, peers: &[PathBuf]) -> Result<(), Error> {
     let mut s = format!("{PEERS_HEADER}\n");
     for p in peers {
         s.push_str(&p.to_string_lossy());
@@ -374,11 +377,20 @@ pub fn parse_opts(args: &[&str]) -> Result<Opts, Error> {
 /// Returns whether ops were recorded.
 fn step(hub: &Path, out: &mut dyn Write, warn: &mut dyn Write) -> Result<bool, Error> {
     let mut repo = Repo::open_dir_with(hub.to_path_buf(), LockMode::Exclusive)?;
+    let r = step_in(&mut repo, out, warn);
+    // Issue #33: refresh `.hub/snapshot` when due.
+    if let Some(w) = repo.maybe_snapshot() {
+        writeln!(warn, "warning: {w}")?;
+    }
+    r
+}
+
+fn step_in(repo: &mut Repo, out: &mut dyn Write, warn: &mut dyn Write) -> Result<bool, Error> {
     for w in &repo.warnings {
         writeln!(warn, "warning: {w}")?;
     }
     if wd::interrupted(&repo.dir)?.is_some() {
-        crate::checkout(&mut repo, None, false, out, warn)?;
+        crate::checkout(repo, None, false, out, warn)?;
     }
     if let Some(p) = pinned(&repo.dir)? {
         let msg = format!(
@@ -394,14 +406,14 @@ fn step(hub: &Path, out: &mut dyn Write, warn: &mut dyn Write) -> Result<bool, E
         writeln!(out, "resumed: working directory back at head")?;
     }
     let mut quiet = Vec::new();
-    let recorded = crate::record(&mut repo, None, true, &mut quiet, warn)?;
+    let recorded = crate::record(repo, None, true, &mut quiet, warn)?;
     if recorded {
         out.write_all(&quiet)?;
         return Ok(true);
     }
     let idx = wd::Index::load(&repo.dir)?;
     if idx.base != repo.head_frontier() {
-        crate::checkout(&mut repo, None, false, out, warn)?;
+        crate::checkout(repo, None, false, out, warn)?;
     }
     Ok(false)
 }

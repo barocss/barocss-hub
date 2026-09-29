@@ -33,6 +33,26 @@ pub const BLOBS_RENAMED: &str = "blobs-renamed";
 pub const OPS_APPENDED: &str = "ops-appended";
 /// `ops.log` fsynced; later persist steps not done.
 pub const OPS_FSYNCED: &str = "ops-fsynced";
+/// Op lines and the batch commit record written, not yet fsynced (#33).
+pub const COMMIT_WRITTEN: &str = "commit-written";
+/// Snapshot temp written and flushed, no barrier/rename yet (#33).
+pub const SNAPSHOT_WRITTEN: &str = "snapshot-written";
+/// Snapshot renamed into place, `.hub/` not yet fsynced (#33).
+pub const SNAPSHOT_RENAMED: &str = "snapshot-renamed";
+/// Migration (#33, Appendix A.2.6): `ops.log.v1` written, not synced.
+pub const MIG_LOG_WRITTEN: &str = "mig-log-written";
+/// Migration: `ops.log.v1` durable, replica still v0.
+pub const MIG_LOG_SYNCED: &str = "mig-log-synced";
+/// Migration: `.replica.tmp` (v1) written and flushed, not renamed.
+pub const MIG_REPLICA_TMP: &str = "mig-replica-tmp";
+/// Migration: replica switched to v1 and `.hub/` synced (commit point).
+pub const MIG_SWITCHED: &str = "mig-switched";
+/// Migration: `ops.log.v1` renamed over `ops.log`.
+pub const MIG_LOG_RENAMED: &str = "mig-log-renamed";
+/// Migration: `peers` rewritten with the v1 header.
+pub const MIG_PEERS: &str = "mig-peers";
+/// Migration: `watch.lock` and `format` in place (before the snapshot).
+pub const MIG_FORMAT: &str = "mig-format";
 /// Checkout: working-file temps written and flushed, no barrier yet.
 pub const FILES_WRITTEN: &str = "files-written";
 /// Checkout: barrier over the temps done, none renamed yet.
