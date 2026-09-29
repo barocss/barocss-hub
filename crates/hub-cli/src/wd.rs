@@ -1163,14 +1163,24 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
     };
     for (path, (node, e, refresh)) in p.index {
         let e = match (e, refresh) {
-            (Entry::File { blob, .. }, true) => {
-                let md = fs::metadata(root.join(&path))?;
-                Entry::File {
+            (Entry::File { blob, .. }, true) => match fs::metadata(root.join(&path)) {
+                Ok(md) => Entry::File {
                     blob,
                     size: md.len(),
                     mtime: mtime_ns(&md),
-                }
-            }
+                },
+                // Removed by the user while we applied (e.g. under `hub
+                // watch`): keep the entry with unknown stat ("rehash"), so
+                // the next scan reports it deleted instead of this apply
+                // failing and leaving the marker, whose resume would
+                // resurrect the file (#29 repair).
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Entry::File {
+                    blob,
+                    size: 0,
+                    mtime: 0,
+                },
+                Err(e) => return Err(e.into()),
+            },
             (e, _) => e,
         };
         idx.entries.insert(path, (node, e));
