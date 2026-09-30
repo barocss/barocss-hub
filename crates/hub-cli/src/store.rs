@@ -271,9 +271,9 @@ pub fn decode_ckpt_eager(body: &str, store: &Store) -> Result<Checkpoint, String
         .map_err(|e| format!("checkpoint frontier not in op log: {e:?}"))
 }
 
-type CkptFields = (Vec<NodeId>, String, ReplicaId, Option<String>);
+pub type CkptFields = (Vec<NodeId>, String, ReplicaId, Option<String>);
 
-fn split_ckpt(body: &str) -> Result<CkptFields, String> {
+pub fn split_ckpt(body: &str) -> Result<CkptFields, String> {
     let t: Vec<&str> = body.split(' ').collect();
     let ["K", author, frontier, msg, note] = t.as_slice() else {
         return Err("not a checkpoint record".into());

@@ -13,6 +13,7 @@ pub mod store;
 pub mod sync;
 pub mod watch;
 pub mod wd;
+pub mod wire;
 
 use hub_core::checkpoint::{
     Checkpoint, Checkpoints, FrontierCheck, ResolveError, VersionId, VersionIndex,

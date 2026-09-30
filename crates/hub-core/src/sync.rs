@@ -463,7 +463,13 @@ impl SyncReplica {
     /// SHA-256 check against `id`. Same effect as [`SyncReplica::receive_blob`]
     /// without holding the bytes in memory: a verified blob is marked held
     /// (the caller keeps the file), a mismatch is a CorruptBlob warning.
-    pub fn receive_blob_held(&mut self, peer: PeerId, id: BlobId, verified: bool, len: u64) -> bool {
+    pub fn receive_blob_held(
+        &mut self,
+        peer: PeerId,
+        id: BlobId,
+        verified: bool,
+        len: u64,
+    ) -> bool {
         self.tick += 1;
         self.blob_bytes_in += len;
         self.blobs_in += 1;
