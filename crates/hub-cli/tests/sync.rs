@@ -20,7 +20,7 @@ fn tmp(tag: &str) -> PathBuf {
 }
 
 fn hub_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_hub"));
+    let mut c = Command::new(env!("CARGO_BIN_EXE_barocss-hub"));
     c.args(args).current_dir(dir);
     for (k, v) in env {
         c.env(k, v);
@@ -305,7 +305,7 @@ fn copied_hub_is_duplicate_replica_then_reid_allows_sync() {
     assert!(st.success());
     let e = fail(&b, &["sync", "../a"]);
     assert!(
-        e.contains("duplicate replica id") && e.contains("hub reid"),
+        e.contains("duplicate replica id") && e.contains("barocss-hub reid"),
         "{e}"
     );
     let w = ok(&a, &["warnings"]);
@@ -397,7 +397,7 @@ fn opposite_concurrent_syncs_do_not_deadlock() {
                 (b.clone(), a.clone())
             };
             std::thread::spawn(move || {
-                Command::new(env!("CARGO_BIN_EXE_hub"))
+                Command::new(env!("CARGO_BIN_EXE_barocss-hub"))
                     .args(["sync", to.to_str().unwrap()])
                     .current_dir(&from)
                     .output()

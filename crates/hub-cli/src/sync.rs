@@ -439,7 +439,7 @@ fn dup_warning(peer: ReplicaId, other: &Path) -> RejectWarning {
         rejected: None,
         reason: RejectReason::DuplicateReplica,
         detail: format!(
-            "repository {} uses our replica id; run `hub reid` in one copy",
+            "repository {} uses our replica id; run `barocss-hub reid` in one copy",
             other.display()
         ),
         stuck: Vec::new(),
@@ -499,7 +499,7 @@ pub fn sync_with(
     let dup_msg = |why: &str| {
         Error(format!(
             "sync aborted: {why} (duplicate replica id, D-022). One repository is probably a \
-             copy of the other's .hub/; run `hub reid` in one of them, then sync again"
+             copy of the other's .hub/; run `barocss-hub reid` in one of them, then sync again"
         ))
     };
     if a.replica_id == b.replica_id {
@@ -581,20 +581,23 @@ pub fn sync_with(
         if s.pending_len() > 0 {
             writeln!(
                 warn,
-                "warning: {name}: {} op(s) pending (missing deps); retried on the next sync, see `hub warnings`",
+                "warning: {name}: {} op(s) pending (missing deps); retried on the next sync, see `barocss-hub warnings`",
                 s.pending_len()
             )?;
         }
     }
     let nw = sa.warnings().len();
     if nw > 0 {
-        writeln!(warn, "warning: {nw} sync warning(s); see `hub warnings`")?;
+        writeln!(
+            warn,
+            "warning: {nw} sync warning(s); see `barocss-hub warnings`"
+        )?;
     }
     let idx = crate::wd::Index::load(&a.dir)?;
     if got.ops > 0 && idx.base != a.head_frontier() {
         writeln!(
             out,
-            "note: the working directory is not updated by sync; run `hub checkout` to bring it to head"
+            "note: the working directory is not updated by sync; run `barocss-hub checkout` to bring it to head"
         )?;
     }
     // Issue #33: both sides refresh `.hub/snapshot` when due.

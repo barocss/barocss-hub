@@ -764,8 +764,9 @@ fn main() {
     let case = args.first().cloned().unwrap_or_default();
     let root = PathBuf::from(flag("--root", "/tmp/hub-bench"));
     fs::create_dir_all(&root).unwrap();
-    let hub = PathBuf::from(flag("--hub", "target/release/hub"));
-    let hub = fs::canonicalize(&hub).expect("--hub: release hub binary (cargo build --release)");
+    let hub = PathBuf::from(flag("--hub", "target/release/barocss-hub"));
+    let hub =
+        fs::canonicalize(&hub).expect("--hub: release barocss-hub binary (cargo build --release)");
     let ctx = Ctx {
         hub,
         out: root.join("results.md"),
@@ -833,7 +834,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: hub-bench <files|ops|delta|blobs|watch|scenario|d030> [--root DIR] [--hub PATH] [--timeout S] [case flags]\n\
+                "usage: barocss-hub-bench <files|ops|delta|blobs|watch|scenario|d030> [--root DIR] [--hub PATH] [--timeout S] [case flags]\n\
                  see crates/hub-bench/README.md"
             );
             std::process::exit(2);

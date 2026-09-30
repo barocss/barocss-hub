@@ -24,7 +24,7 @@ fn tmp(tag: &str) -> PathBuf {
 }
 
 fn hub(dir: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_hub"))
+    Command::new(env!("CARGO_BIN_EXE_barocss-hub"))
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -58,7 +58,7 @@ impl Watcher {
                 .as_nanos()
         ));
         let f = fs::File::create(&log).unwrap();
-        let mut c = Command::new(env!("CARGO_BIN_EXE_hub"));
+        let mut c = Command::new(env!("CARGO_BIN_EXE_barocss-hub"));
         c.args([
             "watch",
             "--poll",
@@ -557,7 +557,7 @@ fn crash_around_pin_write_still_pins() {
             .to_string();
         fs::write(t.join("extra.txt"), b"x").unwrap();
         ok(&t, &["record"]);
-        let o = Command::new(env!("CARGO_BIN_EXE_hub"))
+        let o = Command::new(env!("CARGO_BIN_EXE_barocss-hub"))
             .args(["checkout", &cp1])
             .current_dir(&t)
             .env("HUB_TEST_CRASH_IN_CHECKOUT", stage)

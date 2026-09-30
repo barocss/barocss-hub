@@ -127,7 +127,7 @@ impl Index {
         let stamp = fs::metadata(&p).map(|m| mtime_ns(&m)).unwrap_or(0);
         let bad = |line: usize, why: &str| {
             Error(format!(
-                "corrupt {} line {line}: {why} (repair: `hub checkout --force`)",
+                "corrupt {} line {line}: {why} (repair: `barocss-hub checkout --force`)",
                 p.display()
             ))
         };

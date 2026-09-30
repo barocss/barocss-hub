@@ -19,7 +19,7 @@ fn tmp(tag: &str) -> PathBuf {
 }
 
 fn hub(dir: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_hub"))
+    Command::new(env!("CARGO_BIN_EXE_barocss-hub"))
         .args(args)
         .current_dir(dir)
         .output()

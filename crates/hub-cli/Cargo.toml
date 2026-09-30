@@ -1,19 +1,23 @@
 [package]
-name = "hub-cli"
+name = "barocss-hub-cli"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 publish = false
 
+# Package renamed for D-033 (#35); the library keeps its Rust name.
+[lib]
+name = "hub_cli"
+
 [[bin]]
-name = "hub"
+name = "barocss-hub"
 path = "src/main.rs"
 
 [dependencies]
-hub-core = { path = "../hub-core" }
+hub-core = { package = "barocss-hub-core", path = "../hub-core" }
 sha2 = "0.10"
 
 [dev-dependencies]
 proptest = "1"
 # Issue #31: the eager checkpoint decode oracle (test-only).
-hub-core = { path = "../hub-core", features = ["oracle"] }
+hub-core = { package = "barocss-hub-core", path = "../hub-core", features = ["oracle"] }

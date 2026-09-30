@@ -195,7 +195,7 @@ impl Repo {
             }
             cur = c.parent();
         }
-        err("not a hub repository (no .hub/ here or in any parent); run `hub init`")
+        err("not a hub repository (no .hub/ here or in any parent); run `barocss-hub init`")
     }
 
     /// Open and replay a `.hub/` directory for writing (exclusive lock).
@@ -899,7 +899,7 @@ fn resolve(repo: &Repo, ix: &VersionIndex, id: &str) -> Result<Version, Error> {
 fn not_at_head(repo: &Repo, idx: &Index) -> Error {
     let ix = repo.index();
     Error(format!(
-        "working directory is at version {}, not head {}; run `hub checkout` to return to head first",
+        "working directory is at version {}, not head {}; run `barocss-hub checkout` to return to head first",
         ix.short(&VersionId::of_frontier(&idx.base)),
         ix.short(&VersionId::of_frontier(&repo.head_frontier()))
     ))
@@ -926,7 +926,7 @@ fn refuse_if_interrupted(repo: &Repo) -> Result<(), Error> {
     if wd::interrupted(&repo.dir)?.is_some() {
         return err(
             "a checkout was interrupted; the working directory is partly updated. \
-             Run `hub checkout` to finish it before recording or changing the tree",
+             Run `barocss-hub checkout` to finish it before recording or changing the tree",
         );
     }
     Ok(())
@@ -1222,7 +1222,7 @@ pub(crate) fn record(
 pub const PINNED_WAY_OUT: &str =
     "hint: the working directory is pinned to an old version and an edit made \
 while pinned conflicts with head. To keep the edit: copy the file(s) aside, run \
-`hub checkout --force` (returns to head and unpins), copy them back, then `hub record`.";
+`barocss-hub checkout --force` (returns to head and unpins), copy them back, then `barocss-hub record`.";
 
 pub(crate) fn checkout(
     repo: &mut Repo,
@@ -1315,16 +1315,16 @@ pub(crate) fn checkout(
     if f != repo.head_frontier() {
         writeln!(
             out,
-            "note: not at head; `hub record` and mkdir/touch/mv/rm need `hub checkout` (head) first"
+            "note: not at head; `barocss-hub record` and mkdir/touch/mv/rm need `barocss-hub checkout` (head) first"
         )?;
     }
     Ok(())
 }
 
 pub const HELP: &str = "\
-hub - CRDT-native source control (experimental, single local replica)
+barocss-hub - CRDT-native source control (experimental, single local replica)
 
-Usage: hub <command> [args]
+Usage: barocss-hub <command> [args]
 
 The working directory is the directory containing .hub/ (minus .hub/).
 
@@ -1343,9 +1343,9 @@ Commands:
   log                  list checkpoints with short version ids, newest first
   show [-l] <short-id> print the tree of a version (hex prefix, >= 4 digits)
   sync <path>          exchange ops, blobs and published checkpoints with another
-                       local repo (log only; run `hub checkout` afterwards)
+                       local repo (log only; run `barocss-hub checkout` afterwards)
   publish <short-id|message>  mark a local checkpoint published (sync sends it)
-  peer add|list|rm [<path>]  manage local peers for `hub watch` (.hub/peers,
+  peer add|list|rm [<path>]  manage local peers for `barocss-hub watch` (.hub/peers,
                        local config, not replicated)
   watch [--poll <ms>] [--debounce <ms>] [--sync <ms>]
                        foreground: auto-record working-directory changes,
@@ -1354,8 +1354,20 @@ Commands:
   reid                 give this repo a fresh replica id (after copying a .hub/;
                        run it BEFORE recording in the copy); clears saved
                        duplicate-replica warnings (provisional default)
-  help, --help         show this help
+  help, --help, -h     show this help
+  --version, -V        print the version
 ";
+
+/// Every dispatchable command name. `run` rejects any other first word, and
+/// the tests assert each one appears in [`HELP`] (Issue #35), so the help
+/// cannot drift from the dispatch table.
+pub const COMMANDS: &[&str] = &[
+    "init", "peer", "watch", "sync", "publish", "warnings", "reid", "mkdir", "touch", "mv", "rm",
+    "ls", "status", "commit", "log", "show", "record", "checkout", "help",
+];
+
+/// `barocss-hub --version` output (from the package version).
+pub const VERSION: &str = concat!("barocss-hub ", env!("CARGO_PKG_VERSION"), "\n");
 
 /// Run one command in `cwd`. Output goes to `out`; warnings to `warn`.
 pub fn run(
@@ -1372,11 +1384,27 @@ pub fn run(
             .find(|l| l.split_whitespace().next() == Some(c))
             .and_then(|l| l.split("  ").next())
             .unwrap_or(c);
-        Error(format!("usage: hub {}  (see hub --help)", syn.trim_end()))
+        Error(format!(
+            "usage: barocss-hub {}  (see barocss-hub --help)",
+            syn.trim_end()
+        ))
     };
     if matches!(a.as_slice(), [] | ["help"] | ["--help"] | ["-h"]) {
         out.write_all(HELP.as_bytes())?;
         return Ok(());
+    }
+    if matches!(a.as_slice(), ["--version"] | ["-V"]) {
+        out.write_all(VERSION.as_bytes())?;
+        return Ok(());
+    }
+    if !COMMANDS.contains(&a[0]) {
+        return err(format!(
+            "unknown command '{}' (see barocss-hub --help)",
+            a[0]
+        ));
+    }
+    if a[0] == "help" {
+        return Err(usage("help"));
     }
     if a[0] == "init" {
         if a.len() != 1 {
@@ -1403,13 +1431,6 @@ pub fn run(
             ["sync", p] => sync::sync_cmd(cwd, p, out, warn),
             _ => Err(usage("sync")),
         };
-    }
-    let known = [
-        "publish", "warnings", "reid", "mkdir", "touch", "mv", "rm", "ls", "status", "commit",
-        "log", "show", "record", "checkout",
-    ];
-    if !known.contains(&a[0]) {
-        return err(format!("unknown command '{}' (see hub --help)", a[0]));
     }
     // Mutating commands hold an exclusive lock from replay to append (and,
     // for record/checkout, across the working-directory update and index
@@ -1542,7 +1563,7 @@ pub fn run(
             if let Some(p) = watch::pinned(&repo.dir)? {
                 writeln!(
                     out,
-                    "pinned at {} (`hub checkout <id>` of an older version); watch pauses auto-record and auto-checkout; run `hub checkout` to resume",
+                    "pinned at {} (`barocss-hub checkout <id>` of an older version); watch pauses auto-record and auto-checkout; run `barocss-hub checkout` to resume",
                     ix.short(&VersionId::of_frontier(&p))
                 )?;
             }
@@ -1550,7 +1571,10 @@ pub fn run(
                 writeln!(out, "watch: active (pid {pid})")?;
             }
             if wd::interrupted(&repo.dir)?.is_some() {
-                writeln!(out, "interrupted checkout: run `hub checkout` to finish it")?;
+                writeln!(
+                    out,
+                    "interrupted checkout: run `barocss-hub checkout` to finish it"
+                )?;
             }
             let idx = load_index(&repo, warn)?;
             if idx.base != repo.head_frontier() {
@@ -1563,7 +1587,7 @@ pub fn run(
                 if n > 0 {
                     writeln!(
                         out,
-                        "working directory is behind head by {n} op(s); `hub checkout` brings it up to date"
+                        "working directory is behind head by {n} op(s); `barocss-hub checkout` brings it up to date"
                     )?;
                 }
             }
@@ -1576,7 +1600,7 @@ pub fn run(
             if !tbi.is_empty() {
                 writeln!(
                     out,
-                    "tracked but ignored (still tracked; `hub rm` to stop tracking):"
+                    "tracked but ignored (still tracked; `barocss-hub rm` to stop tracking):"
                 )?;
                 for p in &tbi {
                     writeln!(out, "  {p}")?;

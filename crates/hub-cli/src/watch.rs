@@ -178,7 +178,9 @@ fn peer_root(cwd: &Path, arg: &str) -> Result<PathBuf, Error> {
     // Canonicalize first: a lexical walk of `a/../b` would find a's `.hub`.
     let root = fs::canonicalize(&p)?;
     if !root.join(crate::HUB_DIR).is_dir() {
-        return err(format!("no hub repository at {arg} (run `hub init` there)"));
+        return err(format!(
+            "no hub repository at {arg} (run `barocss-hub init` there)"
+        ));
     }
     let s = root.to_string_lossy();
     if s.contains('\n') || s.contains('\r') {
@@ -226,7 +228,11 @@ pub fn peer_cmd(cwd: &Path, args: &[&str], out: &mut dyn Write) -> Result<(), Er
             write_peers(&hub, &peers)?;
             writeln!(out, "removed peer {}", target.display())?;
         }
-        _ => return err("usage: hub peer add <path> | list | rm <path>  (see hub --help)"),
+        _ => {
+            return err(
+                "usage: barocss-hub peer add <path> | list | rm <path>  (see barocss-hub --help)",
+            )
+        }
     }
     Ok(())
 }
@@ -366,7 +372,7 @@ pub fn parse_opts(args: &[&str]) -> Result<Opts, Error> {
             "--debounce" => o.debounce = ms(it.next())?,
             "--sync" => o.sync_every = ms(it.next())?,
             _ => return err(
-                "usage: hub watch [--poll <ms>] [--debounce <ms>] [--sync <ms>]  (see hub --help)",
+                "usage: barocss-hub watch [--poll <ms>] [--debounce <ms>] [--sync <ms>]  (see barocss-hub --help)",
             ),
         }
     }
@@ -394,7 +400,7 @@ fn step_in(repo: &mut Repo, out: &mut dyn Write, warn: &mut dyn Write) -> Result
     }
     if let Some(p) = pinned(&repo.dir)? {
         let msg = format!(
-            "paused: working directory checked out at {} (pinned); run `hub checkout` to resume watching",
+            "paused: working directory checked out at {} (pinned); run `barocss-hub checkout` to resume watching",
             repo.index().short(&hub_core::checkpoint::VersionId::of_frontier(&p))
         );
         if !PAUSE_SAID.swap(true, Ordering::SeqCst) {
