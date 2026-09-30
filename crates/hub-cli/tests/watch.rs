@@ -25,6 +25,7 @@ fn tmp(tag: &str) -> PathBuf {
 
 fn hub(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_barocss-hub"))
+        .env("XDG_CONFIG_HOME", xdg())
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -59,6 +60,7 @@ impl Watcher {
         ));
         let f = fs::File::create(&log).unwrap();
         let mut c = Command::new(env!("CARGO_BIN_EXE_barocss-hub"));
+        c.env("XDG_CONFIG_HOME", xdg());
         c.args([
             "watch",
             "--poll",
@@ -585,4 +587,15 @@ fn crash_around_pin_write_still_pins() {
         assert!(!t.join(".hub/pinned").exists(), "{stage}");
         let _ = fs::remove_dir_all(t);
     }
+}
+
+/// Issue #45: a private trusted-remotes store per test process.
+fn xdg() -> String {
+    static D: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    D.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("hub45-xdg-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_string_lossy().into_owned()
+    })
+    .clone()
 }

@@ -25,6 +25,7 @@ fn tmp(tag: &str) -> PathBuf {
 
 fn hub_bin(bin: &Path, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut c = Command::new(bin);
+    c.env("XDG_CONFIG_HOME", xdg());
     c.args(args)
         .current_dir(dir)
         .stdin(std::process::Stdio::null());
@@ -715,4 +716,15 @@ fn v0_binary_refuses_v1_without_touching_it() {
     assert!(hub_bin(&bin, &d, &["help"], &[]).status.success());
     assert_eq!(files(&h), before);
     ok_env(&d, &["status"], SNAP);
+}
+
+/// Issue #45: a private trusted-remotes store per test process.
+fn xdg() -> String {
+    static D: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    D.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("hub45-xdg-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_string_lossy().into_owned()
+    })
+    .clone()
 }

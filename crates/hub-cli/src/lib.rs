@@ -1685,12 +1685,12 @@ Commands:
   sync [--yes] [<remote|url>]  exchange ops, blobs and published checkpoints with a remote
                        (name from `remote list`, ssh://host/path, host:path,
                        file:///path or a local path; default: the default remote);
-                       log only: run `barocss-hub checkout` afterwards. An ssh remote
-                       you never added or trusted on this machine asks first
+                       log only: run `barocss-hub checkout` afterwards. A configured
+                       remote you never added or trusted from this repo asks first
                        (--yes: trust it; no terminal: refused, untrusted-remote)
   remote add [--default] [--exec <path>] [<name>] <url> | list | rm <name> | set-url <name> <url> | trust <name>
                        manage remotes (.hub/remotes, local config, not replicated);
-                       --exec: one word of [A-Za-z0-9._/~+-]; trust: mark an ssh
+                       --exec: one word of [A-Za-z0-9._/~+-]; trust: mark a
                        remote as used from this machine (~/.config/barocss-hub)
   serve --stdio [--read-only] [--root <dir>] <path>
                        speak the sync protocol on stdin/stdout for one repository

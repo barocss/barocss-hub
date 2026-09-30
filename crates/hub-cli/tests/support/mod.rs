@@ -25,7 +25,9 @@ pub fn tmp(tag: &str) -> PathBuf {
 }
 
 pub fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_barocss-hub"))
+    let mut c = Command::new(env!("CARGO_BIN_EXE_barocss-hub"));
+    c.env("XDG_CONFIG_HOME", xdg());
+    c
 }
 
 pub fn hub(dir: &Path, args: &[&str]) -> Output {
@@ -398,4 +400,15 @@ pub fn nodes(dir: &Path) -> BTreeMap<String, String> {
             )
         })
         .collect()
+}
+
+/// Issue #45: a private trusted-remotes store per test process.
+fn xdg() -> String {
+    static D: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    D.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("hub45-xdg-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_string_lossy().into_owned()
+    })
+    .clone()
 }

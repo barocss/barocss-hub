@@ -1,21 +1,23 @@
 //! Trusted remotes (Issue #45, [decision-proposal]).
 //!
 //! `.hub/remotes` travels with a folder: a repository someone hands you may
-//! name an attacker's host or `exec`. So the first contact with an ssh
-//! remote that this user never added or confirmed on this machine is not
-//! automatic: the CLI asks (on a terminal), needs `--yes`, or refuses with
-//! `untrusted-remote`; `watch` skips it with an event.
+//! name an attacker's host or `exec`, or (`file://`) another of your own
+//! repositories. So the first contact with any remote read from
+//! `.hub/remotes` that this user never added or confirmed *from this
+//! repository* is not automatic: the CLI asks (on a terminal), needs
+//! `--yes`, or refuses with `untrusted-remote`; `watch` skips it with an
+//! event.
 //!
 //! The store is per user, outside every repository:
 //! `$XDG_CONFIG_HOME/barocss-hub/trusted-remotes` (when `XDG_CONFIG_HOME`
-//! is an absolute path), else `$HOME/.config/barocss-hub/trusted-remotes`
-//! (on macOS too, for one documented location). Header
-//! `barocss-hub/trusted-remotes/v0`, then `T <url> <exec>` per entry
-//! (escaped like `.hub/remotes`). The key is the normalized URL
-//! (`ssh://[user@]host[:port]/path`) plus the exec word, so a changed host,
-//! user, port, path or exec is a new remote. `remote add`, `remote
-//! set-url`, `remote trust` and a confirmed or `--yes` first contact add
-//! entries. `file://` remotes are local paths and are not gated.
+//! is an absolute path), else `$HOME/.config/barocss-hub/trusted-remotes`.
+//! Header `barocss-hub/trusted-remotes/v1`, then `T <local> <url> <exec>`
+//! per entry (escaped like `.hub/remotes`). The key is the canonical local
+//! `.hub/`, the normalized URL (`ssh://[user@]host[:port]/path`, or
+//! `file://<canonical target>`) and the exec word (`-` for `file://`).
+//! A v0 file (first #45 round, no local path) matches nothing. `remote
+//! add`, `remote set-url`, `remote trust` and a confirmed or `--yes` first
+//! contact add entries; the peers -> remotes migration adds none.
 
 use std::fs;
 use std::io::Write;
@@ -23,17 +25,27 @@ use std::path::PathBuf;
 
 use crate::{store, Code, Error};
 
-pub const HEADER: &str = "barocss-hub/trusted-remotes/v0";
+pub const HEADER: &str = "barocss-hub/trusted-remotes/v1";
+/// The #45 first-round format (no local repository in the key). Its
+/// entries no longer match anything: each remote needs one confirmation
+/// again, and the next write replaces the file with v1.
+pub const HEADER_V0: &str = "barocss-hub/trusted-remotes/v0";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustKey {
+    /// Canonical `.hub/` of the repository the remote is used from.
+    pub local: String,
     pub url: String,
     pub exec: String,
 }
 
 impl TrustKey {
     pub fn describe(&self) -> String {
-        format!("{}, exec {}", self.url, self.exec)
+        if self.exec == "-" {
+            format!("{}, from {}", self.url, self.local)
+        } else {
+            format!("{}, exec {}, from {}", self.url, self.exec, self.local)
+        }
     }
 }
 
@@ -63,17 +75,20 @@ fn read_all() -> Result<Vec<TrustKey>, Error> {
     };
     let bad = || Error::new(Code::Corrupt, format!("corrupt {}", p.display()));
     let mut lines = text.lines();
-    if lines.next() != Some(HEADER) {
-        return Err(bad());
+    match lines.next() {
+        Some(HEADER) => {}
+        Some(HEADER_V0) => return Ok(Vec::new()),
+        _ => return Err(bad()),
     }
     lines
         .filter(|l| !l.is_empty())
         .map(|l| {
             let t: Vec<&str> = l.split(' ').collect();
-            let ["T", u, e] = t.as_slice() else {
+            let ["T", l, u, e] = t.as_slice() else {
                 return Err(bad());
             };
             Ok(TrustKey {
+                local: store::unesc(l).map_err(|_| bad())?,
                 url: store::unesc(u).map_err(|_| bad())?,
                 exec: store::unesc(e).map_err(|_| bad())?,
             })
@@ -103,7 +118,8 @@ pub fn add(k: &TrustKey) -> Result<(), Error> {
     let mut s = format!("{HEADER}\n");
     for t in &all {
         s.push_str(&format!(
-            "T {} {}\n",
+            "T {} {} {}\n",
+            store::esc(&t.local),
             store::esc(&t.url),
             store::esc(&t.exec)
         ));

@@ -143,8 +143,12 @@ fn yes_trusts_records_and_later_syncs_need_no_flag() {
     assert!(s.contains("synced with"), "{s}");
     assert_eq!(e.contacts(), 1);
     let st = fs::read_to_string(e.store()).unwrap();
-    assert!(st.starts_with("barocss-hub/trusted-remotes/v0\n"), "{st}");
-    assert!(st.contains(&format!("T s{url} s{BIN}")), "{st}");
+    assert!(st.starts_with("barocss-hub/trusted-remotes/v1\n"), "{st}");
+    let local = fs::canonicalize(a.join(".hub")).unwrap();
+    assert!(
+        st.contains(&format!("T s{} s{url} s{BIN}", local.display())),
+        "{st}"
+    );
     e.ok(&a, &["sync"]);
     let j = e.ok(&a, &["sync", "-y", "origin", "--json"]);
     assert!(
@@ -204,17 +208,195 @@ fn remote_add_and_set_url_are_trusted_by_the_user() {
     e.ok(&a, &["remote", "set-url", "origin", &url2]);
     e.ok(&a, &["sync"]);
     assert_eq!(e.contacts(), 2);
-    // file:// remotes are local paths: never gated.
+    // The user's own `remote add` of a local repository: no prompt.
     let b = e.repo("b");
+    e.ok(&a, &["remote", "add", "b", b.to_str().unwrap()]);
+    e.ok(&a, &["sync", "b"]);
+}
+
+/// Every byte under `d` (the planted-victim checks).
+fn tree(d: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut m = std::collections::BTreeMap::new();
+    let mut st = vec![d.to_path_buf()];
+    while let Some(x) = st.pop() {
+        for en in fs::read_dir(&x).unwrap() {
+            let p = en.unwrap().path();
+            if p.is_dir() {
+                st.push(p);
+            } else {
+                m.insert(p.clone(), fs::read(&p).unwrap());
+            }
+        }
+    }
+    m
+}
+
+/// #45 repair R1: a planted `file://` remote naming another of the user's
+/// repositories is refused: nothing pulled, nothing pushed.
+#[test]
+fn planted_file_remote_is_refused_and_both_repos_are_untouched() {
+    let e = Env::new("pfile");
+    let victim = e.repo("victim");
+    fs::write(victim.join("secret.txt"), "victim secret\n").unwrap();
+    e.ok(&victim, &["record"]);
+    let planted = e.repo("planted");
+    fs::write(planted.join("evil.txt"), "planted\n").unwrap();
+    e.ok(&planted, &["record"]);
+    // Through a symlink too: the key is the canonical target.
+    let link = e.t.join("link-to-victim");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    for target in [victim.clone(), link.clone()] {
+        fs::write(
+            planted.join(".hub/remotes"),
+            format!(
+                "barocss-hub/remotes/v0\nR sv sfile://{} default=1\n",
+                target.display()
+            ),
+        )
+        .unwrap();
+        let (tv, tp) = (tree(&victim), tree(&planted));
+        for args in [&["sync"][..], &["sync", "v"], &["sync", "--json"]] {
+            let o = e.run(&planted, args);
+            assert_eq!(o.status.code(), Some(1), "{args:?}");
+            assert!(
+                String::from_utf8_lossy(&o.stderr).contains("never added or confirmed"),
+                "{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        }
+        let j = String::from_utf8(e.run(&planted, &["sync", "--json"]).stderr).unwrap();
+        assert!(j.contains("\"code\":\"untrusted-remote\""), "{j}");
+        assert_eq!(tree(&victim), tv, "victim changed");
+        assert_eq!(tree(&planted), tp, "planted folder changed");
+    }
+    // Trusting through the symlink trusts the canonical target: the direct
+    // path then works too.
+    e.ok(&planted, &["remote", "trust", "v"]);
     fs::write(
-        a.join(".hub/remotes"),
-        format!("barocss-hub/remotes/v0\nR sb sfile://{}\n", b.display()),
+        planted.join(".hub/remotes"),
+        format!(
+            "barocss-hub/remotes/v0\nR sv sfile://{} default=1\n",
+            victim.display()
+        ),
     )
     .unwrap();
+    e.ok(&planted, &["sync"]);
+    // A missing target: refused as untrusted, never created.
+    let gone = e.t.join("gone");
+    fs::write(
+        planted.join(".hub/remotes"),
+        format!(
+            "barocss-hub/remotes/v0\nR sg sfile://{} default=1\n",
+            gone.display()
+        ),
+    )
+    .unwrap();
+    let o = e.run(&planted, &["sync", "--json"]);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("untrusted-remote"));
+    assert!(!gone.exists());
+}
+
+/// #45 repair R2: the local repository is part of the key. A planted
+/// folder carrying the exact URL of a trusted team server is refused.
+#[test]
+fn planted_copy_of_a_trusted_url_in_another_folder_is_refused() {
+    let e = Env::new("copyurl");
+    e.ok(&e.t, &["init", "--bare", "srv"]);
+    let url = format!("ssh://localhost{}", e.t.join("srv").display());
+    let mine = e.repo("mine");
+    e.ok(&mine, &["remote", "add", "--exec", BIN, "origin", &url]);
+    e.ok(&mine, &["sync"]);
+    let other = e.repo("other");
+    plant(&other, &url, BIN);
+    let o = e.run(&other, &["sync", "--json"]);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("untrusted-remote"));
+    assert_eq!(e.contacts(), 1);
+    // A v0 store (first #45 round, no local path) matches nothing.
+    fs::write(
+        e.store(),
+        format!("barocss-hub/trusted-remotes/v0\nT s{url} s{BIN}\n"),
+    )
+    .unwrap();
+    let o = e.run(&mine, &["sync", "--json"]);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("untrusted-remote"));
+    e.ok(&mine, &["remote", "trust", "origin"]);
+    assert!(fs::read_to_string(e.store())
+        .unwrap()
+        .starts_with("barocss-hub/trusted-remotes/v1\n"));
+    e.ok(&mine, &["sync"]);
+}
+
+/// The peers -> remotes migration grants no trust.
+#[test]
+fn migrated_peers_start_untrusted() {
+    let e = Env::new("mig");
+    let a = e.repo("a");
+    let b = e.repo("b");
+    let root = fs::canonicalize(&b).unwrap();
+    fs::write(
+        a.join(".hub/peers"),
+        format!("barocss-hub/peers/v1\n{}\n", root.display()),
+    )
+    .unwrap();
+    // Migrate (an exclusive-lock command), then sync by name: refused.
+    let _ = e.run(&a, &["remote", "rm", "none"]);
+    assert!(!a.join(".hub/peers").exists(), "not migrated");
+    let o = e.run(&a, &["sync", "--json", "b"]);
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("untrusted-remote"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    e.ok(&a, &["sync", "--yes", "b"]);
     e.ok(&a, &["sync", "b"]);
-    assert!(e
-        .ok(&a, &["remote", "trust", "b"])
-        .contains("no trust needed"));
+}
+
+/// `watch` skips an untrusted `file://` remote with one event.
+#[test]
+fn watch_skips_untrusted_file_remote() {
+    let e = Env::new("wfile");
+    let victim = e.repo("victim");
+    let a = e.repo("a");
+    fs::write(
+        a.join(".hub/remotes"),
+        format!(
+            "barocss-hub/remotes/v0\nR sv sfile://{} default=1\n",
+            victim.display()
+        ),
+    )
+    .unwrap();
+    let tv = tree(&victim);
+    let w = e
+        .cmd(
+            &a,
+            &[
+                "watch",
+                "--json",
+                "--poll",
+                "50",
+                "--debounce",
+                "50",
+                "--sync",
+                "150",
+            ],
+        )
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(w.id().to_string())
+        .status();
+    let out = w.wait_with_output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        s.matches("\"event\":\"untrusted-remote\"").count(),
+        1,
+        "{s}"
+    );
+    assert!(!s.contains("\"event\":\"error\""), "{s}");
+    assert_eq!(tree(&victim), tv);
 }
 
 #[test]

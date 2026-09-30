@@ -364,7 +364,7 @@ pub fn remote_cmd(cwd: &Path, args: &[&str], out: &mut dyn Write) -> Result<(), 
             rs.push(r.clone());
             write_remotes(&hub, &rs, false)?;
             writeln!(out, "added remote {name} {url}")?;
-            trust_added(&r, out)?;
+            trust_added(&r, &hub, out)?;
         }
         ["rm", name] => {
             let before = rs.len();
@@ -390,16 +390,13 @@ pub fn remote_cmd(cwd: &Path, args: &[&str], out: &mut dyn Write) -> Result<(), 
             let r = r.clone();
             write_remotes(&hub, &rs, false)?;
             writeln!(out, "remote {name} is now {url}")?;
-            trust_added(&r, out)?;
+            trust_added(&r, &hub, out)?;
         }
         ["trust", name] => {
             let Some(r) = rs.iter().find(|r| r.name == *name) else {
                 return errc(Code::NotFound, format!("no remote named {name}"));
             };
-            let Some(key) = trust_key(r)? else {
-                writeln!(out, "remote {name} is local (file://); no trust needed")?;
-                return Ok(());
-            };
+            let key = trust_key(r, &hub)?;
             crate::trust::add(&key)?;
             writeln!(out, "trusted remote {name} ({})", key.describe())?;
         }
@@ -704,46 +701,55 @@ pub enum TrustMode {
     Refuse,
 }
 
-/// The trust-store key of a remote (`None` for `file://`).
-pub fn trust_key(r: &Remote) -> Result<Option<crate::trust::TrustKey>, Error> {
-    Ok(key_of(
-        &parse_url(&r.url, Path::new("/"))?,
-        r.exec.as_deref(),
-    ))
+/// The trust-store key of a remote as seen from the repository whose
+/// canonical `.hub/` is `hub` (#45 repair: the local repository is part of
+/// the key, so a planted copy of a trusted URL in another folder is new).
+pub fn trust_key(r: &Remote, hub: &Path) -> Result<crate::trust::TrustKey, Error> {
+    let root = hub.parent().unwrap_or(hub);
+    Ok(key_of(&parse_url(&r.url, root)?, r.exec.as_deref(), hub))
 }
 
-fn key_of(url: &Url, exec: Option<&str>) -> Option<crate::trust::TrustKey> {
+/// `file://` targets are keyed by their canonical path (symlinks resolved;
+/// a missing target keeps the literal path, and sync fails on it anyway).
+fn key_of(url: &Url, exec: Option<&str>, hub: &Path) -> crate::trust::TrustKey {
+    let local = fs::canonicalize(hub)
+        .unwrap_or_else(|_| hub.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
     match url {
-        Url::File(_) => None,
-        Url::Ssh { .. } => Some(crate::trust::TrustKey {
+        Url::File(p) => crate::trust::TrustKey {
+            local,
+            url: file_url(&fs::canonicalize(p).unwrap_or_else(|_| p.clone())),
+            exec: "-".into(),
+        },
+        Url::Ssh { .. } => crate::trust::TrustKey {
+            local,
             url: url_text(url),
             exec: exec.unwrap_or("barocss-hub").to_string(),
-        }),
+        },
     }
 }
 
 /// `remote add`/`set-url` are the user's own act: trust the result.
-fn trust_added(r: &Remote, out: &mut dyn Write) -> Result<(), Error> {
-    if let Some(k) = trust_key(r)? {
-        if let Err(e) = crate::trust::add(&k) {
-            writeln!(
-                out,
-                "note: could not record {} as trusted ({e}); the first sync will ask",
-                r.name
-            )?;
-        }
+fn trust_added(r: &Remote, hub: &Path, out: &mut dyn Write) -> Result<(), Error> {
+    let k = trust_key(r, hub)?;
+    if let Err(e) = crate::trust::add(&k) {
+        writeln!(
+            out,
+            "note: could not record {} as trusted ({e}); the first sync will ask",
+            r.name
+        )?;
     }
     Ok(())
 }
 
 /// The first-contact gate (Issue #45).
-fn check_trust(res: &Resolved, mode: TrustMode) -> Result<(), Error> {
+fn check_trust(res: &Resolved, mode: TrustMode, cwd: &Path) -> Result<(), Error> {
     if !res.configured {
         return Ok(());
     }
-    let Some(k) = key_of(&res.url, res.exec.as_deref()) else {
-        return Ok(());
-    };
+    let hub = fs::canonicalize(find_hub(cwd)?)?;
+    let k = key_of(&res.url, res.exec.as_deref(), &hub);
     if crate::trust::is_trusted(&k).unwrap_or(false) {
         return Ok(());
     }
@@ -799,7 +805,7 @@ pub fn sync(
     warn: &mut dyn Write,
 ) -> Result<Synced, Error> {
     let res = resolve(cwd, arg)?;
-    check_trust(&res, trust)?;
+    check_trust(&res, trust, cwd)?;
     let Resolved { url, exec, .. } = res;
     match &url {
         Url::File(p) => sync::sync_local(cwd, p, sync::env_stop(), warn),
