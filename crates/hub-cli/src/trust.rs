@@ -102,14 +102,17 @@ pub fn is_trusted(k: &TrustKey) -> Result<bool, Error> {
 
 /// Add `k` (temp + fsync + rename; the directory is created 0700).
 pub fn add(k: &TrustKey) -> Result<(), Error> {
+    // Read-modify-write under an exclusive lock on the store directory, so
+    // concurrent `remote add`/`trust` from several repos lose no entry.
+    let p = store_path()?;
+    let dir = p.parent().expect("store path has a parent");
+    fs::create_dir_all(dir)?;
+    let _lock = store::RepoLock::acquire(dir, store::LockMode::Exclusive)?;
     let mut all = read_all()?;
     if all.contains(k) {
         return Ok(());
     }
     all.push(k.clone());
-    let p = store_path()?;
-    let dir = p.parent().expect("store path has a parent");
-    fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
