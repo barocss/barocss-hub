@@ -81,6 +81,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::json::J;
 use crate::store::{self, LockMode};
 use crate::sync::find_hub;
 use crate::{err, wd, Error, Repo};
@@ -345,6 +346,8 @@ pub struct Opts {
     pub poll: Duration,
     pub debounce: Duration,
     pub sync_every: Duration,
+    /// `--json` (Issue #37): JSON Lines events on stdout instead of text.
+    pub json: bool,
 }
 
 impl Default for Opts {
@@ -353,6 +356,7 @@ impl Default for Opts {
             poll: Duration::from_millis(100),
             debounce: Duration::from_millis(400),
             sync_every: Duration::from_secs(2),
+            json: false,
         }
     }
 }
@@ -379,11 +383,31 @@ pub fn parse_opts(args: &[&str]) -> Result<Opts, Error> {
     Ok(o)
 }
 
+/// What one step did (Issue #37: the source of `watch --json` events; the
+/// human text is written by the step itself).
+#[derive(Default)]
+struct Step {
+    resumed_checkout: Option<crate::CheckedOut>,
+    paused: Option<hub_core::checkpoint::VersionId>,
+    /// The pause was announced by this step (announced once per pause).
+    paused_new: bool,
+    resumed: bool,
+    /// Deferred: an editor save is in progress (see [`save_in_progress`]).
+    deferred: Vec<String>,
+    recorded: Option<crate::Recorded>,
+    checked_out: Option<crate::CheckedOut>,
+    head: Option<hub_core::checkpoint::VersionId>,
+}
+
 /// One locked step: resume, record (allow behind), else checkout head.
-/// Returns whether ops were recorded.
-fn step(hub: &Path, out: &mut dyn Write, warn: &mut dyn Write) -> Result<bool, Error> {
+fn step(hub: &Path, out: &mut dyn Write, warn: &mut dyn Write) -> Result<Step, Error> {
     let mut repo = Repo::open_dir_with(hub.to_path_buf(), LockMode::Exclusive)?;
-    let r = step_in(&mut repo, out, warn);
+    let mut r = step_in(&mut repo, out, warn);
+    if let Ok(s) = &mut r {
+        s.head = Some(hub_core::checkpoint::VersionId::of_frontier(
+            &repo.head_frontier(),
+        ));
+    }
     // Issue #33: refresh `.hub/snapshot` when due.
     if let Some(w) = repo.maybe_snapshot() {
         writeln!(warn, "warning: {w}")?;
@@ -391,52 +415,236 @@ fn step(hub: &Path, out: &mut dyn Write, warn: &mut dyn Write) -> Result<bool, E
     r
 }
 
-fn step_in(repo: &mut Repo, out: &mut dyn Write, warn: &mut dyn Write) -> Result<bool, Error> {
+/// Longest time a step defers recording for a save in progress.
+fn defer_limit() -> Duration {
+    Duration::from_millis(
+        std::env::var("HUB_WATCH_SAVE_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000),
+    )
+}
+
+/// When the current deferral started (`None`: not deferring).
+static DEFER_SINCE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// Issue #37: tracked files that are missing while the editor's own
+/// sidecar of that very file exists: `x~` (vim `backupcopy=no`: x is
+/// renamed to x~, then the new x is written), `x___jb_old___` /
+/// `x___jb_tmp___` (JetBrains safe write). Recording at that instant
+/// would record a delete (and later a create: a new node), so the watcher
+/// waits for the save to finish, at most [`defer_limit`] (a lingering
+/// backup after a real delete must not block recording forever).
+pub fn save_in_progress(root: &Path, idx: &wd::Index) -> Vec<String> {
+    let mut v = Vec::new();
+    for (p, (_, e)) in &idx.entries {
+        if !matches!(e, wd::Entry::File { .. }) || fs::symlink_metadata(root.join(p)).is_ok() {
+            continue;
+        }
+        let side = ["~", "___jb_old___", "___jb_tmp___"]
+            .iter()
+            .any(|s| fs::symlink_metadata(root.join(format!("{p}{s}"))).is_ok());
+        if side {
+            v.push(p.clone());
+        }
+    }
+    v
+}
+
+fn step_in(repo: &mut Repo, out: &mut dyn Write, warn: &mut dyn Write) -> Result<Step, Error> {
+    let mut st = Step::default();
     for w in &repo.warnings {
         writeln!(warn, "warning: {w}")?;
     }
     if wd::interrupted(&repo.dir)?.is_some() {
-        crate::checkout(repo, None, false, out, warn)?;
+        st.resumed_checkout = Some(crate::checkout(repo, None, false, out, warn)?);
     }
     if let Some(p) = pinned(&repo.dir)? {
+        let vid = hub_core::checkpoint::VersionId::of_frontier(&p);
         let msg = format!(
             "paused: working directory checked out at {} (pinned); run `barocss-hub checkout` to resume watching",
-            repo.index().short(&hub_core::checkpoint::VersionId::of_frontier(&p))
+            repo.index().short(&vid)
         );
         if !PAUSE_SAID.swap(true, Ordering::SeqCst) {
             writeln!(out, "{msg}")?;
+            st.paused_new = true;
         }
-        return Ok(false);
+        st.paused = Some(vid);
+        return Ok(st);
     }
     if PAUSE_SAID.swap(false, Ordering::SeqCst) {
         writeln!(out, "resumed: working directory back at head")?;
+        st.resumed = true;
+    }
+    {
+        let idx = wd::Index::load(&repo.dir)?;
+        let busy = save_in_progress(&repo.root(), &idx);
+        let mut since = DEFER_SINCE.lock().unwrap_or_else(|e| e.into_inner());
+        if busy.is_empty() {
+            *since = None;
+        } else {
+            let t0 = *since.get_or_insert_with(Instant::now);
+            if t0.elapsed() < defer_limit() {
+                st.deferred = busy;
+                return Ok(st);
+            }
+            *since = None;
+        }
     }
     let mut quiet = Vec::new();
-    let recorded = crate::record(repo, None, true, &mut quiet, warn)?;
-    if recorded {
+    st.recorded = crate::record(repo, None, true, &mut quiet, warn)?;
+    if st.recorded.is_some() {
         out.write_all(&quiet)?;
-        return Ok(true);
+        return Ok(st);
     }
     let idx = wd::Index::load(&repo.dir)?;
     if idx.base != repo.head_frontier() {
-        crate::checkout(repo, None, false, out, warn)?;
+        st.checked_out = Some(crate::checkout(repo, None, false, out, warn)?);
     }
-    Ok(false)
+    Ok(st)
 }
 
-fn sync_all(hub: &Path, out: &mut dyn Write, warn: &mut dyn Write) -> Result<(), Error> {
+/// Parse a sync summary line's six counts (received ops, blobs,
+/// checkpoints; sent ops, blobs, checkpoints).
+fn sync_counts(line: &str) -> Option<[u64; 6]> {
+    let rest = line.split_once(": received ")?.1;
+    let nums: Vec<u64> = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|t| !t.is_empty())
+        .filter_map(|t| t.parse().ok())
+        .collect();
+    nums.try_into().ok()
+}
+
+/// Output of the watcher: human text or JSON Lines events (Issue #37).
+struct Io<'a> {
+    json: bool,
+    out: &'a mut dyn Write,
+    warn: &'a mut dyn Write,
+}
+
+impl Io<'_> {
+    fn event(&mut self, name: &str, fields: Vec<(&str, J)>) -> Result<(), Error> {
+        if self.json {
+            crate::json::emit(self.out, crate::json::event(name, fields))?;
+        }
+        Ok(())
+    }
+    /// Human: `warning: <msg>` on stderr; JSON: a `warning` event.
+    fn warning(&mut self, msg: &str) -> Result<(), Error> {
+        if self.json {
+            self.event("warning", vec![("message", J::s(msg))])
+        } else {
+            writeln!(self.warn, "warning: {msg}")?;
+            Ok(())
+        }
+    }
+    /// Run `f` with the real streams (human) or with buffers whose
+    /// warnings become events and whose text is dropped (JSON).
+    fn call<T>(
+        &mut self,
+        f: impl FnOnce(&mut dyn Write, &mut dyn Write) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if !self.json {
+            return f(self.out, self.warn);
+        }
+        let (mut o, mut w) = (Vec::new(), Vec::new());
+        let r = f(&mut o, &mut w);
+        for l in crate::json::warning_lines(&w) {
+            self.warning(&l)?;
+        }
+        r
+    }
+    fn flush(&mut self) -> Result<(), Error> {
+        self.out.flush()?;
+        self.warn.flush()?;
+        Ok(())
+    }
+}
+
+fn version_j(v: &hub_core::checkpoint::VersionId) -> J {
+    J::obj(vec![("id", J::s(v.hex())), ("short", J::s(v.short()))])
+}
+
+/// The events of one step.
+fn step_events(io: &mut Io, s: &Step) -> Result<(), Error> {
+    if let Some(c) = &s.resumed_checkout {
+        let mut f = crate::json::checkout_fields(c);
+        f.push(("reason", J::s("resume-interrupted")));
+        io.event("checked-out", f)?;
+    }
+    if let (Some(v), true) = (&s.paused, s.paused_new) {
+        io.event("paused", vec![("pinned", version_j(v))])?;
+    }
+    if s.resumed {
+        io.event("resumed", vec![])?;
+    }
+    if !s.deferred.is_empty() {
+        io.event("deferred", vec![("paths", J::strs(&s.deferred))])?;
+    }
+    let head = || J::opt(s.head.as_ref().map(version_j));
+    if let Some(r) = &s.recorded {
+        io.event(
+            "recorded",
+            vec![
+                ("changes", crate::json::changes(&r.changes)),
+                ("head", head()),
+            ],
+        )?;
+    }
+    if let Some(c) = &s.checked_out {
+        let mut f = crate::json::checkout_fields(c);
+        f.push(("reason", J::s("incoming")));
+        io.event("checked-out", f)?;
+    }
+    Ok(())
+}
+
+fn sync_all(hub: &Path, io: &mut Io) -> Result<(), Error> {
     let root = hub.parent().unwrap_or(hub).to_path_buf();
     for p in read_peers(hub)? {
         let mut sink = Vec::new();
-        if let Err(e) = crate::sync::sync_cmd(&root, &p.to_string_lossy(), &mut sink, warn) {
-            writeln!(warn, "warning: sync with {} failed: {e}", p.display())?;
+        let r =
+            io.call(|_, warn| crate::sync::sync_cmd(&root, &p.to_string_lossy(), &mut sink, warn));
+        if let Err(e) = r {
+            if io.json {
+                io.event(
+                    "error",
+                    vec![
+                        ("stage", J::s("sync")),
+                        ("peer", J::s(p.to_string_lossy())),
+                        ("message", J::s(&e.0)),
+                    ],
+                )?;
+            } else {
+                io.warning(&format!("sync with {} failed: {e}", p.display()))?;
+            }
         } else {
             // Only report syncs that moved something (first line only; the
             // checkout note does not apply, the watcher applies itself).
             let s = String::from_utf8_lossy(&sink);
             let first = s.lines().next().unwrap_or("");
             if !first.contains("received 0 op(s), 0 blob(s), 0 checkpoint(s); sent 0 op(s), 0 blob(s), 0 checkpoint(s)") {
-                writeln!(out, "{first}")?;
+                if io.json {
+                    let n = sync_counts(first).unwrap_or([0; 6]);
+                    let counts = |i: usize| {
+                        J::obj(vec![
+                            ("ops", J::Num(n[i])),
+                            ("blobs", J::Num(n[i + 1])),
+                            ("checkpoints", J::Num(n[i + 2])),
+                        ])
+                    };
+                    io.event(
+                        "synced",
+                        vec![
+                            ("peer", J::s(p.to_string_lossy())),
+                            ("received", counts(0)),
+                            ("sent", counts(3)),
+                        ],
+                    )?;
+                } else {
+                    writeln!(io.out, "{first}")?;
+                }
             }
         }
     }
@@ -474,39 +682,67 @@ pub fn watch_cmd(
         format!("{}\n", std::process::id()).as_bytes(),
     )?;
     let _pid = PidGuard(hub.join(PID_FILE));
-    writeln!(
+    let mut io = Io {
+        json: opts.json,
         out,
-        "watching {} ({} peer(s)); Ctrl-C to stop",
-        root.display(),
-        read_peers(&hub)?.len()
-    )?;
-    out.flush()?;
+        warn,
+    };
+    let npeers = read_peers(&hub)?.len();
+    if io.json {
+        io.event(
+            "started",
+            vec![
+                ("root", J::s(root.to_string_lossy())),
+                ("pid", J::n(std::process::id())),
+                ("peers", J::n(npeers)),
+            ],
+        )?;
+    } else {
+        writeln!(
+            io.out,
+            "watching {} ({npeers} peer(s)); Ctrl-C to stop",
+            root.display(),
+        )?;
+    }
+    io.flush()?;
 
     // A failed step (e.g. blocked paths, a refused checkout) is reported
     // and retried on the next trigger; it never stops the watcher.
-    let cycle = |do_sync: bool, out: &mut dyn Write, warn: &mut dyn Write| -> Result<(), Error> {
-        let recorded = match step(&hub, out, warn) {
-            Ok(r) => r,
+    let fail = |io: &mut Io, stage: &str, e: Error| -> Result<(), Error> {
+        if io.json {
+            io.event(
+                "error",
+                vec![("stage", J::s(stage)), ("message", J::s(&e.0))],
+            )
+        } else {
+            io.warning(&format!("{stage}: {e}"))
+        }
+    };
+    let cycle = |do_sync: bool, io: &mut Io| -> Result<(), Error> {
+        let recorded = match io.call(|o, w| step(&hub, o, w)) {
+            Ok(s) => {
+                step_events(io, &s)?;
+                s.recorded.is_some()
+            }
             Err(e) => {
-                writeln!(warn, "warning: auto-record: {e}")?;
+                fail(io, "auto-record", e)?;
                 false
             }
         };
         if (recorded || do_sync) && !stopping() {
             let mid = oplog_len(&hub);
-            sync_all(&hub, out, warn)?;
+            sync_all(&hub, io)?;
             if oplog_len(&hub) != mid && !stopping() {
-                if let Err(e) = step(&hub, out, warn) {
-                    writeln!(warn, "warning: apply: {e}")?;
+                match io.call(|o, w| step(&hub, o, w)) {
+                    Ok(s) => step_events(io, &s)?,
+                    Err(e) => fail(io, "apply", e)?,
                 }
             }
         }
-        out.flush()?;
-        warn.flush()?;
-        Ok(())
+        io.flush()
     };
 
-    cycle(true, out, warn)?;
+    cycle(true, &mut io)?;
     let mut base_fp = fingerprint(&root);
     let mut base_len = oplog_len(&hub);
     let mut seen_fp = base_fp;
@@ -529,7 +765,7 @@ pub fn watch_cmd(
         if !quiet || !(local || incoming || periodic) {
             continue;
         }
-        cycle(local || periodic, out, warn)?;
+        cycle(local || periodic, &mut io)?;
         if periodic || local {
             next_sync = Instant::now() + opts.sync_every;
         }
@@ -538,7 +774,10 @@ pub fn watch_cmd(
         seen_fp = base_fp;
         base_len = oplog_len(&hub);
     }
-    writeln!(out, "watch stopped")?;
-    out.flush()?;
-    Ok(())
+    if io.json {
+        io.event("stopped", vec![])?;
+    } else {
+        writeln!(io.out, "watch stopped")?;
+    }
+    io.flush()
 }

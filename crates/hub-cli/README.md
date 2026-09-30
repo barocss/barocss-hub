@@ -141,6 +141,32 @@ classes, backslash escapes other than a leading `\#` or `\!`, nested
   if one is in the way, it refuses and names it; move it away and retry.
 - Sync is unaffected: rules only apply when scanning the working directory.
 
+### Built-in default ignores (Issue #37)
+
+Editor and OS temp files are ignored even without a `.hubignore`. The list
+(`hub_cli::ignore::DEFAULTS`) is read as if it were the first lines of
+`.hubignore`, so a `!pattern` line in the file re-includes any of them:
+
+| pattern | what |
+|---|---|
+| `*.swp` `*.swo` `*.swn` `*.swx` | vim swap files |
+| `4913` | vim's write-permission probe file |
+| `*~` | vim / emacs backup files |
+| `.#*` | emacs lock files |
+| `#*#` | emacs auto-save files |
+| `*___jb_tmp___` `*___jb_old___` | JetBrains "safe write" temp files |
+| `.~lock.*#` | LibreOffice / OpenOffice lock files |
+| `.goutputstream-*` | GNOME (GIO) atomic-replace temp files |
+| `.DS_Store` `Thumbs.db` `desktop.ini` | macOS / Windows folder metadata |
+
+As with any rule, a file that is already tracked stays tracked. Saves by
+vim (`backupcopy=no`), VS Code-style atomic writes (temp + rename) and
+JetBrains safe write are recorded as a content edit of the same node
+(`crates/hub-cli/tests/editor.rs`). While a tracked file is missing and its
+own `x~`, `x___jb_old___` or `x___jb_tmp___` exists, `barocss-hub watch`
+waits for the save to finish (at most 5 s, `HUB_WATCH_SAVE_WAIT_MS`)
+instead of recording a delete.
+
 ## Live sync between two folders (`barocss-hub watch`)
 
 `barocss-hub watch` records working-directory edits automatically, syncs with every
@@ -191,6 +217,29 @@ watch stopped
 - After a crash or `kill -9`, just start `barocss-hub watch` (or any command) again:
   an interrupted checkout is resumed, a torn log tail is dropped, temps are
   swept. A second `barocss-hub watch` on the same repo refuses while one runs.
+
+## Machine-readable output (`--json`, Issue #37)
+
+`--json` anywhere on the command line switches stdout to exactly one JSON
+document (schema 1), for tools such as editor extensions. The schema is
+documented in the Wiki page `CLI-JSON`; golden documents are in
+`crates/hub-cli/tests/golden/json/`.
+
+```sh
+barocss-hub status --json            # head, workdir state (at-head/behind/pinned), watch pid,
+                                     # conflicts (with blob ids), changes, blocked, ignored
+barocss-hub log --json --path a.txt  # checkpoints containing the file + every op on its node
+barocss-hub cat <version> a.txt      # raw bytes (--json: base64 in a document)
+barocss-hub cat-blob <64-hex>        # raw bytes of a stored blob
+barocss-hub watch --json             # JSON Lines events: started, recorded, synced,
+                                     # checked-out, deferred, paused, resumed, warning, error, stopped
+```
+
+- Warnings are the document's `"warnings"` array; nothing else is printed.
+- On an error stdout is empty, stderr holds
+  `{"schema":1,"program":"barocss-hub","error":{"code":...,"message":...},"warnings":[...]}`
+  and the exit status is 1 (2: the current directory cannot be read).
+- Human output is unchanged; human errors are prefixed `barocss-hub: `.
 
 ## Storage (`.hub/`)
 

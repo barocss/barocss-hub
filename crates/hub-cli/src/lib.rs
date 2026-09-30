@@ -6,6 +6,7 @@
 pub mod blobs;
 pub mod durable;
 pub mod ignore;
+pub mod json;
 pub mod migrate;
 pub mod snapshot;
 pub mod store;
@@ -991,14 +992,15 @@ fn w_all_is_dir(root: &Path, p: &str) -> bool {
 /// after a sync: the recorded ops are then concurrent with the incoming
 /// ones (so a same-file edit is a content conflict, never a silent causal
 /// overwrite), and the plan below materializes the merged head over the
-/// now fully recorded working tree. Returns whether anything was recorded.
+/// now fully recorded working tree. Returns what was recorded (`None`:
+/// nothing to record).
 pub(crate) fn record(
     repo: &mut Repo,
     msg: Option<&str>,
     allow_behind: bool,
     out: &mut dyn Write,
     warn: &mut dyn Write,
-) -> Result<bool, Error> {
+) -> Result<Option<Recorded>, Error> {
     let root = repo.root();
     refuse_if_interrupted(repo)?;
     wd::sweep_tmp(&repo.dir)?;
@@ -1033,7 +1035,7 @@ pub(crate) fn record(
     let changes = wd::diff(&idx, &w);
     if changes.is_empty() {
         writeln!(out, "nothing to record")?;
-        return Ok(false);
+        return Ok(None);
     }
     let old = |p: &str| idx.entries[p].0;
     // Ops are built first and appended only after the working-directory
@@ -1209,12 +1211,84 @@ pub(crate) fn record(
     for l in wd::render_changes(&changes, &idx, &w) {
         writeln!(out, "  {l}")?;
     }
+    let infos = change_infos(&changes, &idx, &w, &created);
+    let mut checkpoint = None;
     if let Some(m) = msg {
         let c = repo.commit(m)?;
         let ix = repo.index();
         writeln!(out, "[{}] {}", ix.short(&c.id()), c.message)?;
+        checkpoint = Some(c);
     }
-    Ok(true)
+    Ok(Some(Recorded {
+        changes: infos,
+        checkpoint,
+    }))
+}
+
+/// What one `record` appended (Issue #37, for `--json` and watch events).
+pub struct Recorded {
+    pub changes: Vec<ChangeInfo>,
+    pub checkpoint: Option<Checkpoint>,
+}
+
+/// One working-directory change with the node it concerns (Issue #37):
+/// `node` is `None` only for an added path not yet recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeInfo {
+    /// `added`, `modified`, `deleted` or `renamed`.
+    pub kind: &'static str,
+    /// The path (for `renamed`, the new path).
+    pub path: String,
+    /// For `renamed`: the old path.
+    pub from: Option<String>,
+    pub node: Option<NodeId>,
+    pub dir: bool,
+}
+
+/// [`ChangeInfo`]s of `changes` (index -> scan); `created` maps added
+/// paths to the nodes a record just created for them.
+pub(crate) fn change_infos(
+    changes: &[Change],
+    idx: &Index,
+    w: &wd::Scan,
+    created: &BTreeMap<String, NodeId>,
+) -> Vec<ChangeInfo> {
+    let old = |p: &str| idx.entries.get(p).map(|e| e.0);
+    let dir_w = |p: &str| matches!(w.get(p), Some(Entry::Dir));
+    let dir_i = |p: &str| matches!(idx.entries.get(p), Some((_, Entry::Dir)));
+    changes
+        .iter()
+        .map(|c| match c {
+            Change::Added(p) => ChangeInfo {
+                kind: "added",
+                path: p.clone(),
+                from: None,
+                node: created.get(p).copied(),
+                dir: dir_w(p),
+            },
+            Change::Modified(p) => ChangeInfo {
+                kind: "modified",
+                path: p.clone(),
+                from: None,
+                node: old(p),
+                dir: false,
+            },
+            Change::Deleted(p) => ChangeInfo {
+                kind: "deleted",
+                path: p.clone(),
+                from: None,
+                node: old(p),
+                dir: dir_i(p),
+            },
+            Change::Renamed(a, b) => ChangeInfo {
+                kind: "renamed",
+                path: b.clone(),
+                from: Some(a.clone()),
+                node: old(a),
+                dir: false,
+            },
+        })
+        .collect()
 }
 
 /// Issue #30: how to leave a pin when an edit made while pinned conflicts
@@ -1224,13 +1298,22 @@ pub const PINNED_WAY_OUT: &str =
 while pinned conflicts with head. To keep the edit: copy the file(s) aside, run \
 `barocss-hub checkout --force` (returns to head and unpins), copy them back, then `barocss-hub record`.";
 
+/// What a checkout wrote (Issue #37, for `--json` and watch events).
+pub struct CheckedOut {
+    pub version: VersionId,
+    pub short: String,
+    pub written: usize,
+    pub removed: usize,
+    pub at_head: bool,
+}
+
 pub(crate) fn checkout(
     repo: &mut Repo,
     id: Option<&str>,
     force: bool,
     out: &mut dyn Write,
     warn: &mut dyn Write,
-) -> Result<(), Error> {
+) -> Result<CheckedOut, Error> {
     let root = repo.root();
     let blobs = repo.blobs()?;
     blobs.sweep_temps()?;
@@ -1312,13 +1395,20 @@ pub(crate) fn checkout(
     )?;
     let mut f = frontier;
     f.sort();
-    if f != repo.head_frontier() {
+    let at_head = f == repo.head_frontier();
+    if !at_head {
         writeln!(
             out,
             "note: not at head; `barocss-hub record` and mkdir/touch/mv/rm need `barocss-hub checkout` (head) first"
         )?;
     }
-    Ok(())
+    Ok(CheckedOut {
+        version: vid,
+        short: ix.short(&vid),
+        written,
+        removed,
+        at_head,
+    })
 }
 
 pub const HELP: &str = "\
@@ -1340,8 +1430,11 @@ Commands:
   status [--ignored]   head, conflicts, unrecorded working-directory changes, tree
                        (--ignored: also list paths excluded by .hubignore)
   commit -m <msg>      checkpoint the current head (local, private)
-  log                  list checkpoints with short version ids, newest first
+  log [--path <path>]  list checkpoints with short version ids, newest first
+                       (--path: checkpoints that contain the file at <path>)
   show [-l] <short-id> print the tree of a version (hex prefix, >= 4 digits)
+  cat <short-id> <path>  write a file's bytes in that version to stdout
+  cat-blob <blob-id>   write a stored blob's bytes (64 hex digits) to stdout
   sync <path>          exchange ops, blobs and published checkpoints with another
                        local repo (log only; run `barocss-hub checkout` afterwards)
   publish <short-id|message>  mark a local checkpoint published (sync sends it)
@@ -1356,6 +1449,9 @@ Commands:
                        duplicate-replica warnings (provisional default)
   help, --help, -h     show this help
   --version, -V        print the version
+
+--json (any command): one JSON document on stdout (schema 1; `watch --json`:
+JSON Lines events); errors as JSON on stderr, exit status 1.
 ";
 
 /// Every dispatchable command name. `run` rejects any other first word, and
@@ -1363,19 +1459,32 @@ Commands:
 /// cannot drift from the dispatch table.
 pub const COMMANDS: &[&str] = &[
     "init", "peer", "watch", "sync", "publish", "warnings", "reid", "mkdir", "touch", "mv", "rm",
-    "ls", "status", "commit", "log", "show", "record", "checkout", "help",
+    "ls", "status", "commit", "log", "show", "record", "checkout", "help", "cat", "cat-blob",
 ];
 
 /// `barocss-hub --version` output (from the package version).
 pub const VERSION: &str = concat!("barocss-hub ", env!("CARGO_PKG_VERSION"), "\n");
 
 /// Run one command in `cwd`. Output goes to `out`; warnings to `warn`.
+///
+/// With `--json` (anywhere in `args`, Issue #37) `out` receives exactly one
+/// JSON document (schema [`json::SCHEMA`]) and warnings stay as text lines
+/// on `warn`; [`main_with`] folds them into the document. `hub watch
+/// --json` instead streams JSON Lines events on `out`.
+///
+/// Help-drift test (Issue #35, `tests/cli.rs`): the test reads this
+/// function's *source text* to find every dispatched command word (`a[0]
+/// == "x"`, `matches!(a[0], "x" | ..)` and `["x", ..]` slice patterns). A
+/// new command must be dispatched in one of those forms here, and listed in
+/// [`COMMANDS`] and [`HELP`], or the test fails.
 pub fn run(
     args: &[String],
     cwd: &Path,
     out: &mut dyn Write,
     warn: &mut dyn Write,
 ) -> Result<(), Error> {
+    let json = args.iter().any(|x| x == json::FLAG);
+    let args: Vec<String> = args.iter().filter(|x| *x != json::FLAG).cloned().collect();
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     let usage = |c: &str| {
         let syn = HELP
@@ -1390,10 +1499,17 @@ pub fn run(
         ))
     };
     if matches!(a.as_slice(), [] | ["help"] | ["--help"] | ["-h"]) {
+        if json {
+            return json::emit(out, json::doc("help", vec![("text", json::J::s(HELP))]));
+        }
         out.write_all(HELP.as_bytes())?;
         return Ok(());
     }
     if matches!(a.as_slice(), ["--version"] | ["-V"]) {
+        if json {
+            let v = json::J::s(env!("CARGO_PKG_VERSION"));
+            return json::emit(out, json::doc("version", vec![("version", v)]));
+        }
         out.write_all(VERSION.as_bytes())?;
         return Ok(());
     }
@@ -1402,6 +1518,10 @@ pub fn run(
             "unknown command '{}' (see barocss-hub --help)",
             a[0]
         ));
+    }
+    if json && !json::STRUCTURED.contains(&a[0]) {
+        // Commands without a structured form: their human lines, wrapped.
+        return json::captured(&args, cwd, out, warn);
     }
     if a[0] == "help" {
         return Err(usage("help"));
@@ -1423,7 +1543,8 @@ pub fn run(
         return watch::peer_cmd(cwd, &a[1..], out);
     }
     if a[0] == "watch" {
-        let opts = watch::parse_opts(&a[1..])?;
+        let mut opts = watch::parse_opts(&a[1..])?;
+        opts.json = json;
         return watch::watch_cmd(cwd, opts, out, warn);
     }
     if a[0] == "sync" {
@@ -1491,19 +1612,59 @@ pub fn run(
             }
             mutate(&mut repo, "rm", Payload::Delete { node }, warn)?;
         }
-        ["record"] => {
-            record(&mut repo, None, false, out, warn)?;
-        }
-        ["record", "-m", msg] => {
-            record(&mut repo, Some(msg), false, out, warn)?;
+        ["record"] | ["record", "-m", _] => {
+            let msg = a.get(2).copied();
+            let mut sink = Vec::new();
+            let o: &mut dyn Write = if json { &mut sink } else { out };
+            let r = record(&mut repo, msg, false, o, warn)?;
+            if json {
+                json::emit(out, json::record_doc(&repo, r.as_ref()))?;
+            }
         }
         ["checkout", rest @ ..] => {
             let force = rest.contains(&"--force");
             let ids: Vec<&str> = rest.iter().copied().filter(|x| *x != "--force").collect();
-            match ids.as_slice() {
-                [] => checkout(&mut repo, None, force, out, warn)?,
-                [id] if !id.starts_with('-') => checkout(&mut repo, Some(id), force, out, warn)?,
+            let mut sink = Vec::new();
+            let o: &mut dyn Write = if json { &mut sink } else { out };
+            let c = match ids.as_slice() {
+                [] => checkout(&mut repo, None, force, o, warn)?,
+                [id] if !id.starts_with('-') => checkout(&mut repo, Some(id), force, o, warn)?,
                 _ => return Err(usage("checkout")),
+            };
+            if json {
+                json::emit(out, json::checkout_doc(&c))?;
+            }
+        }
+        ["cat", id, p] => {
+            let (v, node, blob) = json::cat_target(&repo, id, p)?;
+            let bytes = repo.blobs()?.get(&blob).map_err(|e| Error(e.to_string()))?;
+            if json {
+                json::emit(
+                    out,
+                    json::cat_doc(&v, &repo.index().short(&v), p, node, blob, &bytes),
+                )?;
+            } else {
+                out.write_all(&bytes)?;
+            }
+        }
+        ["cat-blob", b] => {
+            let blob = json::parse_blob(b)?;
+            let bytes = repo.blobs()?.get(&blob).map_err(|e| match e {
+                blobs::BlobError::Missing(_) => Error(format!("no such blob: {b}")),
+                e => Error(e.to_string()),
+            })?;
+            if json {
+                json::emit(out, json::blob_doc(blob, &bytes))?;
+            } else {
+                out.write_all(&bytes)?;
+            }
+        }
+        ["ls", ..] | ["show", ..] | ["status", ..] | ["log", ..] | ["warnings"] if json => {
+            json::read_cmd(&repo, &state, &proj, &a, out, warn)?;
+        }
+        ["log", "--path", p] => {
+            for l in json::path_history_lines(&repo, p)? {
+                writeln!(out, "{l}")?;
             }
         }
         ["ls", "-l"] => {
@@ -1657,7 +1818,11 @@ pub fn run(
         ["commit", "-m", msg] => {
             let c = repo.commit(msg)?;
             let ix = repo.index();
-            writeln!(out, "[{}] {}", ix.short(&c.id()), c.message)?;
+            if json {
+                json::emit(out, json::commit_doc(&repo, &ix, &c))?;
+            } else {
+                writeln!(out, "[{}] {}", ix.short(&c.id()), c.message)?;
+            }
         }
         ["log"] => {
             let ix = repo.index();
@@ -1788,6 +1953,52 @@ pub fn run(
         std::mem::forget(repo);
     }
     Ok(())
+}
+
+/// Program name used as the error prefix (`barocss-hub: <message>`) and in
+/// `--json` error documents.
+pub const PROGRAM: &str = "barocss-hub";
+
+/// The whole process behaviour of `barocss-hub` (Issue #37): run `args`,
+/// print errors, return the exit status (see [`json`] for the exit codes).
+///
+/// Human mode: output and warnings stream to `out`/`err`; an error prints
+/// `barocss-hub: <message>` on `err`. `--json` mode: `out` gets exactly one
+/// JSON document (warnings folded in as `"warnings"`), or, on an error,
+/// nothing on `out` and one JSON error document on `err`. `watch --json`
+/// streams events on `out` as it runs.
+pub fn main_with(args: &[String], cwd: &Path, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    if !args.iter().any(|x| x == json::FLAG) {
+        return match run(args, cwd, out, err) {
+            Ok(()) => 0,
+            Err(e) if e.is_broken_pipe() => 0,
+            Err(e) => {
+                let _ = writeln!(err, "{PROGRAM}: {e}");
+                json::EXIT_ERROR
+            }
+        };
+    }
+    let streaming = args.iter().find(|x| *x != json::FLAG).map(String::as_str) == Some("watch");
+    let (mut doc, mut wbuf) = (Vec::new(), Vec::new());
+    let r = if streaming {
+        run(args, cwd, out, &mut wbuf)
+    } else {
+        run(args, cwd, &mut doc, &mut wbuf)
+    };
+    let warnings = json::warning_lines(&wbuf);
+    match r {
+        Ok(()) => {
+            if !streaming {
+                let _ = out.write_all(&json::with_warnings(&doc, &warnings));
+            }
+            0
+        }
+        Err(e) if e.is_broken_pipe() => 0,
+        Err(e) => {
+            let _ = json::emit(err, json::error_doc(&e.0, &warnings));
+            json::EXIT_ERROR
+        }
+    }
 }
 
 /// Issue #31: the lazy checkpoint decode gives the same `hub` output as the
