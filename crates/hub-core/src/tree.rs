@@ -255,8 +255,16 @@ pub fn initial_state() -> State {
     s
 }
 
+/// Longest valid name in bytes (Remote-Sync §5.2.5, Issue #43): one op
+/// record always fits in one wire frame. Longer names are §2.2 invalid.
+pub const MAX_NAME_BYTES: usize = 4096;
+
 pub fn valid_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && name.len() <= MAX_NAME_BYTES
 }
 
 /// True if `a` is `b` or an ancestor of `b`.

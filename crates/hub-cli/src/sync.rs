@@ -57,24 +57,6 @@ pub const CRASH_ENV: &str = "HUB_TEST_CRASH_IN_SYNC";
 #[doc(hidden)]
 pub const STATS_LOG_ENV: &str = "HUB_TEST_SYNC_STATS";
 
-fn stats_log(a: &SyncReplica, b: &SyncReplica) -> Result<(), Error> {
-    if let Some(p) = std::env::var_os(STATS_LOG_ENV) {
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(p)?;
-        for (name, s) in [("this", a), ("peer", b)] {
-            writeln!(
-                f,
-                "blobs-in {name} {} {}",
-                s.blob_bytes_received(),
-                s.blobs_received()
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// Ops per `Ops` batch.
-const BATCH: usize = 256;
-
 fn read_opt(path: &Path, header: &str) -> Result<Vec<String>, Error> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -285,10 +267,24 @@ fn content_blob(o: &Op) -> Option<hub_core::tree::BlobId> {
 /// applied-set invariant says they were durable before their op) and marked
 /// held; they are read, verified, only if they are sent
 /// ([`fetch_blob`]). Blobs of pending ops are read and verified as before.
-fn load(repo: &Repo) -> Result<SyncReplica, Error> {
-    let disk = repo.blobs()?;
-    disk.sweep_temps()?;
-    let on_disk: std::collections::HashSet<_> = disk.list()?.into_iter().collect();
+pub(crate) fn load(repo: &Repo) -> Result<SyncReplica, Error> {
+    load_opts(repo, true)
+}
+
+/// [`load`]; `write = false` (a read-only `serve`) never creates, sweeps or
+/// otherwise touches a file.
+pub(crate) fn load_opts(repo: &Repo, write: bool) -> Result<SyncReplica, Error> {
+    let bdir = repo.dir.join("blobs");
+    let on_disk: std::collections::HashSet<_> = if write {
+        let disk = repo.blobs()?;
+        disk.sweep_temps()?;
+        crate::session::sweep_wire_files(&bdir);
+        disk.list()?.into_iter().collect()
+    } else if bdir.is_dir() {
+        crate::blobs::list_dir(&bdir)?.into_iter().collect()
+    } else {
+        Default::default()
+    };
     let mut bs = BlobStore::new();
     for o in repo.store.values() {
         if let Some(b) = content_blob(o) {
@@ -308,8 +304,10 @@ fn load(repo: &Repo) -> Result<SyncReplica, Error> {
     }
     let pending = read_pending(&repo.dir)?;
     for (o, _) in &pending {
-        if let Some(bytes) = content_blob(o).and_then(|b| disk.get(&b).ok()) {
-            bs.put(&bytes);
+        if let Some(b) = content_blob(o) {
+            if let Ok(bytes) = crate::blobs::read_verified(&bdir, &b) {
+                bs.put(&bytes);
+            }
         }
     }
     Ok(SyncReplica::from_parts(
@@ -322,28 +320,14 @@ fn load(repo: &Repo) -> Result<SyncReplica, Error> {
     ))
 }
 
-/// Sender side of the Issue #34 `NeedBlobs` step: bytes of a blob the
-/// receiver lacks, from memory (a pending op's blob) or read and verified
-/// from disk.
-fn fetch_blob(repo: &Repo, s: &SyncReplica, id: &hub_core::tree::BlobId) -> Result<Vec<u8>, Error> {
-    if let Some(b) = s.blobs().get(id) {
-        return Ok(b.to_vec());
-    }
-    repo.blobs()?.get(id).map_err(|e| {
-        Error::new(
-            Code::Error,
-            format!("cannot sync {}: {e}", repo.root().display()),
-        )
-    })
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub ops: usize,
+    pub blobs: usize,
+    pub checkpoints: usize,
 }
 
-struct Counts {
-    ops: usize,
-    blobs: usize,
-    checkpoints: usize,
-}
-
-fn persist_warnings(repo: &Repo, s: &SyncReplica) -> Result<(), Error> {
+pub(crate) fn persist_warnings(repo: &Repo, s: &SyncReplica) -> Result<(), Error> {
     let ws: Vec<String> = s.warnings().iter().map(encode_warning).collect();
     rewrite(&repo.dir.join("warnings.log"), WARNINGS_HEADER, &ws)
 }
@@ -363,9 +347,12 @@ pub enum Interrupt {
 /// Error message of an in-process [`Interrupt::Return`].
 pub const INTERRUPTED: &str = "sync interrupted (test hook)";
 
-fn persist(
+/// Persist a merged replica (A.1 order), where some received blobs are verified files (`files`,
+/// Issue #43): they are renamed into place, never re-read.
+pub(crate) fn persist_with(
     repo: &mut Repo,
     s: &SyncReplica,
+    files: &std::collections::HashMap<hub_core::tree::BlobId, PathBuf>,
     appended: &mut usize,
     stop: Option<Interrupt>,
 ) -> Result<Counts, Error> {
@@ -391,6 +378,8 @@ fn persist(
     for b in want {
         if let Some(bytes) = s.blobs().get(&b) {
             batch.add(bytes).map_err(crate::blob_error)?;
+        } else if let Some(f) = files.get(&b) {
+            batch.add_file(&b, f).map_err(crate::blob_error)?;
         }
     }
     let nblobs = batch.commit().map_err(crate::blob_error)?;
@@ -445,36 +434,26 @@ pub fn find_hub(start: &Path) -> Result<PathBuf, Error> {
     )
 }
 
-fn dup_warning(peer: ReplicaId, other: &Path) -> RejectWarning {
-    RejectWarning {
-        peer,
-        author: Some(peer),
-        rejected: None,
-        reason: RejectReason::DuplicateReplica,
-        detail: format!(
-            "repository {} uses our replica id; run `barocss-hub reid` in one copy",
-            other.display()
-        ),
-        stuck: Vec::new(),
-        first_seen: 0,
-    }
-}
-
-/// `hub sync <path>`.
+/// `hub sync <path>` (local `file://`, Issue #22; over the wire protocol
+/// since #43, see [`sync_local`]).
 pub fn sync_cmd(
     cwd: &Path,
     peer_arg: &str,
     out: &mut dyn Write,
     warn: &mut dyn Write,
 ) -> Result<(), Error> {
-    let stop = std::env::var(CRASH_ENV)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Interrupt::Abort);
-    sync_with(cwd, peer_arg, stop, out, warn)
+    crate::remote::sync_cmd(cwd, Some(peer_arg), out, warn)
 }
 
-/// [`sync_cmd`] with an explicit test interruption point.
+/// The test crash hook from the environment ([`CRASH_ENV`]).
+pub(crate) fn env_stop() -> Option<Interrupt> {
+    std::env::var(CRASH_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Interrupt::Abort)
+}
+
+/// Local sync with an explicit test interruption point.
 #[doc(hidden)]
 pub fn sync_with(
     cwd: &Path,
@@ -483,18 +462,120 @@ pub fn sync_with(
     out: &mut dyn Write,
     warn: &mut dyn Write,
 ) -> Result<(), Error> {
-    let mine = fs::canonicalize(find_hub(cwd)?)?;
     let peer_path = cwd.join(peer_arg);
+    let r = sync_local(cwd, &peer_path, stop, warn)?;
+    print_report(&r, out, warn)
+}
+
+/// A finished sync, for printing and for `watch`/`--json`.
+pub struct Synced {
+    pub remote: String,
+    pub report: crate::session::Report,
+    pub peer_pending: Option<usize>,
+    pub pending: usize,
+    pub warnings: usize,
+    pub head_short: String,
+    pub head_id: String,
+    pub behind_note: bool,
+}
+
+/// Print a [`Synced`] the way `hub sync` always has.
+pub fn print_report(r: &Synced, out: &mut dyn Write, warn: &mut dyn Write) -> Result<(), Error> {
+    let (got, sent) = (r.report.received, r.report.sent);
+    writeln!(
+        out,
+        "synced with {}: received {} op(s), {} blob(s), {} checkpoint(s); sent {} op(s), {} blob(s), {} checkpoint(s)",
+        r.remote, got.ops, got.blobs, got.checkpoints, sent.ops, sent.blobs, sent.checkpoints
+    )?;
+    if r.report.read_only {
+        writeln!(out, "remote is read-only; pulled only")?;
+    }
+    writeln!(
+        out,
+        "head {}{}",
+        r.head_short,
+        if r.report.same_head {
+            " (both repositories)"
+        } else {
+            ""
+        }
+    )?;
+    for (n, name) in [
+        (Some(r.pending), "this repository"),
+        (r.peer_pending, "peer"),
+    ] {
+        if let Some(n) = n.filter(|n| *n > 0) {
+            writeln!(
+                warn,
+                "warning: {name}: {n} op(s) pending (missing deps); retried on the next sync, see `barocss-hub warnings`"
+            )?;
+        }
+    }
+    if r.warnings > 0 {
+        writeln!(
+            warn,
+            "warning: {} sync warning(s); see `barocss-hub warnings`",
+            r.warnings
+        )?;
+    }
+    if r.behind_note {
+        writeln!(
+            out,
+            "note: the working directory is not updated by sync; run `barocss-hub checkout` to bring it to head"
+        )?;
+    }
+    Ok(())
+}
+
+/// Build the [`Synced`] summary from the client side after a session.
+pub(crate) fn summarize(
+    remote: String,
+    side: &crate::session::Side,
+    report: crate::session::Report,
+    peer_pending: Option<usize>,
+) -> Result<Synced, Error> {
+    let repo = side.repo().expect("client side holds its repo");
+    let s = side.replica();
+    let ix = repo.index();
+    let hid = VersionId::of_frontier(&repo.head_frontier());
+    let idx = crate::wd::Index::load(&repo.dir)?;
+    Ok(Synced {
+        remote,
+        behind_note: report.received.ops > 0 && idx.base != repo.head_frontier(),
+        report,
+        peer_pending,
+        pending: s.pending_len(),
+        warnings: s.warnings().len(),
+        head_short: ix.short(&hid),
+        head_id: hid.hex(),
+    })
+}
+
+/// Sync with a local repository over the wire protocol (`file://`, §5.3.3)
+/// through an in-process pipe, the far end on a thread. Both repositories
+/// are locked for the whole session in canonical-path order (as #22), so
+/// two opposite local syncs cannot deadlock; see the #43 report for why
+/// the served end does not use the per-step lock here.
+pub fn sync_local(
+    cwd: &Path,
+    peer_path: &Path,
+    stop: Option<Interrupt>,
+    warn: &mut dyn Write,
+) -> Result<Synced, Error> {
+    use crate::session::{self, Access, Side};
+    let mine = fs::canonicalize(find_hub(cwd)?)?;
     if !peer_path.is_dir() {
-        return crate::errc(Code::NoSuchPath, format!("no such directory: {peer_arg}"));
+        return crate::errc(
+            Code::NoSuchPath,
+            format!("no such directory: {}", peer_path.display()),
+        );
     }
     // Canonicalize before the upward walk: `a/../b` must not find a's hub.
-    let theirs = fs::canonicalize(find_hub(&fs::canonicalize(&peer_path)?)?)?;
+    let theirs = fs::canonicalize(find_hub(&fs::canonicalize(peer_path)?)?)?;
     if mine == theirs {
         return crate::errc(Code::Usage, "cannot sync a repository with itself");
     }
-    // Lock order: canonical path, so opposite syncs cannot deadlock.
-    let (mut a, mut b) = if mine < theirs {
+    let (a, b) = if mine < theirs {
         let a = Repo::open_dir_with(mine.clone(), LockMode::Exclusive)?;
         let b = Repo::open_dir_with(theirs.clone(), LockMode::Exclusive)?;
         (a, b)
@@ -506,124 +587,35 @@ pub fn sync_with(
     for w in a.warnings.iter().chain(&b.warnings) {
         writeln!(warn, "warning: {w}")?;
     }
-    let (ra, rb) = (a.root(), b.root());
-    let mut sa = load(&a)?;
-    let mut sb = load(&b)?;
-    let dup_msg = |why: &str| {
-        Error::new(
-            Code::DuplicateReplica,
-            format!(
-                "sync aborted: {why} (duplicate replica id, D-022). One repository is probably a \
-             copy of the other's .hub/; run `barocss-hub reid` in one of them, then sync again"
-            ),
-        )
-    };
-    if a.replica_id == b.replica_id {
-        let wa = sa
-            .warnings()
-            .into_iter()
-            .chain([dup_warning(b.replica_id, &rb)]);
-        let wb = sb
-            .warnings()
-            .into_iter()
-            .chain([dup_warning(a.replica_id, &ra)]);
-        for (repo, ws) in [(&a, wa.collect::<Vec<_>>()), (&b, wb.collect())] {
-            let mut ws2: Vec<RejectWarning> = Vec::new();
-            for w in ws {
-                if !ws2
-                    .iter()
-                    .any(|x| x.reason == w.reason && x.detail == w.detail)
-                {
-                    ws2.push(w);
-                }
-            }
-            let bodies: Vec<String> = ws2.iter().map(encode_warning).collect();
-            rewrite(&repo.dir.join("warnings.log"), WARNINGS_HEADER, &bodies)?;
-        }
-        return Err(dup_msg(&format!(
-            "{} and {} have the same replica id {:032x}",
-            ra.display(),
-            rb.display(),
-            a.replica_id.0
-        )));
+    let rb = b.root();
+    let mut ca = Side::new(Access::Held(Box::new(a)), false)?;
+    let mut cb = Side::new(Access::Held(Box::new(b)), false)?;
+    ca.stop = stop;
+    cb.stop = stop;
+    cb.appended = ca.appended.clone();
+    let (mut x, mut y, _cut) = crate::wire::pair();
+    let th = std::thread::spawn(move || {
+        let r = session::server(&mut y, &mut cb);
+        (r, cb)
+    });
+    let rc = session::client(&mut x, &mut ca);
+    drop(x);
+    let (rs, cb) = th
+        .join()
+        .map_err(|_| Error::new(Code::Error, "sync thread panicked"))?;
+    let interrupted = |r: &Result<(), Error>| matches!(r, Err(e) if e.0 == INTERRUPTED);
+    if interrupted(&rs) {
+        return Err(rs.unwrap_err());
     }
-    let dups = |s: &SyncReplica| {
-        s.warnings()
-            .iter()
-            .filter(|w| w.reason == RejectReason::DuplicateReplica)
-            .count()
-    };
-    let (da, db) = (dups(&sa), dups(&sb));
-    core::sync_with(
-        &mut sa,
-        &mut sb,
-        BATCH,
-        &mut |s, id| fetch_blob(&a, s, id),
-        &mut |s, id| fetch_blob(&b, s, id),
-    )?;
-    stats_log(&sa, &sb)?;
-    if dups(&sa) > da || dups(&sb) > db {
-        // Keep the warnings (D-021), persist no ops (D-022).
-        persist_warnings(&a, &sa)?;
-        persist_warnings(&b, &sb)?;
-        return Err(dup_msg(
-            "received ops authored under our own replica id that we never authored",
-        ));
-    }
-    let mut appended = 0;
-    let got = persist(&mut a, &sa, &mut appended, stop)?;
-    let sent = persist(&mut b, &sb, &mut appended, stop)?;
-    writeln!(
-        out,
-        "synced with {}: received {} op(s), {} blob(s), {} checkpoint(s); sent {} op(s), {} blob(s), {} checkpoint(s)",
-        rb.display(),
-        got.ops,
-        got.blobs,
-        got.checkpoints,
-        sent.ops,
-        sent.blobs,
-        sent.checkpoints
-    )?;
-    let ix = a.index();
-    let hid = VersionId::of_frontier(&a.head_frontier());
-    let same = a.head_frontier() == b.head_frontier();
-    writeln!(
-        out,
-        "head {}{}",
-        ix.short(&hid),
-        if same { " (both repositories)" } else { "" }
-    )?;
-    for (s, name) in [(&sa, "this repository"), (&sb, "peer")] {
-        if s.pending_len() > 0 {
-            writeln!(
-                warn,
-                "warning: {name}: {} op(s) pending (missing deps); retried on the next sync, see `barocss-hub warnings`",
-                s.pending_len()
-            )?;
+    let report = rc?;
+    if let Some(p) = std::env::var_os(STATS_LOG_ENV) {
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(p)?;
+        for (name, s) in [("this", &ca), ("peer", &cb)] {
+            writeln!(f, "blobs-in {name} {} {}", s.blob_bytes_in, s.blobs_in)?;
         }
     }
-    let nw = sa.warnings().len();
-    if nw > 0 {
-        writeln!(
-            warn,
-            "warning: {nw} sync warning(s); see `barocss-hub warnings`"
-        )?;
-    }
-    let idx = crate::wd::Index::load(&a.dir)?;
-    if got.ops > 0 && idx.base != a.head_frontier() {
-        writeln!(
-            out,
-            "note: the working directory is not updated by sync; run `barocss-hub checkout` to bring it to head"
-        )?;
-    }
-    // Issue #33: both sides refresh `.hub/snapshot` when due.
-    for w in [a.maybe_snapshot(), b.maybe_snapshot()]
-        .into_iter()
-        .flatten()
-    {
-        writeln!(warn, "warning: {w}")?;
-    }
-    Ok(())
+    let peer_pending = Some(session::pending_len(&cb));
+    summarize(rb.display().to_string(), &ca, report, peer_pending)
 }
 
 /// Ops in head but not in the down-closure of `base` (0 if `base` does not

@@ -165,85 +165,6 @@ pub fn read_peers(hub: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(lines.filter(|l| !l.is_empty()).map(PathBuf::from).collect())
 }
 
-pub(crate) fn write_peers(hub: &Path, peers: &[PathBuf]) -> Result<(), Error> {
-    let mut s = format!("{PEERS_HEADER}\n");
-    for p in peers {
-        s.push_str(&p.to_string_lossy());
-        s.push('\n');
-    }
-    store::write_atomic(&hub.join("peers"), s.as_bytes())?;
-    Ok(())
-}
-
-fn peer_root(cwd: &Path, arg: &str) -> Result<PathBuf, Error> {
-    let p = cwd.join(arg);
-    if !p.is_dir() {
-        return crate::errc(Code::NoSuchPath, format!("no such directory: {arg}"));
-    }
-    // Canonicalize first: a lexical walk of `a/../b` would find a's `.hub`.
-    let root = fs::canonicalize(&p)?;
-    if !root.join(crate::HUB_DIR).is_dir() {
-        return crate::errc(
-            Code::NotARepository,
-            format!("no hub repository at {arg} (run `barocss-hub init` there)"),
-        );
-    }
-    let s = root.to_string_lossy();
-    if s.contains('\n') || s.contains('\r') {
-        return crate::errc(Code::InvalidPath, "peer path contains a newline");
-    }
-    Ok(root)
-}
-
-/// `hub peer add|list|rm`.
-pub fn peer_cmd(cwd: &Path, args: &[&str], out: &mut dyn Write) -> Result<(), Error> {
-    let hub = fs::canonicalize(find_hub(cwd)?)?;
-    // The repo lock serializes peers-file updates with other writers.
-    let _repo_lock = store::RepoLock::acquire(&hub, LockMode::Exclusive)?;
-    let mut peers = read_peers(&hub)?;
-    match args {
-        ["list"] => {
-            for p in &peers {
-                writeln!(out, "{}", p.display())?;
-            }
-        }
-        ["add", arg] => {
-            let root = peer_root(cwd, arg)?;
-            if hub.parent() == Some(root.as_path()) {
-                return crate::errc(Code::Usage, "cannot add this repository as its own peer");
-            }
-            if peers.contains(&root) {
-                writeln!(out, "already a peer: {}", root.display())?;
-            } else {
-                peers.push(root.clone());
-                write_peers(&hub, &peers)?;
-                writeln!(out, "added peer {}", root.display())?;
-            }
-        }
-        ["rm", arg] => {
-            let target = match peer_root(cwd, arg) {
-                Ok(r) => r,
-                // A peer that no longer exists can still be removed by path.
-                Err(_) => PathBuf::from(arg),
-            };
-            let before = peers.len();
-            peers.retain(|p| *p != target);
-            if peers.len() == before {
-                return crate::errc(Code::NotFound, format!("not a peer: {arg}"));
-            }
-            write_peers(&hub, &peers)?;
-            writeln!(out, "removed peer {}", target.display())?;
-        }
-        _ => {
-            return crate::errc(
-                Code::Usage,
-                "usage: barocss-hub peer add <path> | list | rm <path>  (see barocss-hub --help)",
-            )
-        }
-    }
-    Ok(())
-}
-
 /// `Some(pid)` if a watcher currently holds `.hub/watch.lock`.
 pub fn active_watch(hub: &Path) -> Result<Option<String>, Error> {
     if !hub.join(LOCK_FILE).exists() {
@@ -515,18 +436,6 @@ fn step_in(repo: &mut Repo, out: &mut dyn Write, warn: &mut dyn Write) -> Result
     Ok(st)
 }
 
-/// Parse a sync summary line's six counts (received ops, blobs,
-/// checkpoints; sent ops, blobs, checkpoints).
-fn sync_counts(line: &str) -> Option<[u64; 6]> {
-    let rest = line.split_once(": received ")?.1;
-    let nums: Vec<u64> = rest
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|t| !t.is_empty())
-        .filter_map(|t| t.parse().ok())
-        .collect();
-    nums.try_into().ok()
-}
-
 /// Output of the watcher: human text or JSON Lines events (Issue #37).
 struct Io<'a> {
     json: bool,
@@ -611,50 +520,77 @@ fn step_events(io: &mut Io, s: &Step) -> Result<(), Error> {
     Ok(())
 }
 
-fn sync_all(hub: &Path, io: &mut Io) -> Result<(), Error> {
+/// Per-remote failure backoff (Issue #43, D-044): after `n` consecutive
+/// failures a remote is skipped until `2^min(n,5)` sync intervals passed.
+#[derive(Default)]
+struct Backoff(std::collections::HashMap<String, (u32, Instant)>);
+
+impl Backoff {
+    fn due(&self, name: &str) -> bool {
+        self.0.get(name).is_none_or(|(_, t)| Instant::now() >= *t)
+    }
+    fn fail(&mut self, name: &str, every: Duration) {
+        let e = self
+            .0
+            .entry(name.to_string())
+            .or_insert((0, Instant::now()));
+        e.0 += 1;
+        e.1 = Instant::now() + every * (1u32 << e.0.min(5));
+    }
+    fn ok(&mut self, name: &str) {
+        self.0.remove(name);
+    }
+}
+
+fn sync_all(hub: &Path, io: &mut Io, backoff: &mut Backoff, every: Duration) -> Result<(), Error> {
     let root = hub.parent().unwrap_or(hub).to_path_buf();
-    for p in read_peers(hub)? {
-        let mut sink = Vec::new();
-        let r =
-            io.call(|_, warn| crate::sync::sync_cmd(&root, &p.to_string_lossy(), &mut sink, warn));
-        if let Err(e) = r {
-            if io.json {
-                io.event(
-                    "error",
-                    vec![
-                        ("stage", J::s("sync")),
-                        ("peer", J::s(p.to_string_lossy())),
-                        ("message", J::s(&e.0)),
-                    ],
-                )?;
-            } else {
-                io.warning(&format!("sync with {} failed: {e}", p.display()))?;
-            }
-        } else {
-            // Only report syncs that moved something (first line only; the
-            // checkout note does not apply, the watcher applies itself).
-            let s = String::from_utf8_lossy(&sink);
-            let first = s.lines().next().unwrap_or("");
-            if !first.contains("received 0 op(s), 0 blob(s), 0 checkpoint(s); sent 0 op(s), 0 blob(s), 0 checkpoint(s)") {
+    for r in crate::remote::remotes_view(hub)? {
+        if !backoff.due(&r.name) {
+            continue;
+        }
+        let name = r.name.clone();
+        let res = io.call(|_, warn| crate::remote::sync(&root, Some(&name), true, warn));
+        match res {
+            Err(e) => {
+                backoff.fail(&name, every);
                 if io.json {
-                    let n = sync_counts(first).unwrap_or([0; 6]);
-                    let counts = |i: usize| {
-                        J::obj(vec![
-                            ("ops", J::Num(n[i])),
-                            ("blobs", J::Num(n[i + 1])),
-                            ("checkpoints", J::Num(n[i + 2])),
-                        ])
-                    };
                     io.event(
-                        "synced",
+                        "error",
                         vec![
-                            ("peer", J::s(p.to_string_lossy())),
-                            ("received", counts(0)),
-                            ("sent", counts(3)),
+                            ("stage", J::s("sync")),
+                            ("peer", J::s(&name)),
+                            ("code", J::s(e.code().as_str())),
+                            ("message", J::s(&e.0)),
                         ],
                     )?;
                 } else {
-                    writeln!(io.out, "{first}")?;
+                    io.warning(&format!("sync with {name} failed: {e}"))?;
+                }
+            }
+            Ok(s) => {
+                backoff.ok(&name);
+                let (g, t) = (s.report.received, s.report.sent);
+                let moved = g.ops + g.blobs + g.checkpoints + t.ops + t.blobs + t.checkpoints > 0;
+                // Only report syncs that moved something.
+                if moved {
+                    if io.json {
+                        io.event(
+                            "synced",
+                            vec![
+                                ("peer", J::s(&name)),
+                                ("received", crate::json::counts_j(&g)),
+                                ("sent", crate::json::counts_j(&t)),
+                                ("read_only", J::Bool(s.report.read_only)),
+                            ],
+                        )?;
+                    } else {
+                        writeln!(
+                            io.out,
+                            "synced with {name}: received {} op(s), {} blob(s), {} checkpoint(s); sent {} op(s), {} blob(s), {} checkpoint(s){}",
+                            g.ops, g.blobs, g.checkpoints, t.ops, t.blobs, t.checkpoints,
+                            if s.report.read_only { " (remote is read-only; pulled only)" } else { "" }
+                        )?;
+                    }
                 }
             }
         }
@@ -701,20 +637,21 @@ pub fn watch_cmd(
         out,
         warn,
     };
-    let npeers = read_peers(&hub)?.len();
+    let nremotes = crate::remote::remotes_view(&hub)?.len();
+    let mut backoff = Backoff::default();
     if io.json {
         io.event(
             "started",
             vec![
                 ("root", J::s(root.to_string_lossy())),
                 ("pid", J::n(std::process::id())),
-                ("peers", J::n(npeers)),
+                ("remotes", J::n(nremotes)),
             ],
         )?;
     } else {
         writeln!(
             io.out,
-            "watching {} ({npeers} peer(s)); Ctrl-C to stop",
+            "watching {} ({nremotes} remote(s)); Ctrl-C to stop",
             root.display(),
         )?;
     }
@@ -732,7 +669,8 @@ pub fn watch_cmd(
             io.warning(&format!("{stage}: {e}"))
         }
     };
-    let cycle = |do_sync: bool, io: &mut Io| -> Result<(), Error> {
+    let every = opts.sync_every;
+    let mut cycle = |do_sync: bool, io: &mut Io| -> Result<(), Error> {
         let recorded = match io.call(|o, w| step(&hub, o, w)) {
             Ok(s) => {
                 step_events(io, &s)?;
@@ -745,7 +683,7 @@ pub fn watch_cmd(
         };
         if (recorded || do_sync) && !stopping() {
             let mid = oplog_len(&hub);
-            sync_all(&hub, io)?;
+            sync_all(&hub, io, &mut backoff, every)?;
             if oplog_len(&hub) != mid && !stopping() {
                 match io.call(|o, w| step(&hub, o, w)) {
                     Ok(s) => step_events(io, &s)?,

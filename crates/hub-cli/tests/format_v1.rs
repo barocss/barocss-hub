@@ -490,9 +490,8 @@ fn migration_preserves_every_output() {
         fs::read_to_string(h.join("format")).unwrap(),
         "barocss-hub/format/v1\n"
     );
-    assert!(fs::read_to_string(h.join("peers"))
-        .unwrap()
-        .starts_with("barocss-hub/peers/v1\n"));
+    // #43 (D-041): no `peers` file any more.
+    assert!(!h.join("peers").exists());
     assert!(h.join("watch.lock").exists());
     assert!(!h.join("ops.log.v1").exists());
     // Same op records, now one batch.
@@ -525,10 +524,14 @@ fn migration_preserves_every_output() {
 fn migration_keeps_peers_and_skips_torn_v0_tail() {
     let d = setup("mig-peers");
     let p = setup("mig-peers-peer");
-    ok(&d, &["peer", "add", p.to_str().unwrap()]);
+    // #43: the v0 peer becomes a `file://` remote named after its folder,
+    // exactly what this `remote add` makes.
+    let name = p.file_name().unwrap().to_str().unwrap().to_string();
+    ok(&d, &["remote", "add", &name, p.to_str().unwrap()]);
     let want = views(&d, NOSNAP);
     to_v0(&d);
     let h = d.join(".hub");
+    fs::remove_file(h.join("remotes")).unwrap();
     fs::write(
         h.join("peers"),
         format!(
@@ -548,10 +551,15 @@ fn migration_keeps_peers_and_skips_torn_v0_tail() {
     let (_, err) = ok_env(&d, &["status"], &[]);
     assert!(err.contains("migrated"), "{err}");
     assert_eq!(views(&d, NOSNAP), want);
-    assert_eq!(
-        ok(&d, &["peer", "list"]).trim(),
-        fs::canonicalize(&p).unwrap().display().to_string()
+    let want_list = format!(
+        "{name}\tfile://{}\t(default)",
+        fs::canonicalize(&p).unwrap().display()
     );
+    assert_eq!(ok(&d, &["remote", "list"]).trim(), want_list);
+    // The first exclusive command converts `peers` into `remotes`.
+    ok(&d, &["record"]);
+    assert!(!h.join("peers").exists());
+    assert_eq!(ok(&d, &["remote", "list"]).trim(), want_list);
 }
 
 const MIG_STAGES: &[&str] = &[
@@ -640,7 +648,7 @@ fn v0_binary_refuses_v1_without_touching_it() {
     let bin = PathBuf::from(bin);
     let d = setup("v0bin");
     let peer = setup("v0bin-peer");
-    ok(&d, &["peer", "add", peer.to_str().unwrap()]);
+    ok(&d, &["remote", "add", "p", peer.to_str().unwrap()]);
     write(&d, "top", b"unrecorded edit\n");
     // A committed-but-uncheckpointed batch at the end of the log, plus a
     // trailing half line the v0 torn-tail rule would cut.

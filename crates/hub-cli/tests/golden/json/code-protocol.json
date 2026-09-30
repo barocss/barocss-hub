@@ -1,0 +1,1 @@
+{"schema":1,"program":"barocss-hub","error":{"code":"protocol","message":"sync with ssh://h/r failed: the remote did not answer with the barocss-hub wire preamble (not barocss-hub, or a login banner on stdout)"},"warnings":[]}

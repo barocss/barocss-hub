@@ -58,9 +58,6 @@ pub fn needs_finish(dir: &Path) -> bool {
     dir.join(OPLOG_V1_TMP).exists()
         || !dir.join(watch::LOCK_FILE).exists()
         || !dir.join("format").exists()
-        || fs::read_to_string(dir.join("peers"))
-            .map(|t| t.lines().next() != Some(watch::PEERS_HEADER))
-            .unwrap_or(true)
 }
 
 /// Check `.hub/format` if present (must say v1).
@@ -156,14 +153,8 @@ pub fn finish(dir: &Path) -> Result<(), Error> {
         dsync(dir)?;
     }
     durable::crash_point(durable::MIG_LOG_RENAMED);
-    let peers = dir.join("peers");
-    let need = fs::read_to_string(&peers)
-        .map(|t| t.lines().next() != Some(watch::PEERS_HEADER))
-        .unwrap_or(true);
-    if need {
-        let list = watch::read_peers(dir)?;
-        watch::write_peers(dir, &list)?;
-    }
+    // Issue #43 (D-041): `peers` is no longer rewritten here; the exclusive
+    // open that follows converts it to `remotes` (remote::migrate_peers).
     durable::crash_point(durable::MIG_PEERS);
     if !dir.join(watch::LOCK_FILE).exists() {
         OpenOptions::new()
