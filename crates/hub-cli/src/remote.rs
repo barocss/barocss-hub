@@ -202,7 +202,9 @@ pub fn remote_name_ok(n: &str) -> bool {
 }
 
 fn exec_ok(e: &str) -> bool {
-    !e.is_empty() && e.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b'\'' && b != b'"')
+    !e.is_empty()
+        && e.bytes()
+            .all(|b| (0x21..=0x7e).contains(&b) && b != b'\'' && b != b'"')
 }
 
 /// `barocss-hub remote add|list|rm|set-url`.
@@ -263,6 +265,24 @@ pub fn remote_cmd(cwd: &Path, args: &[&str], out: &mut dyn Write) -> Result<(), 
                 return errc(Code::AlreadyExists, format!("remote {name} already exists"));
             }
             let url = canonical_url(cwd, url)?;
+            if let Some(p) = url.strip_prefix("file://") {
+                let p = Path::new(p);
+                if !p.join(crate::HUB_DIR).is_dir() {
+                    return errc(
+                        Code::NotARepository,
+                        format!(
+                            "no hub repository at {} (run `barocss-hub init` there)",
+                            pos[pos.len() - 1]
+                        ),
+                    );
+                }
+                if hub.parent() == Some(p) {
+                    return errc(Code::Usage, "cannot add this repository as its own remote");
+                }
+            }
+            if rs.iter().any(|r| r.url == url) {
+                return errc(Code::AlreadyExists, format!("already a remote: {url}"));
+            }
             if default {
                 for r in &mut rs {
                     r.default = false;
@@ -324,13 +344,17 @@ pub enum Url {
 fn word_ok(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('-')
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'[' | b']' | b':' | b'%'))
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'[' | b']' | b':' | b'%')
+        })
 }
 
 fn path_ok(p: &str) -> Result<(), Error> {
     if p.is_empty() || p.contains('\n') || p.contains('\0') || p.contains('\r') {
-        return errc(Code::Usage, "remote path is empty or contains a newline or NUL");
+        return errc(
+            Code::Usage,
+            "remote path is empty or contains a newline or NUL",
+        );
     }
     Ok(())
 }
@@ -419,7 +443,10 @@ fn canonical_url(cwd: &Path, s: &str) -> Result<String, Error> {
     match parse_url(s, cwd)? {
         Url::File(p) => {
             if !p.is_dir() {
-                return errc(Code::NoSuchPath, format!("no such directory: {}", p.display()));
+                return errc(
+                    Code::NoSuchPath,
+                    format!("no such directory: {}", p.display()),
+                );
             }
             Ok(file_url(&fs::canonicalize(p)?))
         }
@@ -501,13 +528,22 @@ pub fn resolve(cwd: &Path, arg: Option<&str>) -> Result<(String, Url, Option<Str
         },
     };
     let root = hub.parent().unwrap_or(&hub).to_path_buf();
-    let base = if arg.is_some() && r.url == r.name { cwd } else { &root };
+    let base = if arg.is_some() && r.url == r.name {
+        cwd
+    } else {
+        &root
+    };
     let url = parse_url(&r.url, base)?;
     Ok((r.name, url, r.exec))
 }
 
 /// Run one sync; `batch` = ssh BatchMode (non-interactive).
-pub fn sync(cwd: &Path, arg: Option<&str>, batch: bool, warn: &mut dyn Write) -> Result<Synced, Error> {
+pub fn sync(
+    cwd: &Path,
+    arg: Option<&str>,
+    batch: bool,
+    warn: &mut dyn Write,
+) -> Result<Synced, Error> {
     let (_name, url, exec) = resolve(cwd, arg)?;
     match &url {
         Url::File(p) => sync::sync_local(cwd, p, sync::env_stop(), warn),
@@ -516,7 +552,12 @@ pub fn sync(cwd: &Path, arg: Option<&str>, batch: bool, warn: &mut dyn Write) ->
 }
 
 /// `barocss-hub sync [<remote|url>]` (human output).
-pub fn sync_cmd(cwd: &Path, arg: Option<&str>, out: &mut dyn Write, warn: &mut dyn Write) -> Result<(), Error> {
+pub fn sync_cmd(
+    cwd: &Path,
+    arg: Option<&str>,
+    out: &mut dyn Write,
+    warn: &mut dyn Write,
+) -> Result<(), Error> {
     let r = sync(cwd, arg, !stdin_is_tty(), warn)?;
     sync::print_report(&r, out, warn)
 }
@@ -600,7 +641,9 @@ fn sync_ssh(
     }
     let st = child.wait()?;
     let _ = errt.join();
-    let tail = String::from_utf8_lossy(&tail.lock().unwrap()).trim().to_string();
+    let tail = String::from_utf8_lossy(&tail.lock().unwrap())
+        .trim()
+        .to_string();
     let report = match r {
         Ok(rep) => rep,
         Err(e) if e.is_remote() => return Err(e),
@@ -610,7 +653,11 @@ fn sync_ssh(
                 Some(c) if c != 0 && e.code() == Code::Protocol => " (remote barocss-hub has no serve (too old?) or printed a banner)",
                 _ => "",
             };
-            let code = if matches!(e.code(), Code::Io) || st.code() == Some(127) { Code::Io } else { e.code() };
+            let code = if matches!(e.code(), Code::Io) || st.code() == Some(127) {
+                Code::Io
+            } else {
+                e.code()
+            };
             let mut m = format!("sync with {} failed: {}{hint}", url_text(url), e.0);
             if !tail.is_empty() {
                 m.push_str(&format!("; ssh: {tail}"));
@@ -626,12 +673,18 @@ fn sync_ssh(
 /// Parse `SSH_ORIGINAL_COMMAND` with the exact §5.9.6 grammar. Returns
 /// (`--read-only` given, path).
 pub fn parse_forced(cmd: &str) -> Result<(bool, String), Error> {
-    let no = || Error::new(Code::Forbidden, "forced command: SSH_ORIGINAL_COMMAND is not `<bin> serve --stdio [--read-only] '<path>'`");
+    let no = || {
+        Error::new(Code::Forbidden, "forced command: SSH_ORIGINAL_COMMAND is not `<bin> serve --stdio [--read-only] '<path>'`")
+    };
     if !cmd.is_ascii() {
         return Err(no());
     }
     let (word, rest) = cmd.split_once(' ').ok_or_else(no)?;
-    if word.is_empty() || !word.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b'\'') {
+    if word.is_empty()
+        || !word
+            .bytes()
+            .all(|b| (0x21..=0x7e).contains(&b) && b != b'\'')
+    {
         return Err(no());
     }
     let rest = rest.strip_prefix("serve --stdio ").ok_or_else(no)?;
@@ -669,7 +722,12 @@ fn forbidden(m: impl Into<String>) -> Error {
 
 /// Resolve and confine a served path (§5.9.2). Returns the canonical
 /// `.hub/` directory. Nothing is opened for writing here.
-pub fn confine(path: &str, root: Option<&Path>, forced: bool, cwd: &Path) -> Result<PathBuf, Error> {
+pub fn confine(
+    path: &str,
+    root: Option<&Path>,
+    forced: bool,
+    cwd: &Path,
+) -> Result<PathBuf, Error> {
     if path.is_empty() || path.contains('\0') || path.contains('\n') {
         return Err(forbidden("bad path"));
     }
@@ -684,24 +742,23 @@ pub fn confine(path: &str, root: Option<&Path>, forced: bool, cwd: &Path) -> Res
     if forced && !p.is_absolute() {
         return Err(forbidden(format!("{path}: must be absolute or ~/")));
     }
-    if Path::new(path).components().any(|c| c == Component::ParentDir) {
+    if Path::new(path)
+        .components()
+        .any(|c| c == Component::ParentDir)
+    {
         return Err(forbidden(format!("{path}: `..` is refused")));
     }
     let p = if p.is_absolute() { p } else { cwd.join(p) };
     let croot = match root {
-        Some(r) => Some(fs::canonicalize(r).map_err(|e| {
-            forbidden(format!("serve root {}: {e}", r.display()))
-        })?),
+        Some(r) => Some(
+            fs::canonicalize(r)
+                .map_err(|e| forbidden(format!("serve root {}: {e}", r.display())))?,
+        ),
         None => None,
     };
     let canon = match fs::canonicalize(&p) {
         Ok(c) => c,
-        Err(_) => {
-            return errc(
-                Code::NotARepository,
-                format!("no repository at {path}"),
-            )
-        }
+        Err(_) => return errc(Code::NotARepository, format!("no repository at {path}")),
     };
     if let Some(r) = &croot {
         if !canon.starts_with(r) {
@@ -712,7 +769,8 @@ pub fn confine(path: &str, root: Option<&Path>, forced: bool, cwd: &Path) -> Res
     let meta = fs::symlink_metadata(&hub)
         .map_err(|_| Error::new(Code::NotARepository, format!("no repository at {path}")))?;
     let inside = |q: &Path| -> Result<(), Error> {
-        let t = fs::canonicalize(q).map_err(|_| forbidden(format!("{}: dangling symlink", q.display())))?;
+        let t = fs::canonicalize(q)
+            .map_err(|_| forbidden(format!("{}: dangling symlink", q.display())))?;
         if !t.starts_with(&canon) {
             return Err(forbidden(format!(
                 "{} is a symlink pointing outside the repository",
@@ -773,7 +831,9 @@ pub fn serve_cmd(cwd: &Path, args: &[&str]) -> Result<(), Error> {
     let mut prep = || -> Result<PathBuf, Error> {
         let p = if forced {
             if path.is_some() {
-                return Err(forbidden("a path argument is not allowed with --from-ssh-original-command"));
+                return Err(forbidden(
+                    "a path argument is not allowed with --from-ssh-original-command",
+                ));
             }
             let c = std::env::var("SSH_ORIGINAL_COMMAND")
                 .map_err(|_| forbidden("forced command without SSH_ORIGINAL_COMMAND"))?;
@@ -831,7 +891,6 @@ pub fn refuse_bare(hub: &Path, cmd: &str) -> Result<(), Error> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,8 +898,14 @@ mod tests {
     #[test]
     fn forced_grammar() {
         let ok = |c: &str| parse_forced(c).unwrap();
-        assert_eq!(ok("barocss-hub serve --stdio '/srv/a b'"), (false, "/srv/a b".into()));
-        assert_eq!(ok("x serve --stdio --read-only '~/r'"), (true, "~/r".into()));
+        assert_eq!(
+            ok("barocss-hub serve --stdio '/srv/a b'"),
+            (false, "/srv/a b".into())
+        );
+        assert_eq!(
+            ok("x serve --stdio --read-only '~/r'"),
+            (true, "~/r".into())
+        );
         assert_eq!(ok("x serve --stdio 'it'\\''s'"), (false, "it's".into()));
         for bad in [
             "x serve --stdio /a",
@@ -857,7 +922,11 @@ mod tests {
             "x serve --stdio '/a\\b'x",
             "serve --stdio '/a'",
         ] {
-            assert_eq!(parse_forced(bad).unwrap_err().code(), Code::Forbidden, "{bad}");
+            assert_eq!(
+                parse_forced(bad).unwrap_err().code(),
+                Code::Forbidden,
+                "{bad}"
+            );
         }
         // Backslash inside a quoted path is a plain character.
         assert_eq!(ok("x serve --stdio '/a\\b'"), (false, "/a\\b".into()));
@@ -868,20 +937,45 @@ mod tests {
         let c = Path::new("/w");
         assert_eq!(
             parse_url("ssh://al@h:2222/srv/p", c).unwrap(),
-            Url::Ssh { user: Some("al".into()), host: "h".into(), port: Some(2222), path: "/srv/p".into() }
+            Url::Ssh {
+                user: Some("al".into()),
+                host: "h".into(),
+                port: Some(2222),
+                path: "/srv/p".into()
+            }
         );
         assert_eq!(
             parse_url("ssh://h/~/p", c).unwrap(),
-            Url::Ssh { user: None, host: "h".into(), port: None, path: "~/p".into() }
+            Url::Ssh {
+                user: None,
+                host: "h".into(),
+                port: None,
+                path: "~/p".into()
+            }
         );
         assert_eq!(
             parse_url("h:rel/p", c).unwrap(),
-            Url::Ssh { user: None, host: "h".into(), port: None, path: "~/rel/p".into() }
+            Url::Ssh {
+                user: None,
+                host: "h".into(),
+                port: None,
+                path: "~/rel/p".into()
+            }
         );
         assert_eq!(parse_url("file:///x", c).unwrap(), Url::File("/x".into()));
         assert_eq!(parse_url("../b", c).unwrap(), Url::File("/w/../b".into()));
-        assert_eq!(parse_url("https://h/p", c).unwrap_err().code(), Code::Unsupported);
-        for bad in ["ssh://u:pw@h/p", "ssh://-oProxyCommand=x/p", "-oProxyCommand=x:p", "ftp://h/p", "ssh://h/a\nb", "file://rel"] {
+        assert_eq!(
+            parse_url("https://h/p", c).unwrap_err().code(),
+            Code::Unsupported
+        );
+        for bad in [
+            "ssh://u:pw@h/p",
+            "ssh://-oProxyCommand=x/p",
+            "-oProxyCommand=x:p",
+            "ftp://h/p",
+            "ssh://h/a\nb",
+            "file://rel",
+        ] {
             assert!(parse_url(bad, c).is_err(), "{bad}");
         }
         let a = ssh_argv(&parse_url("h:/it's; rm -rf ~", c).unwrap(), None, true).unwrap();

@@ -743,7 +743,11 @@ impl RepoLock {
     /// [`RepoLock::acquire`] that gives up after `wait` (Issue #43: a
     /// `serve` persist step never waits forever for another session's
     /// lock) with `ErrorKind::WouldBlock`.
-    pub fn acquire_timeout(dir: &Path, mode: LockMode, wait: std::time::Duration) -> io::Result<RepoLock> {
+    pub fn acquire_timeout(
+        dir: &Path,
+        mode: LockMode,
+        wait: std::time::Duration,
+    ) -> io::Result<RepoLock> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -768,7 +772,10 @@ impl RepoLock {
                     return Err(e);
                 }
                 if std::time::Instant::now() >= end {
-                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "repository is locked by another process"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "repository is locked by another process",
+                    ));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }

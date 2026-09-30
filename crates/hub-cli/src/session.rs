@@ -461,7 +461,12 @@ impl Side {
     // ------------------------------------------------------------ requester
 
     /// Request `Δ` from the peer and receive it (one half, §5.2.4).
-    fn request(&mut self, conn: &mut Conn, peer: ReplicaId, resume: bool) -> Result<Vec<Recv>, Error> {
+    fn request(
+        &mut self,
+        conn: &mut Conn,
+        peer: ReplicaId,
+        resume: bool,
+    ) -> Result<Vec<Recv>, Error> {
         let mut log = Vec::new();
         let mut requested: BTreeSet<BlobId> = BTreeSet::new();
         let mut outstanding: BTreeMap<BlobId, u64> = BTreeMap::new();
@@ -469,7 +474,14 @@ impl Side {
         conn.send(&Frame::Have {
             frontier: self.sr.frontier(),
         })?;
-        let last = self.recv_ops(conn, peer, resume, &mut log, &mut requested, &mut outstanding)?;
+        let last = self.recv_ops(
+            conn,
+            peer,
+            resume,
+            &mut log,
+            &mut requested,
+            &mut outstanding,
+        )?;
         self.recv_blobs(conn, peer, &mut log, &mut outstanding, &mut retried)?;
         let need = self.sr.need(&last).ids;
         if !need.is_empty() {
@@ -479,7 +491,14 @@ impl Side {
                 conn.send(&Frame::Need(g.clone()))?;
             }
             for _ in &gs {
-                self.recv_ops(conn, peer, resume, &mut log, &mut requested, &mut outstanding)?;
+                self.recv_ops(
+                    conn,
+                    peer,
+                    resume,
+                    &mut log,
+                    &mut requested,
+                    &mut outstanding,
+                )?;
             }
             self.recv_blobs(conn, peer, &mut log, &mut outstanding, &mut retried)?;
         }
@@ -717,7 +736,9 @@ impl Side {
     fn send_checkpoints(&self, conn: &mut Conn) -> Result<Vec<Checkpoint>, Error> {
         let recs = self.sr.checkpoints_msg().records;
         let max = conn.theirs.frame as usize - 1;
-        for g in groups(recs.clone(), usize::MAX, max, |c| store::encode_ckpt(c).len()) {
+        for g in groups(recs.clone(), usize::MAX, max, |c| {
+            store::encode_ckpt(c).len()
+        }) {
             conn.send(&Frame::Checkpoints(g))?;
         }
         Ok(recs)

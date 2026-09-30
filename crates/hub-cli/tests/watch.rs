@@ -168,8 +168,8 @@ fn pair(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
     fs::create_dir_all(&b).unwrap();
     ok(&a, &["init"]);
     ok(&b, &["init"]);
-    ok(&a, &["peer", "add", "../b"]);
-    ok(&b, &["peer", "add", "../a"]);
+    ok(&a, &["remote", "add", "b", "../b"]);
+    ok(&b, &["remote", "add", "a", "../a"]);
     (t, a, b)
 }
 
@@ -178,16 +178,17 @@ fn report(name: &str, d: Duration) {
 }
 
 #[test]
-fn peer_commands() {
+fn remote_commands() {
     let (t, a, b) = pair("peer");
-    let l = ok(&a, &["peer", "list"]);
-    assert!(l.trim_end().ends_with("/b"), "{l}");
-    assert!(ok(&a, &["status"]).contains("peers:"));
-    assert!(ok(&a, &["peer", "add", "../b"]).contains("already a peer"));
-    assert!(!hub(&a, &["peer", "add", "."]).status.success());
-    ok(&a, &["peer", "rm", "../b"]);
-    assert_eq!(ok(&a, &["peer", "list"]), "");
-    assert!(!hub(&a, &["peer", "rm", "../b"]).status.success());
+    let l = ok(&a, &["remote", "list"]);
+    assert!(l.trim_end().ends_with("/b\t(default)"), "{l}");
+    assert!(ok(&a, &["status"]).contains("remotes:"));
+    assert!(!hub(&a, &["remote", "add", "b2", "../b"]).status.success());
+    assert!(!hub(&a, &["remote", "add", "self", "."]).status.success());
+    assert!(!hub(&a, &["peer", "add", "../b"]).status.success());
+    ok(&a, &["remote", "rm", "b"]);
+    assert_eq!(ok(&a, &["remote", "list"]), "");
+    assert!(!hub(&a, &["remote", "rm", "b"]).status.success());
     assert!(b.is_dir());
     let _ = fs::remove_dir_all(t);
 }
@@ -527,7 +528,7 @@ fn peer_add_before_peer_init_is_not_self() {
     fs::create_dir_all(&a).unwrap();
     fs::create_dir_all(&b).unwrap();
     ok(&a, &["init"]);
-    let o = hub(&a, &["peer", "add", "../b"]);
+    let o = hub(&a, &["remote", "add", "b", "../b"]);
     assert!(!o.status.success());
     let e = String::from_utf8_lossy(&o.stderr);
     assert!(e.contains("no hub repository at ../b"), "{e}");
@@ -536,7 +537,7 @@ fn peer_add_before_peer_init_is_not_self() {
     assert!(!o.status.success());
     assert!(!String::from_utf8_lossy(&o.stderr).contains("itself"));
     ok(&b, &["init"]);
-    ok(&a, &["peer", "add", "../b"]);
+    ok(&a, &["remote", "add", "b", "../b"]);
     let _ = fs::remove_dir_all(t);
 }
 

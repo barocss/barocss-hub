@@ -524,6 +524,41 @@ fn status_doc(repo: &Repo, proj: &Projection, warn: &mut dyn Write) -> Result<J,
     let published = sync::read_published(repo)?.len();
     let (sw, npend) = sync::warnings_view(repo)?;
     let remotes = crate::remote::remotes_view(&repo.dir)?;
+    let remotes_j = J::Arr(
+        remotes
+            .iter()
+            .map(|r| {
+                J::obj(vec![
+                    ("name", J::s(&r.name)),
+                    ("url", J::s(&r.url)),
+                    ("default", J::Bool(r.default)),
+                ])
+            })
+            .collect(),
+    );
+    if crate::remote::is_bare(&repo.dir) {
+        // D-042: a bare repository has no working-directory section.
+        return Ok(doc(
+            "status",
+            vec![
+                ("root", J::s(repo.root().to_string_lossy())),
+                ("bare", J::Bool(true)),
+                (
+                    "head",
+                    J::obj(vec![
+                        ("version", version(&ix, &hid)),
+                        ("ops", J::n(repo.store.len())),
+                        ("checkpoints", J::n(repo.checkpoints.len())),
+                        ("published", J::n(published)),
+                    ]),
+                ),
+                ("conflicts", conflicts(proj, &repo.conflicts())),
+                ("sync_warnings", sync_warnings(&sw)),
+                ("pending_ops", J::n(npend)),
+                ("remotes", remotes_j),
+            ],
+        ));
+    }
     let pinned = watch::pinned(&repo.dir)?;
     let active = watch::active_watch(&repo.dir)?;
     let interrupted = wd::interrupted(&repo.dir)?.is_some();
@@ -618,21 +653,7 @@ fn status_doc(repo: &Repo, proj: &Projection, warn: &mut dyn Write) -> Result<J,
             ("conflicts", conflicts(proj, &repo.conflicts())),
             ("sync_warnings", sync_warnings(&sw)),
             ("pending_ops", J::n(npend)),
-            (
-                "remotes",
-                J::Arr(
-                    remotes
-                        .iter()
-                        .map(|r| {
-                            J::obj(vec![
-                                ("name", J::s(&r.name)),
-                                ("url", J::s(&r.url)),
-                                ("default", J::Bool(r.default)),
-                            ])
-                        })
-                        .collect(),
-                ),
-            ),
+            ("remotes", remotes_j),
             ("changes", changes(&infos)),
             (
                 "blocked",
@@ -848,7 +869,10 @@ pub fn sync_doc(r: &crate::sync::Synced, warn: &mut dyn Write) -> Result<J, Erro
             ("read_only", J::Bool(r.report.read_only)),
             (
                 "head",
-                J::obj(vec![("id", J::s(&r.head_id)), ("short", J::s(&r.head_short))]),
+                J::obj(vec![
+                    ("id", J::s(&r.head_id)),
+                    ("short", J::s(&r.head_short)),
+                ]),
             ),
             ("pending_ops", J::n(r.pending)),
             ("output", J::strs(text.lines().collect::<Vec<_>>())),

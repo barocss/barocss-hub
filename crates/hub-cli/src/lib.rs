@@ -400,7 +400,11 @@ impl Repo {
 
     /// [`Repo::open_dir_with`] waiting at most `wait` for the lock (Issue
     /// #43, `serve`), else `locked`.
-    pub fn open_dir_opts(dir: PathBuf, mode: LockMode, wait: Option<std::time::Duration>) -> Result<Repo, Error> {
+    pub fn open_dir_opts(
+        dir: PathBuf,
+        mode: LockMode,
+        wait: Option<std::time::Duration>,
+    ) -> Result<Repo, Error> {
         let acquire = |m: LockMode| {
             match wait {
                 Some(w) => RepoLock::acquire_timeout(&dir, m, w),
@@ -841,6 +845,16 @@ impl Repo {
     }
 
     pub fn commit(&mut self, message: &str) -> Result<Checkpoint, Error> {
+        if message.len() > wire::MAX_MESSAGE_BYTES {
+            return errc(
+                Code::Usage,
+                format!(
+                    "checkpoint message of {} bytes exceeds the {}-byte limit",
+                    message.len(),
+                    wire::MAX_MESSAGE_BYTES
+                ),
+            );
+        }
         let c = if oracle() {
             Checkpoint::new(&self.store, &self.head(), message, self.replica_id, None)
         } else {
@@ -1690,8 +1704,9 @@ JSON Lines events); errors as JSON on stderr, exit status 1.
 /// the tests assert each one appears in [`HELP`] (Issue #35), so the help
 /// cannot drift from the dispatch table.
 pub const COMMANDS: &[&str] = &[
-    "init", "peer", "remote", "serve", "watch", "sync", "publish", "warnings", "reid", "mkdir", "touch", "mv", "rm",
-    "ls", "status", "commit", "log", "show", "record", "checkout", "help", "cat", "cat-blob",
+    "init", "peer", "remote", "serve", "watch", "sync", "publish", "warnings", "reid", "mkdir",
+    "touch", "mv", "rm", "ls", "status", "commit", "log", "show", "record", "checkout", "help",
+    "cat", "cat-blob",
 ];
 
 /// `barocss-hub --version` output (from the package version).
@@ -1793,7 +1808,10 @@ pub fn run(
     if a[0] == "serve" {
         return remote::serve_cmd(cwd, &a[1..]);
     }
-    if matches!(a[0], "record" | "checkout" | "mkdir" | "touch" | "mv" | "rm" | "watch") {
+    if matches!(
+        a[0],
+        "record" | "checkout" | "mkdir" | "touch" | "mv" | "rm" | "watch"
+    ) {
         if let Ok(hub) = sync::find_hub(cwd) {
             remote::refuse_bare(&hub, a[0])?;
         }
@@ -1988,6 +2006,14 @@ pub fn run(
                     writeln!(out, "  {} {}", r.name, r.url)?;
                 }
             }
+            if remote::is_bare(&repo.dir) {
+                // D-042: no working directory, index, pin or watch.
+                writeln!(out, "bare repository (no working directory)")?;
+                for l in render_tree(&state, &proj, hub_core::tree::ROOT) {
+                    writeln!(out, "{l}")?;
+                }
+                return Ok(());
+            }
             if let Some(p) = watch::pinned(&repo.dir)? {
                 writeln!(
                     out,
@@ -2163,6 +2189,19 @@ pub fn run(
                         ix.short(&c.id()),
                         c.message
                     )?;
+                }
+                [c] if c.message.len() > wire::MAX_MESSAGE_BYTES
+                    || c.note
+                        .as_ref()
+                        .is_some_and(|n| n.len() > wire::MAX_MESSAGE_BYTES) =>
+                {
+                    return errc(
+                        Code::Usage,
+                        format!(
+                            "checkpoint message exceeds the {}-byte limit; it cannot be published",
+                            wire::MAX_MESSAGE_BYTES
+                        ),
+                    )
                 }
                 [c] => {
                     sync::append_published(&repo, c)?;

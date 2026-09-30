@@ -407,7 +407,7 @@ fn every_command_emits_one_document() {
         vec!["mv", "dd/e", "dd/g"],
         vec!["rm", "dd/g"],
         vec!["publish", "c1"],
-        vec!["peer", "list"],
+        vec!["remote", "list"],
         vec!["reid"],
         vec!["help"],
     ] {
@@ -529,7 +529,7 @@ fn watch_events_for_incoming_ops() {
     let b = tmp("wb");
     ok(&a, &["init"]);
     ok(&b, &["init"]);
-    ok(&b, &["peer", "add", a.to_str().unwrap()]);
+    ok(&b, &["remote", "add", "a", a.to_str().unwrap()]);
     let w = Watcher::start(&b, 200, &[]);
     fs::write(a.join("n.txt"), b"x\n").unwrap();
     ok(&a, &["record"]);

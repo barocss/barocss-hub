@@ -57,7 +57,6 @@ pub const CRASH_ENV: &str = "HUB_TEST_CRASH_IN_SYNC";
 #[doc(hidden)]
 pub const STATS_LOG_ENV: &str = "HUB_TEST_SYNC_STATS";
 
-
 fn read_opt(path: &Path, header: &str) -> Result<Vec<String>, Error> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -495,9 +494,16 @@ pub fn print_report(r: &Synced, out: &mut dyn Write, warn: &mut dyn Write) -> Re
         out,
         "head {}{}",
         r.head_short,
-        if r.report.same_head { " (both repositories)" } else { "" }
+        if r.report.same_head {
+            " (both repositories)"
+        } else {
+            ""
+        }
     )?;
-    for (n, name) in [(Some(r.pending), "this repository"), (r.peer_pending, "peer")] {
+    for (n, name) in [
+        (Some(r.pending), "this repository"),
+        (r.peer_pending, "peer"),
+    ] {
         if let Some(n) = n.filter(|n| *n > 0) {
             writeln!(
                 warn,
@@ -594,7 +600,9 @@ pub fn sync_local(
     });
     let rc = session::client(&mut x, &mut ca);
     drop(x);
-    let (rs, cb) = th.join().map_err(|_| Error::new(Code::Error, "sync thread panicked"))?;
+    let (rs, cb) = th
+        .join()
+        .map_err(|_| Error::new(Code::Error, "sync thread panicked"))?;
     let interrupted = |r: &Result<(), Error>| matches!(r, Err(e) if e.0 == INTERRUPTED);
     if interrupted(&rs) {
         return Err(rs.unwrap_err());

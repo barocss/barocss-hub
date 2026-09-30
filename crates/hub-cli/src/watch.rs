@@ -530,7 +530,10 @@ impl Backoff {
         self.0.get(name).is_none_or(|(_, t)| Instant::now() >= *t)
     }
     fn fail(&mut self, name: &str, every: Duration) {
-        let e = self.0.entry(name.to_string()).or_insert((0, Instant::now()));
+        let e = self
+            .0
+            .entry(name.to_string())
+            .or_insert((0, Instant::now()));
         e.0 += 1;
         e.1 = Instant::now() + every * (1u32 << e.0.min(5));
     }
