@@ -179,7 +179,11 @@ fn slow_save_without_deferral_is_delete_plus_create() {
         .filter(|e| e.get("event").str() == "recorded")
         .flat_map(|e| e.get("changes").arr().iter().map(|c| c.get("kind").str()))
         .collect();
-    assert_eq!(kinds, ["deleted", "added"]);
+    // x.txt left under the node's feet: recorded as a rename of the node to
+    // `x.txt~` (no sibling then, so not ignored) or as a delete, then the
+    // new x.txt as an add; either way a new node.
+    assert!(kinds.contains(&"added"), "{kinds:?}");
+    assert!(kinds[0] == "renamed" || kinds[0] == "deleted", "{kinds:?}");
     assert_ne!(nodes(&d)["x.txt"], before["x.txt"]);
 }
 
@@ -193,13 +197,19 @@ fn delete_with_lingering_backup_is_recorded_after_the_limit() {
     fs::remove_file(d.join("x.txt")).unwrap();
     wait_for("delete recorded", || !w.of("recorded").is_empty());
     let ev = &w.of("recorded")[0];
-    let c = &ev.get("changes").arr()[0];
-    assert_eq!(c.get("kind").str(), "deleted");
-    assert_eq!(c.get("path").str(), "x.txt");
+    let kinds: Vec<(&str, &str)> = ev
+        .get("changes")
+        .arr()
+        .iter()
+        .map(|c| (c.get("kind").str(), c.get("path").str()))
+        .collect();
+    // With x.txt gone, x.txt~ is no longer a backup (Issue #37 repair: `*~`
+    // is ignored only while its sibling exists), so it is recorded too.
+    assert_eq!(kinds, [("added", "x.txt~"), ("deleted", "x.txt")]);
     let evs = w.stop();
     assert!(evs.iter().any(|e| e.get("event").str() == "deferred"));
     assert!(!nodes(&d).contains_key("x.txt"));
-    assert!(!nodes(&d).contains_key("x.txt~"));
+    assert!(nodes(&d).contains_key("x.txt~"));
 }
 
 const DEFAULT_SAMPLES: &[&str] = &[
@@ -207,10 +217,6 @@ const DEFAULT_SAMPLES: &[&str] = &[
     ".x.txt.swo",
     ".x.txt.swn",
     ".x.txt.swx",
-    "4913",
-    "x.txt~",
-    ".#x.txt",
-    "#x.txt#",
     "x.txt___jb_tmp___",
     "x.txt___jb_old___",
     ".~lock.doc.odt#",
@@ -265,16 +271,15 @@ fn default_ignores_are_never_recorded() {
 fn defaults_re_include_and_tracked_stays_tracked() {
     let d = tmp("reinclude");
     ok(&d, &["init"]);
-    fs::write(d.join(".hubignore"), "!*~\n!4913\n").unwrap();
-    fs::write(d.join("notes~"), b"1").unwrap();
-    fs::write(d.join("4913"), b"probe").unwrap();
+    fs::write(d.join(".hubignore"), "!t.swp\n").unwrap();
+    fs::write(d.join("t.swp"), b"1").unwrap();
     fs::write(d.join("a.swp"), b"s").unwrap();
     ok(&d, &["record"]);
     let n = nodes(&d);
-    assert!(n.contains_key("notes~") && n.contains_key("4913"));
+    assert!(n.contains_key("t.swp"));
     assert!(!n.contains_key("a.swp"));
     fs::remove_file(d.join(".hubignore")).unwrap();
-    fs::write(d.join("notes~"), b"2").unwrap();
+    fs::write(d.join("t.swp"), b"2").unwrap();
     let st = js(&d, &["status"]);
     let tbi: Vec<&str> = st
         .get("tracked_but_ignored")
@@ -282,13 +287,91 @@ fn defaults_re_include_and_tracked_stays_tracked() {
         .iter()
         .map(|v| v.str())
         .collect();
-    assert_eq!(tbi, ["4913", "notes~"]);
+    assert_eq!(tbi, ["t.swp"]);
     let r = js(&d, &["record"]);
-    let ch = r.get("changes").arr();
-    let kinds: Vec<(&str, &str)> = ch
+    let kinds: Vec<(&str, &str)> = r
+        .get("changes")
+        .arr()
         .iter()
         .map(|c| (c.get("kind").str(), c.get("path").str()))
         .collect();
-    assert_eq!(kinds, [("modified", "notes~"), ("deleted", ".hubignore")]);
-    assert_eq!(nodes(&d)["notes~"], n["notes~"]);
+    assert_eq!(kinds, [("modified", "t.swp"), ("deleted", ".hubignore")]);
+    assert_eq!(nodes(&d)["t.swp"], n["t.swp"]);
+}
+
+/// Issue #37 repair: editor temp names that are also plausible real file
+/// names are ignored only while they look like the temp. Real files with
+/// those names are recorded, by `record` and by `watch`, and plain
+/// `status` says how many files the defaults hide.
+#[test]
+fn conditional_defaults_record_real_files() {
+    let d = tmp("cond");
+    ok(&d, &["init"]);
+    fs::create_dir_all(d.join("data")).unwrap();
+    let w = |p: &str, b: &[u8]| fs::write(d.join(p), b).unwrap();
+    // Recorded: real content, or no sibling.
+    w("data/4913", b"a data file named 4913\n");
+    w("notes~", b"my notes\n");
+    w(".#draft", b"a real draft\nsecond line\n");
+    w("#todo#", b"todo list\n");
+    // Ignored: they look like the editor's temp.
+    w("empty/4913".replace("empty/", "").as_str(), b"");
+    w("a", b"a\n");
+    w("a~", b"old a\n");
+    w("#a#", b"autosave of a\n");
+    w(".#a", b"me@host.4242:1700000000");
+    let st = ok(&d, &["status"]);
+    assert!(
+        st.contains(
+            "4 file(s) hidden by default ignore rules (see `barocss-hub status --ignored`)"
+        ),
+        "{st}"
+    );
+    let sj = js(&d, &["status"]);
+    assert_eq!(sj.get("hidden_by_defaults"), &V::Num(4.0));
+    ok(&d, &["record"]);
+    let n = nodes(&d);
+    let names: Vec<&str> = n.keys().map(String::as_str).collect();
+    assert_eq!(
+        names,
+        ["#todo#", ".#draft", "a", "data", "data/4913", "notes~"],
+        "recorded set"
+    );
+    // A sibling-conditional file becomes visible once its sibling goes.
+    fs::remove_file(d.join("a")).unwrap();
+    let r = js(&d, &["record"]);
+    let kinds: Vec<(&str, &str)> = r
+        .get("changes")
+        .arr()
+        .iter()
+        .map(|c| (c.get("kind").str(), c.get("path").str()))
+        .collect();
+    // `a~` has content different from `a`: an add plus a delete, no rename.
+    assert_eq!(kinds, [("added", "#a#"), ("added", "a~"), ("deleted", "a")]);
+    // watch evaluates the same rules.
+    let wch = Watcher::start(&d, 200, &[]);
+    w("data/more~", b"real\n");
+    w("x", b"x\n");
+    w("x~", b"x backup\n");
+    wait_for("recorded", || !wch.of("recorded").is_empty());
+    wait_for("quiet", || {
+        let evs = wch.of("recorded");
+        let paths: Vec<String> = evs
+            .iter()
+            .flat_map(|e| {
+                e.get("changes")
+                    .arr()
+                    .iter()
+                    .map(|c| c.get("path").str().to_string())
+            })
+            .collect();
+        paths.contains(&"data/more~".to_string()) && paths.contains(&"x".to_string())
+    });
+    wch.stop();
+    let n = nodes(&d);
+    assert!(n.contains_key("data/more~") && n.contains_key("x"));
+    assert!(
+        !n.contains_key("x~"),
+        "backup next to its file stays ignored"
+    );
 }

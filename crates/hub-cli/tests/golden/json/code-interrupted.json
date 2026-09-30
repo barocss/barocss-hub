@@ -1,0 +1,1 @@
+{"schema":1,"program":"barocss-hub","error":{"code":"interrupted","message":"a checkout was interrupted; the working directory is partly updated. Run `barocss-hub checkout` to finish it before recording or changing the tree"},"warnings":[]}

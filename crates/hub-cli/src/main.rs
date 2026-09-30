@@ -9,7 +9,10 @@ fn main() -> ExitCode {
             if args.iter().any(|a| a == hub_cli::json::FLAG) {
                 let _ = hub_cli::json::emit(
                     &mut std::io::stderr(),
-                    hub_cli::json::error_doc(&msg, &[]),
+                    hub_cli::json::error_doc(
+                        &hub_cli::Error::new(hub_cli::Code::Io, msg.clone()),
+                        &[],
+                    ),
                 );
             } else {
                 eprintln!("{}: {msg}", hub_cli::PROGRAM);

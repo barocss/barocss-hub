@@ -1,0 +1,1 @@
+{"schema":1,"program":"barocss-hub","error":{"code":"not-a-repository","message":"not a hub repository (no .hub/ here or in any parent); run `barocss-hub init`"},"warnings":[]}

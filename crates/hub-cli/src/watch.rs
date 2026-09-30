@@ -75,6 +75,7 @@
 //! (after SIGKILL) is never mistaken for a live watcher; a second
 //! `hub watch` refuses while the lock is held.
 
+use crate::Code;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -84,7 +85,7 @@ use std::time::{Duration, Instant};
 use crate::json::J;
 use crate::store::{self, LockMode};
 use crate::sync::find_hub;
-use crate::{err, wd, Error, Repo};
+use crate::{wd, Error, Repo};
 
 pub const PIN_FILE: &str = "pinned";
 pub const PIN_HEADER: &str = "barocss-hub/pinned/v0";
@@ -131,10 +132,13 @@ pub fn pinned(hub: &Path) -> Result<Option<Vec<hub_core::tree::OpId>>, Error> {
         [h, "-"] if *h == PIN_HEADER => Ok(Some(Vec::new())),
         [h, ids] if *h == PIN_HEADER => ids
             .split(',')
-            .map(|t| store::parse_id(t).map_err(|e| Error(format!("corrupt {}: {e}", p.display()))))
+            .map(|t| {
+                store::parse_id(t)
+                    .map_err(|e| Error::new(Code::Corrupt, format!("corrupt {}: {e}", p.display())))
+            })
             .collect::<Result<Vec<_>, _>>()
             .map(Some),
-        _ => err(format!("corrupt {}", p.display())),
+        _ => crate::errc(Code::Corrupt, format!("corrupt {}", p.display())),
     }
 }
 
@@ -156,7 +160,7 @@ pub fn read_peers(hub: &Path) -> Result<Vec<PathBuf>, Error> {
     };
     let mut lines = text.lines();
     if !matches!(lines.next(), Some(PEERS_HEADER | PEERS_HEADER_V0)) {
-        return err(format!("corrupt {}", p.display()));
+        return crate::errc(Code::Corrupt, format!("corrupt {}", p.display()));
     }
     Ok(lines.filter(|l| !l.is_empty()).map(PathBuf::from).collect())
 }
@@ -174,18 +178,19 @@ pub(crate) fn write_peers(hub: &Path, peers: &[PathBuf]) -> Result<(), Error> {
 fn peer_root(cwd: &Path, arg: &str) -> Result<PathBuf, Error> {
     let p = cwd.join(arg);
     if !p.is_dir() {
-        return err(format!("no such directory: {arg}"));
+        return crate::errc(Code::NoSuchPath, format!("no such directory: {arg}"));
     }
     // Canonicalize first: a lexical walk of `a/../b` would find a's `.hub`.
     let root = fs::canonicalize(&p)?;
     if !root.join(crate::HUB_DIR).is_dir() {
-        return err(format!(
-            "no hub repository at {arg} (run `barocss-hub init` there)"
-        ));
+        return crate::errc(
+            Code::NotARepository,
+            format!("no hub repository at {arg} (run `barocss-hub init` there)"),
+        );
     }
     let s = root.to_string_lossy();
     if s.contains('\n') || s.contains('\r') {
-        return err("peer path contains a newline");
+        return crate::errc(Code::InvalidPath, "peer path contains a newline");
     }
     Ok(root)
 }
@@ -205,7 +210,7 @@ pub fn peer_cmd(cwd: &Path, args: &[&str], out: &mut dyn Write) -> Result<(), Er
         ["add", arg] => {
             let root = peer_root(cwd, arg)?;
             if hub.parent() == Some(root.as_path()) {
-                return err("cannot add this repository as its own peer");
+                return crate::errc(Code::Usage, "cannot add this repository as its own peer");
             }
             if peers.contains(&root) {
                 writeln!(out, "already a peer: {}", root.display())?;
@@ -224,13 +229,14 @@ pub fn peer_cmd(cwd: &Path, args: &[&str], out: &mut dyn Write) -> Result<(), Er
             let before = peers.len();
             peers.retain(|p| *p != target);
             if peers.len() == before {
-                return err(format!("not a peer: {arg}"));
+                return crate::errc(Code::NotFound, format!("not a peer: {arg}"));
             }
             write_peers(&hub, &peers)?;
             writeln!(out, "removed peer {}", target.display())?;
         }
         _ => {
-            return err(
+            return crate::errc(
+                Code::Usage,
                 "usage: barocss-hub peer add <path> | list | rm <path>  (see barocss-hub --help)",
             )
         }
@@ -369,13 +375,18 @@ pub fn parse_opts(args: &[&str]) -> Result<Opts, Error> {
             v.and_then(|s| s.parse::<u64>().ok())
                 .filter(|n| *n > 0)
                 .map(Duration::from_millis)
-                .ok_or_else(|| Error(format!("{a} needs a positive number of milliseconds")))
+                .ok_or_else(|| {
+                    Error::new(
+                        Code::Usage,
+                        format!("{a} needs a positive number of milliseconds"),
+                    )
+                })
         };
         match *a {
             "--poll" => o.poll = ms(it.next())?,
             "--debounce" => o.debounce = ms(it.next())?,
             "--sync" => o.sync_every = ms(it.next())?,
-            _ => return err(
+            _ => return crate::errc(Code::Usage,
                 "usage: barocss-hub watch [--poll <ms>] [--debounce <ms>] [--sync <ms>]  (see barocss-hub --help)",
             ),
         }
@@ -669,12 +680,15 @@ pub fn watch_cmd(
     let hub = fs::canonicalize(find_hub(cwd)?)?;
     let root = hub.parent().unwrap_or(&hub).to_path_buf();
     let Some(_watch_lock) = store::try_lock_exclusive(&hub.join(LOCK_FILE))? else {
-        return err(format!(
-            "a watch is already running on this repository (pid {})",
-            fs::read_to_string(hub.join(PID_FILE))
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|_| "?".into())
-        ));
+        return crate::errc(
+            Code::Locked,
+            format!(
+                "a watch is already running on this repository (pid {})",
+                fs::read_to_string(hub.join(PID_FILE))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "?".into())
+            ),
+        );
     };
     install_signals();
     store::write_atomic(

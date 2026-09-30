@@ -42,17 +42,11 @@ pub const FILE: &str = ".hubignore";
 /// applied before the file's own lines. Same list in the README and the
 /// Wiki (CLI-JSON / Repository-Semantics).
 pub const DEFAULTS: &[&str] = &[
-    // vim: swap files (.x.swp, then .swo, .swn, ... when taken), the
-    // `4913` write-permission probe, and `x~` backups (also emacs).
+    // vim swap files (.x.swp, then .swo, .swn, ... when taken).
     "*.swp",
     "*.swo",
     "*.swn",
     "*.swx",
-    "4913",
-    "*~",
-    // emacs: `.#x` lock links and `#x#` auto-save files.
-    ".#*",
-    "\\#*#",
     // JetBrains "safe write".
     "*___jb_tmp___",
     "*___jb_old___",
@@ -66,8 +60,41 @@ pub const DEFAULTS: &[&str] = &[
     "desktop.ini",
 ];
 
+/// When a [`CONDITIONAL`] default matches (Issue #37 repair: an editor
+/// temp name that is also a plausible real file name is ignored only while
+/// the file looks like the temp; otherwise it is recorded like any file).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cond {
+    /// Always (an ordinary rule).
+    Always,
+    /// An empty regular file (vim's `4913` write probe).
+    Empty,
+    /// `x~` while `x` exists (vim / emacs backup).
+    SiblingOfTilde,
+    /// `#x#` while `x` exists (emacs auto-save).
+    SiblingOfHashes,
+    /// `.#x` that is a symlink, or a regular file of at most
+    /// [`LOCK_MAX`] bytes, one line, containing `@` (emacs lock file:
+    /// `user@host.pid:boot`).
+    EmacsLock,
+}
+
+/// Largest regular file taken for an emacs `.#x` lock.
+pub const LOCK_MAX: u64 = 256;
+
+/// Built-in defaults that apply only under a condition (Issue #37 repair),
+/// after [`DEFAULTS`] and before the `.hubignore` lines (so `!` still
+/// re-includes them). Directories never match these.
+pub const CONDITIONAL: &[(&str, Cond)] = &[
+    ("4913", Cond::Empty),
+    ("*~", Cond::SiblingOfTilde),
+    ("\\#*#", Cond::SiblingOfHashes),
+    (".#*", Cond::EmacsLock),
+];
+
 #[derive(Clone, Debug)]
 struct Rule {
+    cond: Cond,
     negate: bool,
     dir_only: bool,
     /// Pattern segments; unanchored patterns start with `**`.
@@ -77,6 +104,9 @@ struct Rule {
 #[derive(Clone, Debug, Default)]
 pub struct Ignore {
     rules: Vec<Rule>,
+    /// Working-directory root, for [`Cond`] checks; without it conditional
+    /// rules never match.
+    root: Option<std::path::PathBuf>,
 }
 
 impl Ignore {
@@ -85,20 +115,75 @@ impl Ignore {
         let p = root.join(FILE);
         match fs::symlink_metadata(&p) {
             Ok(m) if m.is_file() => {}
-            Ok(_) => return Ok(Ignore::defaults()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Ignore::defaults()),
+            Ok(_) => return Ok(Ignore::defaults_at(root)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Ignore::defaults_at(root)),
             Err(e) => return Err(e),
         }
         let bytes = fs::read(&p)?;
-        let mut ig = Ignore::defaults();
+        let mut ig = Ignore::defaults_at(root);
         ig.rules
             .extend(Ignore::parse(&String::from_utf8_lossy(&bytes)).rules);
         Ok(ig)
     }
 
-    /// Only the built-in [`DEFAULTS`].
+    /// Only the unconditional built-in [`DEFAULTS`].
     pub fn defaults() -> Ignore {
         Ignore::parse(&DEFAULTS.join("\n"))
+    }
+
+    /// All built-in defaults, [`CONDITIONAL`] ones checked under `root`.
+    pub fn defaults_at(root: &Path) -> Ignore {
+        let mut ig = Ignore::defaults();
+        for (pat, cond) in CONDITIONAL {
+            let mut r = Ignore::parse(pat).rules;
+            for x in &mut r {
+                x.cond = *cond;
+            }
+            ig.rules.extend(r);
+        }
+        ig.root = Some(root.to_path_buf());
+        ig
+    }
+
+    /// Whether `path` is ignored by the built-in defaults alone (for the
+    /// `status` hint).
+    pub fn is_default_ignored(root: &Path, path: &str, is_dir: bool) -> bool {
+        Ignore::defaults_at(root).is_ignored(path, is_dir)
+    }
+
+    fn cond_holds(&self, c: Cond, path: &str, is_dir: bool) -> bool {
+        if c == Cond::Always {
+            return true;
+        }
+        let Some(root) = &self.root else { return false };
+        if is_dir {
+            return false;
+        }
+        let exists = |p: &str| fs::symlink_metadata(root.join(p)).is_ok();
+        let (dir, name) = match path.rsplit_once('/') {
+            Some((d, n)) => (format!("{d}/"), n),
+            None => (String::new(), path),
+        };
+        let md = fs::symlink_metadata(root.join(path));
+        match c {
+            Cond::Always => true,
+            Cond::Empty => md.is_ok_and(|m| m.is_file() && m.len() == 0),
+            Cond::SiblingOfTilde => {
+                let base = &name[..name.len() - 1];
+                !base.is_empty() && exists(&format!("{dir}{base}"))
+            }
+            Cond::SiblingOfHashes => {
+                name.len() > 2 && exists(&format!("{dir}{}", &name[1..name.len() - 1]))
+            }
+            Cond::EmacsLock => match md {
+                Ok(m) if m.file_type().is_symlink() => true,
+                Ok(m) if m.is_file() && m.len() <= LOCK_MAX => fs::read(root.join(path))
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .is_some_and(|t| t.contains('@') && !t.trim_end().contains('\n')),
+                _ => false,
+            },
+        }
     }
 
     pub fn parse(text: &str) -> Ignore {
@@ -135,12 +220,13 @@ impl Ignore {
                 continue;
             }
             rules.push(Rule {
+                cond: Cond::Always,
                 negate,
                 dir_only,
                 segs,
             });
         }
-        Ignore { rules }
+        Ignore { rules, root: None }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -156,7 +242,7 @@ impl Ignore {
             if r.dir_only && !is_dir {
                 continue;
             }
-            if match_segs(&r.segs, &parts) {
+            if match_segs(&r.segs, &parts) && self.cond_holds(r.cond, path, is_dir) {
                 ignored = !r.negate;
             }
         }
@@ -339,10 +425,6 @@ mod tests {
             ".x.rs.swo",
             ".x.rs.swn",
             ".x.rs.swx",
-            "4913",
-            "x.rs~",
-            ".#x.rs",
-            "#x.rs#",
             "x.rs___jb_tmp___",
             "x.rs___jb_old___",
             ".~lock.report.odt#",
@@ -387,12 +469,57 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let i = Ignore::load(&root).unwrap();
         assert!(i.is_ignored("a.swp", false) && i.is_ignored(".DS_Store", false));
-        fs::write(root.join(FILE), "!*.swp\n!4913\n*.log\n").unwrap();
+        fs::write(root.join(FILE), "!*.swp\n!*~\n*.log\n").unwrap();
+        fs::write(root.join("x"), "").unwrap();
+        fs::write(root.join("x~"), "").unwrap();
         let i = Ignore::load(&root).unwrap();
         assert!(!i.is_ignored("a.swp", false));
-        assert!(!i.is_ignored("d/4913", false));
-        assert!(i.is_ignored("x~", false), "other defaults still apply");
+        assert!(!i.is_ignored("x~", false), "conditional re-included");
+        assert!(
+            i.is_ignored(".DS_Store", false),
+            "other defaults still apply"
+        );
         assert!(i.is_ignored("a.log", false));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Issue #37 repair: the conditional defaults match only files that
+    /// look like the editor's temp; the same names with real content (or
+    /// without the sibling) are not ignored.
+    #[test]
+    fn conditional_defaults() {
+        let root = std::env::temp_dir().join(format!("hub-ig-cond-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("d")).unwrap();
+        let w = |p: &str, b: &[u8]| fs::write(root.join(p), b).unwrap();
+        w("d/4913", b"");
+        w("4913", b"data");
+        w("a", b"a");
+        w("a~", b"old a");
+        w("notes~", b"notes");
+        w("#a#", b"autosave");
+        w("#todo#", b"real");
+        w(".#a", b"me@host.123:456");
+        w(".#draft", b"a real draft\nwith two lines @ home");
+        w(".#big", &[b'@'; 300]);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("me@host.1:2", root.join(".#link")).unwrap();
+        let i = Ignore::load(&root).unwrap();
+        for p in ["d/4913", "a~", "#a#", ".#a"] {
+            assert!(i.is_ignored(p, false), "{p}");
+        }
+        #[cfg(unix)]
+        assert!(i.is_ignored(".#link", false));
+        for p in ["4913", "notes~", "#todo#", ".#draft", ".#big"] {
+            assert!(!i.is_ignored(p, false), "{p}");
+        }
+        // Directories never match a conditional default.
+        fs::create_dir_all(root.join("b~")).unwrap();
+        w("b", b"");
+        assert!(!i.is_ignored("b~", true));
+        // Without a root (plain parse) conditional rules never match.
+        assert!(!Ignore::defaults().is_ignored("a~", false));
+        assert_eq!(CONDITIONAL.len(), 4);
         fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -14,7 +14,8 @@
 //! - Errors: nothing on stdout; one document on stderr,
 //!   `{"schema":1,"program":"barocss-hub","error":{"code","message"},"warnings"}`,
 //!   and exit status [`EXIT_ERROR`]. `code` is a coarse, stable class
-//!   ([`error_code`]); `message` is the human text (not stable).
+//!   (a [`crate::Code`], chosen where the error is constructed, never
+//!   derived from the text); `message` is the human text (not stable).
 //! - Exit status: 0 success, [`EXIT_ERROR`] (1) any command error,
 //!   [`EXIT_NO_CWD`] (2) the current directory cannot be read.
 //! - Ids: node and op ids as `"<counter>.<32 hex replica>"`, version ids
@@ -23,6 +24,7 @@
 //! - Schema 1 may gain keys; existing keys keep their name and meaning.
 //!   A breaking change bumps `schema`.
 
+use crate::Code;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write;
@@ -33,7 +35,7 @@ use hub_core::projection::{project, Projection};
 use hub_core::tree::{evaluate, BlobId, Conflict, Kind, NodeId, Payload, State, ROOT};
 
 use crate::wd::{self, Entry};
-use crate::{err, store, sync, watch, Error, Repo};
+use crate::{store, sync, watch, Error, Repo};
 
 /// The flag, accepted anywhere in the arguments.
 pub const FLAG: &str = "--json";
@@ -208,55 +210,16 @@ pub fn with_warnings(doc: &[u8], warnings: &[String]) -> Vec<u8> {
     body.into_bytes()
 }
 
-/// Coarse, stable error class of a message (the message itself is human
-/// text): `usage`, `not-a-repository`, `no-such-path`, `not-a-file`,
-/// `bad-version`, `no-such-blob`, `bad-blob-id`, `locked`,
-/// `not-at-head`, `refused`, `io`, `corrupt`, or `error`.
-pub fn error_code(msg: &str) -> &'static str {
-    let m = msg;
-    if m.starts_with("usage:") || m.starts_with("unknown command") || m.contains("needs a positive")
-    {
-        "usage"
-    } else if m.starts_with("not a hub repository") {
-        "not-a-repository"
-    } else if m.starts_with("no such path") {
-        "no-such-path"
-    } else if m.starts_with("not a file") {
-        "not-a-file"
-    } else if m.starts_with("unknown version")
-        || m.starts_with("invalid version id")
-        || m.starts_with("ambiguous version")
-    {
-        "bad-version"
-    } else if m.starts_with("no such blob") || m.contains("missing blob") {
-        "no-such-blob"
-    } else if m.starts_with("invalid blob id") {
-        "bad-blob-id"
-    } else if m.starts_with("cannot lock") || m.contains("already running") {
-        "locked"
-    } else if m.starts_with("working directory is at version") {
-        "not-at-head"
-    } else if m.starts_with("refusing") || m.contains("would overwrite") || m.contains("refuse") {
-        "refused"
-    } else if m.starts_with("i/o error") || m.starts_with("cannot read current directory") {
-        "io"
-    } else if m.starts_with("corrupt") || m.contains(": corrupt") {
-        "corrupt"
-    } else {
-        "error"
-    }
-}
-
 /// The error document written on stderr.
-pub fn error_doc(msg: &str, warnings: &[String]) -> J {
+pub fn error_doc(e: &Error, warnings: &[String]) -> J {
     J::obj(vec![
         ("schema", J::Num(SCHEMA)),
         ("program", J::s(crate::PROGRAM)),
         (
             "error",
             J::obj(vec![
-                ("code", J::s(error_code(msg))),
-                ("message", J::s(msg)),
+                ("code", J::s(e.code().as_str())),
+                ("message", J::s(&e.0)),
             ]),
         ),
         ("warnings", J::strs(warnings)),
@@ -456,8 +419,12 @@ pub(crate) fn read_cmd(
     out: &mut dyn Write,
     warn: &mut dyn Write,
 ) -> Result<(), Error> {
-    let usage =
-        |c: &str| crate::err::<()>(format!("usage: barocss-hub {c}  (see barocss-hub --help)"));
+    let usage = |c: &str| {
+        crate::errc::<()>(
+            crate::Code::Usage,
+            format!("usage: barocss-hub {c}  (see barocss-hub --help)"),
+        )
+    };
     let d = match a {
         ["ls"] | ["ls", "-l"] => doc(
             "ls",
@@ -586,12 +553,25 @@ fn status_doc(repo: &Repo, proj: &Projection, warn: &mut dyn Write) -> Result<J,
         .iter()
         .filter(|p| !p.match_indices('/').any(|(i, _)| ignored.contains(&p[..i])))
         .map(|p| {
+            let dir = crate::w_all_is_dir(&repo.root(), p);
             J::obj(vec![
                 ("path", J::s(p)),
-                ("dir", J::Bool(crate::w_all_is_dir(&repo.root(), p))),
+                ("dir", J::Bool(dir)),
+                (
+                    "default",
+                    J::Bool(crate::ignore::Ignore::is_default_ignored(
+                        &repo.root(),
+                        p,
+                        dir,
+                    )),
+                ),
             ])
         })
         .collect();
+    let hidden = ign
+        .iter()
+        .filter(|j| matches!(j, J::Obj(f) if f.iter().any(|(k, v)| k == "default" && *v == J::Bool(true))))
+        .count();
     let unmat: Vec<&String> = idx
         .entries
         .iter()
@@ -670,6 +650,7 @@ fn status_doc(repo: &Repo, proj: &Projection, warn: &mut dyn Write) -> Result<J,
             ("unmaterialized", J::strs(unmat)),
             ("tracked_but_ignored", J::strs(tbi)),
             ("ignored", J::Arr(ign)),
+            ("hidden_by_defaults", J::n(hidden)),
         ],
     ))
 }
@@ -688,7 +669,10 @@ fn path_history(repo: &Repo, p: &str) -> Result<History, Error> {
     let proj = project(repo.state());
     let node = crate::lookup(&proj, p)?;
     if node == ROOT {
-        return err("usage: barocss-hub log [--path <path>]  (see barocss-hub --help)");
+        return crate::errc(
+            Code::Usage,
+            "usage: barocss-hub log [--path <path>]  (see barocss-hub --help)",
+        );
     }
     let mut memo: BTreeMap<VersionId, Option<(String, Option<BlobId>)>> = BTreeMap::new();
     let mut out = Vec::new();
@@ -871,7 +855,7 @@ pub(crate) fn cat_target(
     let pj = project(&st);
     let node = crate::lookup(&pj, p)?;
     if st[&node].kind != Kind::File {
-        return err(format!("not a file: '{p}'"));
+        return crate::errc(Code::NotAFile, format!("not a file: '{p}'"));
     }
     Ok((
         vid,
@@ -882,10 +866,13 @@ pub(crate) fn cat_target(
 
 pub(crate) fn parse_blob(t: &str) -> Result<BlobId, Error> {
     if t.len() != 64 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return err(format!("invalid blob id '{t}' (need 64 hex digits)"));
+        return crate::errc(
+            Code::BadBlobId,
+            format!("invalid blob id '{t}' (need 64 hex digits)"),
+        );
     }
     store::parse_blob(&t.to_ascii_lowercase())
-        .map_err(|e| Error(format!("invalid blob id '{t}': {e}")))
+        .map_err(|e| Error::new(Code::BadBlobId, format!("invalid blob id '{t}': {e}")))
 }
 
 fn content(bytes: &[u8]) -> Vec<(&'static str, J)> {
@@ -983,23 +970,14 @@ mod tests {
     }
 
     #[test]
-    fn error_codes() {
-        for (m, c) in [
-            ("usage: barocss-hub ls [-l] [path]", "usage"),
-            ("unknown command 'x' (see barocss-hub --help)", "usage"),
-            ("not a hub repository (no .hub/ here", "not-a-repository"),
-            ("no such path: 'x'", "no-such-path"),
-            ("not a file: 'd'", "not-a-file"),
-            ("unknown version 'abcd'", "bad-version"),
-            (
-                "invalid version id 'zz' (need 4-64 hex digits)",
-                "bad-version",
-            ),
-            ("no such blob: 00", "no-such-blob"),
-            ("invalid blob id 'x' (need 64 hex digits)", "bad-blob-id"),
-            ("something else", "error"),
-        ] {
-            assert_eq!(error_code(m), c, "{m}");
-        }
+    fn code_names_are_unique_and_kebab() {
+        let names: Vec<&str> = crate::Code::ALL.iter().map(|c| c.as_str()).collect();
+        let mut u = names.clone();
+        u.sort();
+        u.dedup();
+        assert_eq!(u.len(), names.len());
+        assert!(names
+            .iter()
+            .all(|n| n.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')));
     }
 }

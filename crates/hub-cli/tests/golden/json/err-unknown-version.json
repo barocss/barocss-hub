@@ -1,1 +1,1 @@
-{"schema":1,"program":"barocss-hub","error":{"code":"bad-version","message":"unknown version 'ffff'"},"warnings":[]}
+{"schema":1,"program":"barocss-hub","error":{"code":"not-found","message":"unknown version 'ffff'"},"warnings":[]}

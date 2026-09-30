@@ -33,8 +33,120 @@ use wd::{Change, Entry, Index, PlanOpts, Target};
 
 pub const HUB_DIR: &str = ".hub";
 
+/// A command error: the human message and its code, chosen where the
+/// error is constructed (Issue #37 repair; `--json` `error.code`).
 #[derive(Debug)]
-pub struct Error(pub String);
+pub struct Error(pub String, pub Code);
+
+/// Stable error codes (schema 1, Wiki CLI-JSON). Never derived from text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Code {
+    /// Bad arguments or an unknown command.
+    Usage,
+    /// No `.hub/` here or in any parent.
+    NotARepository,
+    /// `init` in a repository, or `mkdir`/`touch`/`mv` onto an existing path.
+    AlreadyExists,
+    /// A path argument that cannot name a node (`..`, empty, bad name).
+    InvalidPath,
+    /// No node at the path (also a missing directory argument).
+    NoSuchPath,
+    NotAFile,
+    NotADirectory,
+    /// A version id that is not 4-64 hex digits.
+    BadVersion,
+    /// A well-formed version id (or checkpoint) that matches nothing.
+    NotFound,
+    /// A prefix or message matching several versions or checkpoints.
+    Ambiguous,
+    NoSuchBlob,
+    BadBlobId,
+    /// Another process holds the repository or watch lock.
+    Locked,
+    /// The working directory is behind head: run `checkout` first.
+    Behind,
+    /// The working directory is pinned to an old version.
+    Pinned,
+    /// A checkout was interrupted: run `checkout` to finish it.
+    Interrupted,
+    /// Working-directory paths collide with unmaterialized paths (D-019).
+    Blocked,
+    /// The working-directory update would clobber unrecorded or ignored data.
+    Refused,
+    /// Ops under our own replica id that we never authored (D-021).
+    DuplicateReplica,
+    /// A damaged `.hub/` file or blob.
+    Corrupt,
+    Io,
+    /// Anything else.
+    Error,
+}
+
+impl Code {
+    pub const ALL: &'static [Code] = &[
+        Code::Usage,
+        Code::NotARepository,
+        Code::AlreadyExists,
+        Code::InvalidPath,
+        Code::NoSuchPath,
+        Code::NotAFile,
+        Code::NotADirectory,
+        Code::BadVersion,
+        Code::NotFound,
+        Code::Ambiguous,
+        Code::NoSuchBlob,
+        Code::BadBlobId,
+        Code::Locked,
+        Code::Behind,
+        Code::Pinned,
+        Code::Interrupted,
+        Code::Blocked,
+        Code::Refused,
+        Code::DuplicateReplica,
+        Code::Corrupt,
+        Code::Io,
+        Code::Error,
+    ];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Code::Usage => "usage",
+            Code::NotARepository => "not-a-repository",
+            Code::AlreadyExists => "already-exists",
+            Code::InvalidPath => "invalid-path",
+            Code::NoSuchPath => "no-such-path",
+            Code::NotAFile => "not-a-file",
+            Code::NotADirectory => "not-a-directory",
+            Code::BadVersion => "bad-version",
+            Code::NotFound => "not-found",
+            Code::Ambiguous => "ambiguous",
+            Code::NoSuchBlob => "no-such-blob",
+            Code::BadBlobId => "bad-blob-id",
+            Code::Locked => "locked",
+            Code::Behind => "behind",
+            Code::Pinned => "pinned",
+            Code::Interrupted => "interrupted",
+            Code::Blocked => "blocked",
+            Code::Refused => "refused",
+            Code::DuplicateReplica => "duplicate-replica",
+            Code::Corrupt => "corrupt",
+            Code::Io => "io",
+            Code::Error => "error",
+        }
+    }
+}
+
+impl Error {
+    pub fn new(code: Code, msg: impl Into<String>) -> Error {
+        Error(msg.into(), code)
+    }
+    pub fn code(&self) -> Code {
+        self.1
+    }
+    /// Same code, message prefixed with `<p>: `.
+    pub fn prefix(self, p: &str) -> Error {
+        Error(format!("{p}: {}", self.0), self.1)
+    }
+}
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -44,8 +156,22 @@ impl std::fmt::Display for Error {
 
 impl From<StoreError> for Error {
     fn from(e: StoreError) -> Self {
-        Error(e.to_string())
+        let code = match e {
+            StoreError::Io(_) => Code::Io,
+            StoreError::Corrupt { .. } => Code::Corrupt,
+        };
+        Error::new(code, e.to_string())
     }
+}
+
+/// The [`Code`] of a blob-store error.
+pub(crate) fn blob_error(e: blobs::BlobError) -> Error {
+    let code = match e {
+        blobs::BlobError::Missing(_) => Code::NoSuchBlob,
+        blobs::BlobError::Corrupt { .. } => Code::Corrupt,
+        blobs::BlobError::Io(_) => Code::Io,
+    };
+    Error::new(code, e.to_string())
 }
 
 /// Message of the error produced when stdout's reader went away (EPIPE,
@@ -61,9 +187,9 @@ impl Error {
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         if e.kind() == std::io::ErrorKind::BrokenPipe {
-            return Error(BROKEN_PIPE.into());
+            return Error::new(Code::Io, BROKEN_PIPE);
         }
-        Error(format!("i/o error: {e}"))
+        Error::new(Code::Io, format!("i/o error: {e}"))
     }
 }
 
@@ -83,7 +209,12 @@ pub(crate) fn fast_exit() -> bool {
 }
 
 pub(crate) fn err<T>(s: impl Into<String>) -> Result<T, Error> {
-    Err(Error(s.into()))
+    Err(Error::new(Code::Error, s.into()))
+}
+
+/// `Err` with an explicit [`Code`].
+pub(crate) fn errc<T>(code: Code, s: impl Into<String>) -> Result<T, Error> {
+    Err(Error::new(code, s.into()))
 }
 
 /// An opened repository: the replayed replica plus checkpoints.
@@ -162,7 +293,10 @@ impl Repo {
     pub fn init(root: &Path) -> Result<Repo, Error> {
         let dir = root.join(HUB_DIR);
         if dir.exists() {
-            return err(format!("already a hub repository: {}", dir.display()));
+            return errc(
+                Code::AlreadyExists,
+                format!("already a hub repository: {}", dir.display()),
+            );
         }
         fs::create_dir_all(&dir)?;
         let (rp, op, cp) = Self::paths(&dir);
@@ -196,7 +330,10 @@ impl Repo {
             }
             cur = c.parent();
         }
-        err("not a hub repository (no .hub/ here or in any parent); run `barocss-hub init`")
+        errc(
+            Code::NotARepository,
+            "not a hub repository (no .hub/ here or in any parent); run `barocss-hub init`",
+        )
     }
 
     /// Open and replay a `.hub/` directory for writing (exclusive lock).
@@ -209,8 +346,12 @@ impl Repo {
     /// replay -> mint -> append is atomic with respect to other processes.
     pub fn open_dir_with(dir: PathBuf, mode: LockMode) -> Result<Repo, Error> {
         let acquire = |m: LockMode| {
-            RepoLock::acquire(&dir, m)
-                .map_err(|e| Error(format!("cannot lock {}: {e}", dir.join("lock").display())))
+            RepoLock::acquire(&dir, m).map_err(|e| {
+                Error::new(
+                    Code::Locked,
+                    format!("cannot lock {}: {e}", dir.join("lock").display()),
+                )
+            })
         };
         let mut lock = acquire(mode)?;
         let mut warnings = Vec::new();
@@ -253,7 +394,10 @@ impl Repo {
         }
         let (fmt, rid) = migrate::read_replica(&dir)?;
         if fmt != migrate::Format::V1 {
-            return err(format!("corrupt {}", dir.join("replica").display()));
+            return errc(
+                Code::Corrupt,
+                format!("corrupt {}", dir.join("replica").display()),
+            );
         }
         migrate::check_format(&dir)?;
         let replica_id = ReplicaId(rid);
@@ -722,11 +866,14 @@ pub(crate) fn replay_records(
         replica.receive_all(replay);
     }
     if replica.pending_len() != 0 {
-        return err(format!(
-            "corrupt {}: {} op(s) with missing deps",
-            file.display(),
-            replica.pending_len()
-        ));
+        return errc(
+            Code::Corrupt,
+            format!(
+                "corrupt {}: {} op(s) with missing deps",
+                file.display(),
+                replica.pending_len()
+            ),
+        );
     }
     Ok((st, replica))
 }
@@ -739,7 +886,10 @@ fn norm(path: &str) -> Result<String, Error> {
         .filter(|p| !p.is_empty() && *p != ".")
         .collect();
     if parts.contains(&"..") {
-        return err(format!("invalid path '{path}': '..' is not supported"));
+        return errc(
+            Code::InvalidPath,
+            format!("invalid path '{path}': '..' is not supported"),
+        );
     }
     Ok(parts.join("/"))
 }
@@ -749,25 +899,25 @@ fn lookup(proj: &Projection, path: &str) -> Result<NodeId, Error> {
     proj.entries
         .get(&p)
         .copied()
-        .ok_or_else(|| Error(format!("no such path: '{path}'")))
+        .ok_or_else(|| Error::new(Code::NoSuchPath, format!("no such path: '{path}'")))
 }
 
 /// Resolve a not-yet-existing path to (parent dir, new name).
 fn resolve_new(state: &State, proj: &Projection, path: &str) -> Result<(NodeId, String), Error> {
     let p = norm(path)?;
     if p.is_empty() {
-        return err(format!("invalid path '{path}'"));
+        return errc(Code::InvalidPath, format!("invalid path '{path}'"));
     }
     if proj.entries.contains_key(&p) {
-        return err(format!("already exists: '{p}'"));
+        return errc(Code::AlreadyExists, format!("already exists: '{p}'"));
     }
     let (dir, name) = p.rsplit_once('/').unwrap_or(("", &p));
     if !valid_name(name) {
-        return err(format!("invalid name '{name}'"));
+        return errc(Code::InvalidPath, format!("invalid name '{name}'"));
     }
     let parent = lookup(proj, dir)?;
     if state[&parent].kind == Kind::File {
-        return err(format!("not a directory: '{dir}'"));
+        return errc(Code::NotADirectory, format!("not a directory: '{dir}'"));
     }
     Ok((parent, name.to_string()))
 }
@@ -883,23 +1033,31 @@ fn render_long(state: &State, proj: &Projection) -> Vec<String> {
 
 fn resolve(repo: &Repo, ix: &VersionIndex, id: &str) -> Result<Version, Error> {
     ix.resolve_version(&repo.store, id).map_err(|e| match e {
-        ResolveError::InvalidPrefix => {
-            Error(format!("invalid version id '{id}' (need 4-64 hex digits)"))
-        }
-        ResolveError::NotFound => Error(format!("unknown version '{id}'")),
-        ResolveError::Ambiguous(ids) => Error(format!(
-            "ambiguous version '{id}': {}",
-            ids.iter()
-                .map(|i| ix.short(i))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
+        ResolveError::InvalidPrefix => Error::new(
+            Code::BadVersion,
+            format!("invalid version id '{id}' (need 4-64 hex digits)"),
+        ),
+        ResolveError::NotFound => Error::new(Code::NotFound, format!("unknown version '{id}'")),
+        ResolveError::Ambiguous(ids) => Error::new(
+            Code::Ambiguous,
+            format!(
+                "ambiguous version '{id}': {}",
+                ids.iter()
+                    .map(|i| ix.short(i))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ),
     })
 }
 
 fn not_at_head(repo: &Repo, idx: &Index) -> Error {
     let ix = repo.index();
-    Error(format!(
+    let code = match watch::pinned(&repo.dir) {
+        Ok(Some(_)) => Code::Pinned,
+        _ => Code::Behind,
+    };
+    Error::new(code, format!(
         "working directory is at version {}, not head {}; run `barocss-hub checkout` to return to head first",
         ix.short(&VersionId::of_frontier(&idx.base)),
         ix.short(&VersionId::of_frontier(&repo.head_frontier()))
@@ -925,7 +1083,8 @@ fn load_index(repo: &Repo, warn: &mut dyn Write) -> Result<Index, Error> {
 /// Refuse while an interrupted checkout's marker exists.
 fn refuse_if_interrupted(repo: &Repo) -> Result<(), Error> {
     if wd::interrupted(&repo.dir)?.is_some() {
-        return err(
+        return errc(
+            Code::Interrupted,
             "a checkout was interrupted; the working directory is partly updated. \
              Run `barocss-hub checkout` to finish it before recording or changing the tree",
         );
@@ -1025,12 +1184,15 @@ pub(crate) fn record(
     print_warnings(warn, &ws)?;
     let blocked = wd::blocked(&idx, &w);
     if !blocked.is_empty() {
-        return Err(Error(format!(
-            "refusing to record: working-directory paths collide with unmaterialized \
+        return Err(Error::new(
+            Code::Blocked,
+            format!(
+                "refusing to record: working-directory paths collide with unmaterialized \
              case-clashing paths (D-019):\n  {}\nresolve by renaming or removing these \
              files, or rename one of the clashing nodes (e.g. in a case-sensitive checkout)",
-            wd::render_blocked(&blocked).join("\n  ")
-        )));
+                wd::render_blocked(&blocked).join("\n  ")
+            ),
+        ));
     }
     let changes = wd::diff(&idx, &w);
     if changes.is_empty() {
@@ -1073,12 +1235,12 @@ pub(crate) fn record(
         if let Change::Added(p) | Change::Modified(p) = c {
             if matches!(w[p], Entry::File { .. }) {
                 let bytes = fs::read(root.join(p))?;
-                let b = batch.add(&bytes).map_err(|e| Error(e.to_string()))?;
+                let b = batch.add(&bytes).map_err(blob_error)?;
                 stored.insert(p, b);
             }
         }
     }
-    batch.commit().map_err(|e| Error(e.to_string()))?;
+    batch.commit().map_err(blob_error)?;
     let put = |path: &str| -> Result<BlobId, Error> { Ok(stored[path]) };
     // 1. Creates, parents first (a path sorts before its descendants).
     for c in &changes {
@@ -1371,8 +1533,8 @@ pub(crate) fn checkout(
         },
     );
     let plan = match plan {
-        Err(Error(m)) if !force && crate::watch::pinned(&repo.dir)?.is_some() => {
-            return Err(Error(format!("{m}\n{PINNED_WAY_OUT}")));
+        Err(Error(m, _)) if !force && crate::watch::pinned(&repo.dir)?.is_some() => {
+            return Err(Error::new(Code::Pinned, format!("{m}\n{PINNED_WAY_OUT}")));
         }
         p => p?,
     };
@@ -1493,10 +1655,13 @@ pub fn run(
             .find(|l| l.split_whitespace().next() == Some(c))
             .and_then(|l| l.split("  ").next())
             .unwrap_or(c);
-        Error(format!(
-            "usage: barocss-hub {}  (see barocss-hub --help)",
-            syn.trim_end()
-        ))
+        Error::new(
+            Code::Usage,
+            format!(
+                "usage: barocss-hub {}  (see barocss-hub --help)",
+                syn.trim_end()
+            ),
+        )
     };
     if matches!(a.as_slice(), [] | ["help"] | ["--help"] | ["-h"]) {
         if json {
@@ -1514,10 +1679,10 @@ pub fn run(
         return Ok(());
     }
     if !COMMANDS.contains(&a[0]) {
-        return err(format!(
-            "unknown command '{}' (see barocss-hub --help)",
-            a[0]
-        ));
+        return errc(
+            Code::Usage,
+            format!("unknown command '{}' (see barocss-hub --help)", a[0]),
+        );
     }
     if json && !json::STRUCTURED.contains(&a[0]) {
         // Commands without a structured form: their human lines, wrapped.
@@ -1588,11 +1753,14 @@ pub fn run(
         ["mv", from, to] => {
             let node = lookup(&proj, from)?;
             if node == hub_core::tree::ROOT {
-                return err("cannot move the root");
+                return errc(Code::InvalidPath, "cannot move the root");
             }
             let (new_parent, new_name) = resolve_new(&state, &proj, to)?;
             if is_ancestor_or_self(&state, node, new_parent) {
-                return err(format!("cannot move '{from}' into itself"));
+                return errc(
+                    Code::InvalidPath,
+                    format!("cannot move '{from}' into itself"),
+                );
             }
             mutate(
                 &mut repo,
@@ -1608,7 +1776,7 @@ pub fn run(
         ["rm", p] => {
             let node = lookup(&proj, p)?;
             if node == hub_core::tree::ROOT {
-                return err("cannot remove the root");
+                return errc(Code::InvalidPath, "cannot remove the root");
             }
             mutate(&mut repo, "rm", Payload::Delete { node }, warn)?;
         }
@@ -1637,7 +1805,7 @@ pub fn run(
         }
         ["cat", id, p] => {
             let (v, node, blob) = json::cat_target(&repo, id, p)?;
-            let bytes = repo.blobs()?.get(&blob).map_err(|e| Error(e.to_string()))?;
+            let bytes = repo.blobs()?.get(&blob).map_err(blob_error)?;
             if json {
                 json::emit(
                     out,
@@ -1650,8 +1818,10 @@ pub fn run(
         ["cat-blob", b] => {
             let blob = json::parse_blob(b)?;
             let bytes = repo.blobs()?.get(&blob).map_err(|e| match e {
-                blobs::BlobError::Missing(_) => Error(format!("no such blob: {b}")),
-                e => Error(e.to_string()),
+                blobs::BlobError::Missing(_) => {
+                    Error::new(Code::NoSuchBlob, format!("no such blob: {b}"))
+                }
+                e => blob_error(e),
             })?;
             if json {
                 json::emit(out, json::blob_doc(blob, &bytes))?;
@@ -1767,6 +1937,25 @@ pub fn run(
                     writeln!(out, "  {p}")?;
                 }
             }
+            if a.len() == 1 {
+                let n = ignored
+                    .iter()
+                    .filter(|p| !p.match_indices('/').any(|(i, _)| ignored.contains(&p[..i])))
+                    .filter(|p| {
+                        ignore::Ignore::is_default_ignored(
+                            &repo.root(),
+                            p,
+                            w_all_is_dir(&repo.root(), p),
+                        )
+                    })
+                    .count();
+                if n > 0 {
+                    writeln!(
+                        out,
+                        "{n} file(s) hidden by default ignore rules (see `barocss-hub status --ignored`)"
+                    )?;
+                }
+            }
             if a.len() == 2 && ignored.is_empty() {
                 writeln!(out, "ignored: none")?;
             } else if a.len() == 2 {
@@ -1864,7 +2053,12 @@ pub fn run(
                 }
             }
             match uniq.as_slice() {
-                [] => return err(format!("no local checkpoint matches '{what}'")),
+                [] => {
+                    return errc(
+                        Code::NotFound,
+                        format!("no local checkpoint matches '{what}'"),
+                    )
+                }
                 [c] if published.contains(c) => {
                     writeln!(
                         out,
@@ -1878,13 +2072,16 @@ pub fn run(
                     writeln!(out, "published [{}] {}", ix.short(&c.id()), c.message)?;
                 }
                 many => {
-                    return err(format!(
-                        "ambiguous checkpoint '{what}': {}; publish by exact message",
-                        many.iter()
-                            .map(|c| format!("[{}] {}", ix.short(&c.id()), c.message))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
+                    return errc(
+                        Code::Ambiguous,
+                        format!(
+                            "ambiguous checkpoint '{what}': {}; publish by exact message",
+                            many.iter()
+                                .map(|c| format!("[{}] {}", ix.short(&c.id()), c.message))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    )
                 }
             }
         }
@@ -1995,7 +2192,7 @@ pub fn main_with(args: &[String], cwd: &Path, out: &mut dyn Write, err: &mut dyn
         }
         Err(e) if e.is_broken_pipe() => 0,
         Err(e) => {
-            let _ = json::emit(err, json::error_doc(&e.0, &warnings));
+            let _ = json::emit(err, json::error_doc(&e, &warnings));
             json::EXIT_ERROR
         }
     }
