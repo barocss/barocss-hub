@@ -181,39 +181,73 @@ waits for the save to finish (at most 5 s, `HUB_WATCH_SAVE_WAIT_MS`)
 instead of recording a delete. (After a real delete, a leftover `x~` no
 longer has its sibling, so it is recorded.)
 
+## Remotes and SSH (Issue #43, Wiki Remote-Sync)
+
+`sync` speaks wire protocol v1 to a remote; a same-machine folder is just a
+`file://` remote (the `peer` command is gone, D-041; an existing
+`.hub/peers` is converted to `file://` remotes by the first writing
+command).
+
+```sh
+# on the server: a bare repository (no working directory, D-042)
+barocss-hub init --bare /srv/hub/proj
+# on each laptop
+barocss-hub remote add origin ssh://alice@srv/srv/hub/proj   # or srv:proj (home-relative)
+barocss-hub remote add --exec /home/alice/.cargo/bin/barocss-hub origin2 srv:/srv/hub/proj
+barocss-hub remote list
+barocss-hub sync            # the default remote; or `sync origin`, a URL, or a path
+barocss-hub checkout        # sync is log-only
+```
+
+- The client runs the system `ssh` (keys, host keys, agents, ProxyJump and
+  `~/.ssh/config` are ssh's business; barocss-hub never asks for a
+  password). `BAROCSS_HUB_SSH` replaces the ssh program and fixed args.
+  The remote end is `barocss-hub serve --stdio <path>`, which serves only
+  that repository.
+- Restricting a key on the server (`~/.ssh/authorized_keys`):
+  `restrict,command="barocss-hub serve --stdio --root /srv/hub --from-ssh-original-command" ssh-ed25519 ...`
+  Add `--read-only` for keys that may only pull: such a client pulls,
+  prints `remote is read-only; pulled only` and exits 0.
+- `watch` syncs with every remote (D-044). `sync --json` reports
+  `received`, `sent`, `read_only` and `head`.
+- Not verified here against a real sshd (none on the development
+  machine); the tests use `HUB_SSH_COMMAND`, a stand-in `ssh` that runs the
+  remote command locally.
+
 ## Live sync between two folders (`barocss-hub watch`)
 
 `barocss-hub watch` records working-directory edits automatically, syncs with every
-configured peer and applies what arrives. Run it in the foreground in each
+configured remote and applies what arrives. Run it in the foreground in each
 folder; Ctrl-C stops it cleanly (exit 0).
 
 ```sh
 mkdir a b
 (cd a && barocss-hub init) && (cd b && barocss-hub init)
-(cd a && barocss-hub peer add ../b)       # .hub/peers: local config, not replicated
-(cd b && barocss-hub peer add ../a)
+(cd a && barocss-hub remote add b ../b)  # .hub/remotes: local config, not replicated
+(cd b && barocss-hub remote add a ../a)
 (cd a && barocss-hub watch)               # terminal 1
 (cd b && barocss-hub watch)               # terminal 2
 echo hello > a/notes.txt          # ~1 s later: b/notes.txt says hello
 echo "from b" >> b/notes.txt      # ~1 s later: a/notes.txt has both lines
-(cd a && barocss-hub status)              # "peers:", "watch: active (pid N)", clean
+(cd a && barocss-hub status)              # "remotes:", "watch: active (pid N)", clean
 ```
 
 Watcher output (terminal 1) for the above, as actually run:
 
 ```text
-watching /.../a (1 peer(s)); Ctrl-C to stop
+watching /.../a (1 remote(s)); Ctrl-C to stop
 recorded 1 change(s):
   added:    notes.txt
-synced with /.../b: received 0 op(s), 0 blob(s), 0 checkpoint(s); sent 2 op(s), 1 blob(s), 0 checkpoint(s)
+synced with b: received 0 op(s), 0 blob(s), 0 checkpoint(s); sent 2 op(s), 1 blob(s), 0 checkpoint(s)
 checked out f1137570 (1 written, 0 removed)
 watch stopped
 ```
 
 - Change detection polls the tree (`--poll`, default 100 ms); an edit is
   recorded after the tree has been quiet for `--debounce` (default 400 ms),
-  so a burst of saves becomes one record. Peers are also synced every
-  `--sync` ms (default 2000).
+  so a burst of saves becomes one record. Every remote is also synced
+  every `--sync` ms (default 2000); a failing remote backs off (up to 32
+  intervals) and is reported as an `error` event with `peer` = its name.
 - Auto-record is `barocss-hub record`: `.hubignore`, blocked paths and an
   interrupted checkout are honoured; a refusal is printed and retried.
   It never checkpoints; use `barocss-hub commit`. [decision-proposal]

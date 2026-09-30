@@ -134,7 +134,7 @@ describe('barocss-hub extension (real CLI, temp repos)', function () {
   });
 
   it('unsaved-edit guard: incoming change on a dirty file offers Compare / Keep mine / Reload', async () => {
-    hub(WS, 'peer', 'add', PEER);
+    hub(WS, 'remote', 'add', 'peer', PEER);
     const offered: string[][] = [];
     api.setGuardPrompt(async (_m, ...items) => { offered.push(items); return 'Keep mine'; });
     const doc = await vscode.workspace.openTextDocument(fileUri('h.txt'));
@@ -155,7 +155,7 @@ describe('barocss-hub extension (real CLI, temp repos)', function () {
     await waitFor('kept edit recorded', async () => (await api.repos()[0].pathLog('h.txt')).ops.filter((o) => o.kind === 'set-content').length >= 3);
     api.setGuardPrompt(undefined);
     await vscode.commands.executeCommand('barocssHub.stopWatch');
-    hub(WS, 'peer', 'rm', PEER);
+    hub(WS, 'remote', 'rm', 'peer');
   });
 
   it('observes VS Code save temp names (report only)', async () => {
