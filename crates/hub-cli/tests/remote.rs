@@ -48,7 +48,9 @@ exec sh -c "$cmd"
 
 fn hub_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut c = Command::new(BIN);
-    c.args(args).current_dir(dir).env_remove("BAROCSS_HUB_SERVE_ROOT");
+    c.args(args)
+        .current_dir(dir)
+        .env_remove("BAROCSS_HUB_SERVE_ROOT");
     for (k, v) in env {
         c.env(k, v);
     }
@@ -96,7 +98,11 @@ fn worktree(root: &Path) -> BTreeMap<String, Vec<u8>> {
             if rel.is_empty() && n == ".hub" {
                 continue;
             }
-            let p = if rel.is_empty() { n } else { format!("{rel}/{n}") };
+            let p = if rel.is_empty() {
+                n
+            } else {
+                format!("{rel}/{n}")
+            };
             if e.file_type().unwrap().is_dir() {
                 walk(&e.path(), &p, out);
             } else {
@@ -121,7 +127,10 @@ fn files_mtimes(d: &Path) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)>
                 stack.push(e.path());
                 m.insert(e.path(), (Vec::new(), md.modified().unwrap()));
             } else {
-                m.insert(e.path(), (fs::read(e.path()).unwrap(), md.modified().unwrap()));
+                m.insert(
+                    e.path(),
+                    (fs::read(e.path()).unwrap(), md.modified().unwrap()),
+                );
             }
         }
     }
@@ -175,7 +184,10 @@ fn ssh_sync_through_bare_server_converges() {
     fs::write(b.join("g.txt"), "from b\n").unwrap();
     ok(&b, &["record"]);
     let s = ok_env(&a, &["sync"], &e.env());
-    assert!(s.contains("sent 5 op(s), 2 blob(s), 1 checkpoint(s)"), "{s}");
+    assert!(
+        s.contains("sent 5 op(s), 2 blob(s), 1 checkpoint(s)"),
+        "{s}"
+    );
     e.sync(&b, "origin");
     e.sync(&a, "origin");
     ok(&a, &["checkout"]);
@@ -248,7 +260,11 @@ fn read_only_server_pulls_only_and_is_untouched() {
     assert!(s.contains("sent 0 op(s)"), "{s}");
     let j = ok_env(&a, &["sync", "--json", &url], &env);
     assert!(j.contains("\"read_only\":true"), "{j}");
-    assert_eq!(files_mtimes(&srv.join(".hub")), before, "read-only server changed");
+    assert_eq!(
+        files_mtimes(&srv.join(".hub")),
+        before,
+        "read-only server changed"
+    );
     ok(&a, &["checkout"]);
     assert!(a.join("s.txt").exists());
     assert!(ok(&a, &["log"]).contains("[published] s"));
@@ -291,7 +307,11 @@ fn forced_command_confinement() {
     ] {
         let o = forced(&url, &[]);
         assert!(!o.status.success(), "{url}");
-        assert!(code(&o).contains("\"code\":\"forbidden\""), "{url}: {}", code(&o));
+        assert!(
+            code(&o).contains("\"code\":\"forbidden\""),
+            "{url}: {}",
+            code(&o)
+        );
     }
     // The environment cannot widen the root under a forced command.
     let o = forced(
@@ -304,7 +324,11 @@ fn forced_command_confinement() {
     fs::create_dir_all(&srv2).unwrap();
     ok(&srv2, &["init"]);
     fs::remove_file(srv2.join(".hub/checkpoints.log")).unwrap();
-    std::os::unix::fs::symlink(outside.join(".hub/checkpoints.log"), srv2.join(".hub/checkpoints.log")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.join(".hub/checkpoints.log"),
+        srv2.join(".hub/checkpoints.log"),
+    )
+    .unwrap();
     let o = forced(&format!("ssh://h{}", srv2.display()), &[]);
     assert!(code(&o).contains("forbidden"), "{}", code(&o));
 }
@@ -337,14 +361,21 @@ fn no_command_injection_through_url_path_or_exec() {
     }
     // Option injection through the host is refused before ssh runs.
     let err = fail_env(&a, &["sync", "-oProxyCommand=touch:x"], &env);
-    assert!(err.contains("bad remote url") || err.contains("usage"), "{err}");
+    assert!(
+        err.contains("bad remote url") || err.contains("usage"),
+        "{err}"
+    );
     assert!(!pwned.exists());
 }
 
 #[test]
 fn central_replica_three_clients_concurrent_ssh_and_file() {
     for via_ssh in [false, true] {
-        let e = Env::new(if via_ssh { "central-ssh" } else { "central-file" });
+        let e = Env::new(if via_ssh {
+            "central-ssh"
+        } else {
+            "central-file"
+        });
         let srv = e.bare("srv");
         let url = if via_ssh {
             format!("ssh://localhost{}", srv.display())
@@ -408,7 +439,16 @@ fn watch_syncs_with_remotes() {
         ok(d, &["remote", "add", "--exec", BIN, "origin", &url]);
     }
     let w = Command::new(BIN)
-        .args(["watch", "--json", "--poll", "50", "--debounce", "100", "--sync", "300"])
+        .args([
+            "watch",
+            "--json",
+            "--poll",
+            "50",
+            "--debounce",
+            "100",
+            "--sync",
+            "300",
+        ])
         .current_dir(&b)
         .env("HUB_SSH_COMMAND", &e.ssh)
         .stdout(std::process::Stdio::piped())
@@ -421,10 +461,16 @@ fn watch_syncs_with_remotes() {
     while !b.join("x.txt").exists() && t0.elapsed() < std::time::Duration::from_secs(20) {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    let _ = Command::new("kill").arg("-TERM").arg(w.id().to_string()).status();
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(w.id().to_string())
+        .status();
     let out = w.wait_with_output().unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(b.join("x.txt").exists(), "{s}");
     assert!(s.contains("\"remotes\":1"), "{s}");
-    assert!(s.contains("\"event\":\"synced\"") && s.contains("\"peer\":\"origin\""), "{s}");
+    assert!(
+        s.contains("\"event\":\"synced\"") && s.contains("\"peer\":\"origin\""),
+        "{s}"
+    );
 }
