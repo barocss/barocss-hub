@@ -1,0 +1,1 @@
+{"schema":1,"program":"barocss-hub","error":{"code":"unsupported","message":"https://example.invalid/r: HTTP remotes are not implemented yet (serve --http is designed, not built)"},"warnings":[]}
