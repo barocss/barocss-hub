@@ -22,6 +22,13 @@
 //! Not supported at all: nested `.hubignore` files, `.git/info/exclude`
 //! style per-repo or global excludes, case-insensitive matching.
 //!
+//! # Built-in default ignores (Issue #37)
+//! [`DEFAULTS`] (editor and OS temp files) are parsed as if they were the
+//! first lines of every `.hubignore`, so a later `!pattern` in the file
+//! re-includes any of them (last match wins). They apply even with no
+//! `.hubignore`. As with any rule, a path that is already tracked stays
+//! tracked (#24).
+//!
 //! The top-level `.hub/` directory is always excluded by the scanner and
 //! never reaches this matcher.
 
@@ -30,6 +37,34 @@ use std::io;
 use std::path::Path;
 
 pub const FILE: &str = ".hubignore";
+
+/// Built-in default ignore patterns (Issue #37), in `.hubignore` syntax,
+/// applied before the file's own lines. Same list in the README and the
+/// Wiki (CLI-JSON / Repository-Semantics).
+pub const DEFAULTS: &[&str] = &[
+    // vim: swap files (.x.swp, then .swo, .swn, ... when taken), the
+    // `4913` write-permission probe, and `x~` backups (also emacs).
+    "*.swp",
+    "*.swo",
+    "*.swn",
+    "*.swx",
+    "4913",
+    "*~",
+    // emacs: `.#x` lock links and `#x#` auto-save files.
+    ".#*",
+    "\\#*#",
+    // JetBrains "safe write".
+    "*___jb_tmp___",
+    "*___jb_old___",
+    // LibreOffice / OpenOffice lock files.
+    ".~lock.*#",
+    // GNOME GIO atomic-replace temp files (gedit and other GTK editors).
+    ".goutputstream-*",
+    // OS metadata.
+    ".DS_Store",
+    "Thumbs.db",
+    "desktop.ini",
+];
 
 #[derive(Clone, Debug)]
 struct Rule {
@@ -50,12 +85,20 @@ impl Ignore {
         let p = root.join(FILE);
         match fs::symlink_metadata(&p) {
             Ok(m) if m.is_file() => {}
-            Ok(_) => return Ok(Ignore::default()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Ignore::default()),
+            Ok(_) => return Ok(Ignore::defaults()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Ignore::defaults()),
             Err(e) => return Err(e),
         }
         let bytes = fs::read(&p)?;
-        Ok(Ignore::parse(&String::from_utf8_lossy(&bytes)))
+        let mut ig = Ignore::defaults();
+        ig.rules
+            .extend(Ignore::parse(&String::from_utf8_lossy(&bytes)).rules);
+        Ok(ig)
+    }
+
+    /// Only the built-in [`DEFAULTS`].
+    pub fn defaults() -> Ignore {
+        Ignore::parse(&DEFAULTS.join("\n"))
     }
 
     pub fn parse(text: &str) -> Ignore {
@@ -284,5 +327,72 @@ mod tests {
     fn empty_ignores_nothing() {
         assert!(!ig("").is_ignored("x", false));
         assert!(!ig("/\n!\n").is_ignored("x", false));
+    }
+
+    /// Issue #37: every default pattern, with a sample it must match (at
+    /// the root and nested) and near misses it must not.
+    #[test]
+    fn defaults_match_editor_and_os_temp_files() {
+        let d = Ignore::defaults();
+        let hits = [
+            ".x.rs.swp",
+            ".x.rs.swo",
+            ".x.rs.swn",
+            ".x.rs.swx",
+            "4913",
+            "x.rs~",
+            ".#x.rs",
+            "#x.rs#",
+            "x.rs___jb_tmp___",
+            "x.rs___jb_old___",
+            ".~lock.report.odt#",
+            ".goutputstream-AB12CD",
+            ".DS_Store",
+            "Thumbs.db",
+            "desktop.ini",
+        ];
+        assert_eq!(hits.len(), DEFAULTS.len(), "one sample per default");
+        for h in hits {
+            assert!(d.is_ignored(h, false), "{h}");
+            assert!(d.is_ignored(&format!("src/deep/{h}"), false), "nested {h}");
+        }
+        for miss in [
+            "x.rs",
+            "swp",
+            "x.swp.rs",
+            "49130",
+            "~x",
+            "x#",
+            "x___jb_tmp",
+            "DS_Store",
+            "thumbs.db.txt",
+            "#readme",
+        ] {
+            assert!(!d.is_ignored(miss, false), "{miss}");
+        }
+        // Each default is also its own rule: dropping any one of them makes
+        // its sample tracked (mutation check of the list itself).
+        for (i, h) in hits.iter().enumerate() {
+            let mut rest: Vec<&str> = DEFAULTS.to_vec();
+            rest.remove(i);
+            assert!(!Ignore::parse(&rest.join("\n")).is_ignored(h, false), "{h}");
+        }
+    }
+
+    /// Defaults come first: a `.hubignore` `!` line re-includes them.
+    #[test]
+    fn defaults_re_includable_from_hubignore() {
+        let root = std::env::temp_dir().join(format!("hub-ig-defaults-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let i = Ignore::load(&root).unwrap();
+        assert!(i.is_ignored("a.swp", false) && i.is_ignored(".DS_Store", false));
+        fs::write(root.join(FILE), "!*.swp\n!4913\n*.log\n").unwrap();
+        let i = Ignore::load(&root).unwrap();
+        assert!(!i.is_ignored("a.swp", false));
+        assert!(!i.is_ignored("d/4913", false));
+        assert!(i.is_ignored("x~", false), "other defaults still apply");
+        assert!(i.is_ignored("a.log", false));
+        fs::remove_dir_all(&root).unwrap();
     }
 }
