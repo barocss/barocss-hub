@@ -191,3 +191,52 @@ fn pre43_binary_on_a_migrated_repository() {
     check_migrated(&d, &peers);
     ok(&d, &["status"]);
 }
+
+/// After migration, a pre-#43 binary's `peer add X` writes a non-empty v1
+/// `.hub/peers` (header + canonical roots, exactly as `write_peers` did).
+/// The new binary merges it: nothing lost, a URL already present is not
+/// duplicated, a basename that collides with an existing remote name
+/// becomes `local-<n>` (n = its 1-based line in `peers`, bumped past used
+/// names); a valid unused basename is kept as the name.
+#[test]
+fn peers_written_after_migration_are_merged_not_lost() {
+    let (d, peers) = setup("readd");
+    ok(&d, &["record"]);
+    check_migrated(&d, &peers);
+    let t = d.parent().unwrap();
+    let fresh = t.join("fresh");
+    let clash = t.join("x").join("p1"); // basename `p1` is already a remote
+    for p in [&fresh, &clash] {
+        fs::create_dir_all(p).unwrap();
+        ok(p, &["init"]);
+    }
+    let clash = fs::canonicalize(clash).unwrap();
+    fs::write(
+        d.join(".hub/peers"),
+        format!(
+            "barocss-hub/peers/v1\n{}\n{}\n{}\n",
+            peers[0].display(), // already a remote (p1): deduplicated by URL
+            fresh.display(),
+            clash.display()
+        ),
+    )
+    .unwrap();
+    ok(&d, &["record"]);
+    assert!(!d.join(".hub/peers").exists());
+    let l = ok(&d, &["remote", "list"]);
+    assert_eq!(l.lines().count(), 5, "{l}");
+    assert_eq!(
+        l.matches(&format!("\tfile://{}", peers[0].display()))
+            .count(),
+        1,
+        "{l}"
+    );
+    assert!(
+        l.contains(&format!("fresh\tfile://{}", fresh.display())),
+        "{l}"
+    );
+    assert!(
+        l.contains(&format!("local-3\tfile://{}", clash.display())),
+        "{l}"
+    );
+}
