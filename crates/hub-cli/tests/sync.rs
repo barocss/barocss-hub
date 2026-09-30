@@ -308,9 +308,11 @@ fn copied_hub_is_duplicate_replica_then_reid_allows_sync() {
         e.contains("duplicate replica id") && e.contains("barocss-hub reid"),
         "{e}"
     );
+    // #43 (Remote-Sync §5.2.3 R5): the Hello replica id is an unverified
+    // claim, so the refusal persists nothing on either side.
     let w = ok(&a, &["warnings"]);
-    assert!(w.contains("duplicate-replica"), "{w}");
-    assert!(ok(&b, &["status"]).contains("duplicate-replica"));
+    assert!(!w.contains("duplicate-replica"), "{w}");
+    assert!(!ok(&b, &["status"]).contains("duplicate-replica"));
     let rid = ok(&b, &["reid"]);
     assert!(rid.contains(" -> "), "{rid}");
     fs::write(b.join("g"), "g\n").unwrap();
@@ -323,32 +325,44 @@ fn copied_hub_is_duplicate_replica_then_reid_allows_sync() {
 
 /// #23 PROVISIONAL default (`hub_cli::sync::REID_CLEARS_DUPLICATE_WARNINGS`,
 /// pending user confirmation): a successful `hub reid` clears this repo's
-/// saved duplicate-replica warnings; the other copy keeps its own.
+/// saved duplicate-replica warnings. Since #43 such a warning comes only
+/// from op-level detection (R5): `a` and its copy `b` share an id, `b`'s op
+/// reaches `a` through a third repository `c`.
 #[test]
 fn reid_clears_duplicate_replica_warnings() {
     let t = tmp("dup-clear");
     let a = t.join("a");
     let b = t.join("b");
+    let c = t.join("c");
     fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&c).unwrap();
     ok(&a, &["init"]);
+    ok(&c, &["init"]);
     let st = Command::new("cp")
         .args(["-R", a.to_str().unwrap(), b.to_str().unwrap()])
         .status()
         .unwrap();
     assert!(st.success());
-    fail(&b, &["sync", "../a"]);
-    assert!(ok(&b, &["warnings"]).contains("duplicate-replica"));
-    let rid = ok(&b, &["reid"]);
+    fs::write(b.join("g"), "g\n").unwrap();
+    ok(&b, &["record"]);
+    sync(&c, &b);
+    let e = fail(&a, &["sync", "../c"]);
+    assert!(e.contains("duplicate replica id"), "{e}");
+    assert!(ok(&a, &["warnings"]).contains("duplicate-replica"));
+    // A persisted op-level warning stops later syncs with that peer (D-022).
+    let e = fail(&a, &["sync", "../c"]);
+    assert!(e.contains("duplicate"), "{e}");
+    let rid = ok(&a, &["reid"]);
+    // One warning per op of b's record (create + set-content).
     assert_eq!(
-        rid.contains("cleared 1 duplicate-replica warning(s)"),
+        rid.contains("cleared 2 duplicate-replica warning(s)"),
         hub_cli::sync::REID_CLEARS_DUPLICATE_WARNINGS,
         "{rid}"
     );
     assert_eq!(
-        !ok(&b, &["warnings"]).contains("duplicate-replica"),
+        !ok(&a, &["warnings"]).contains("duplicate-replica"),
         hub_cli::sync::REID_CLEARS_DUPLICATE_WARNINGS
     );
-    assert!(ok(&a, &["warnings"]).contains("duplicate-replica"));
 }
 
 #[test]

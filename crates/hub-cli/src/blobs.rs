@@ -224,6 +224,22 @@ impl Blobs {
     }
 }
 
+/// Ids of the blob files in a `blobs/` directory, without creating it.
+pub fn list_dir(dir: &Path) -> io::Result<Vec<BlobId>> {
+    Blobs {
+        dir: dir.to_path_buf(),
+    }
+    .list()
+}
+
+/// Read and verify one blob from a `blobs/` directory, without creating it.
+pub fn read_verified(dir: &Path, id: &BlobId) -> Result<Vec<u8>, BlobError> {
+    Blobs {
+        dir: dir.to_path_buf(),
+    }
+    .get(id)
+}
+
 /// A group commit of blobs (Issue #29, Wiki Appendix A.1): every
 /// [`BlobBatch::add`] writes and flushes a temp; [`BlobBatch::commit`] issues
 /// one barrier, renames every temp to its blob name and fsyncs `blobs/`
@@ -292,6 +308,24 @@ impl BlobBatch<'_> {
         self.seen.insert(id);
         self.last = Some(f);
         Ok(id)
+    }
+
+    /// Stage a received file already verified to hash to `id` and flushed
+    /// (Issue #43): it is renamed to its final name (no re-read); a direct
+    /// batch's commit then flushes `blobs/` and issues the barrier.
+    pub fn add_file(&mut self, id: &BlobId, path: &Path) -> Result<(), BlobError> {
+        if *id == BlobId::empty() || self.seen.contains(id) {
+            let _ = fs::remove_file(path);
+            return Ok(());
+        }
+        let fin = self.blobs.path(id);
+        fs::rename(path, &fin)?;
+        let f = File::open(&fin)?;
+        durable::flush(&f)?;
+        self.temps.push((fin, *id));
+        self.seen.insert(*id);
+        self.last = Some(f);
+        Ok(())
     }
 
     /// Barrier, renames, one directory fsync. Returns how many blobs were

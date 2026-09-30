@@ -8,6 +8,8 @@ pub mod durable;
 pub mod ignore;
 pub mod json;
 pub mod migrate;
+pub mod remote;
+pub mod session;
 pub mod snapshot;
 pub mod store;
 pub mod sync;
@@ -330,6 +332,12 @@ impl Repo {
 
     /// Create `.hub/` under `root`.
     pub fn init(root: &Path) -> Result<Repo, Error> {
+        Self::init_opts(root, false)
+    }
+
+    /// [`Repo::init`]; `bare` also writes the `.hub/bare` marker (D-042),
+    /// before the replica file that marks a complete init.
+    pub fn init_opts(root: &Path, bare: bool) -> Result<Repo, Error> {
         let dir = root.join(HUB_DIR);
         if dir.exists() {
             return errc(
@@ -341,8 +349,11 @@ impl Repo {
         let (rp, op, cp) = Self::paths(&dir);
         store::write_atomic(&op, format!("{}\n", store::OPLOG_HEADER).as_bytes())?;
         store::write_atomic(&cp, format!("{}\n", store::CKPT_HEADER).as_bytes())?;
-        // Format v1 (Issue #33, Appendix A.2.7): v1 peers, watch.lock, format.
-        watch::write_peers(&dir, &[])?;
+        // Format v1 (Issue #33, Appendix A.2.7): watch.lock, format. (No
+        // `peers` since #43, D-041.)
+        if bare {
+            store::write_atomic(&dir.join(remote::BARE_FILE), b"")?;
+        }
         fs::File::create(dir.join(watch::LOCK_FILE))?;
         store::write_atomic(&dir.join("format"), store::FORMAT_V1.as_bytes())?;
         let rid = hub_core::sync::new_replica_id();
@@ -384,8 +395,18 @@ impl Repo {
     /// file is read and held until the `Repo` is dropped, so a writer's
     /// replay -> mint -> append is atomic with respect to other processes.
     pub fn open_dir_with(dir: PathBuf, mode: LockMode) -> Result<Repo, Error> {
+        Self::open_dir_opts(dir, mode, None)
+    }
+
+    /// [`Repo::open_dir_with`] waiting at most `wait` for the lock (Issue
+    /// #43, `serve`), else `locked`.
+    pub fn open_dir_opts(dir: PathBuf, mode: LockMode, wait: Option<std::time::Duration>) -> Result<Repo, Error> {
         let acquire = |m: LockMode| {
-            RepoLock::acquire(&dir, m).map_err(|e| {
+            match wait {
+                Some(w) => RepoLock::acquire_timeout(&dir, m, w),
+                None => RepoLock::acquire(&dir, m),
+            }
+            .map_err(|e| {
                 Error::new(
                     Code::Locked,
                     format!("cannot lock {}: {e}", dir.join("lock").display()),
@@ -430,6 +451,9 @@ impl Repo {
                 drop(lock);
                 lock = acquire(mode)?;
             }
+        }
+        if mode == LockMode::Exclusive {
+            remote::migrate_peers(&dir)?;
         }
         let (fmt, rid) = migrate::read_replica(&dir)?;
         if fmt != migrate::Format::V1 {
@@ -1620,7 +1644,8 @@ Usage: barocss-hub <command> [args]
 The working directory is the directory containing .hub/ (minus .hub/).
 
 Commands:
-  init                 create .hub/ in the current directory
+  init [--bare [<dir>]]  create .hub/ in the current directory (--bare: a
+                       repository without a working directory, for a server)
   record [-m <msg>]    record working-directory changes as ops (-m: also checkpoint)
   checkout [--force] [<short-id>]  write a version (default: head) to the working directory
   mkdir <path>         create a directory (op + working directory)
@@ -1636,14 +1661,20 @@ Commands:
   show [-l] <short-id> print the tree of a version (hex prefix, >= 4 digits)
   cat <short-id> <path>  write a file's bytes in that version to stdout
   cat-blob <blob-id>   write a stored blob's bytes (64 hex digits) to stdout
-  sync <path>          exchange ops, blobs and published checkpoints with another
-                       local repo (log only; run `barocss-hub checkout` afterwards)
+  sync [<remote|url>]  exchange ops, blobs and published checkpoints with a remote
+                       (name from `remote list`, ssh://host/path, host:path,
+                       file:///path or a local path; default: the default remote);
+                       log only: run `barocss-hub checkout` afterwards
+  remote add [--default] [--exec <path>] [<name>] <url> | list | rm <name> | set-url <name> <url>
+                       manage remotes (.hub/remotes, local config, not replicated)
+  serve --stdio [--read-only] [--root <dir>] <path>
+                       speak the sync protocol on stdin/stdout for one repository
+                       (the remote end of ssh; see --from-ssh-original-command)
   publish <short-id|message>  mark a local checkpoint published (sync sends it)
-  peer add|list|rm [<path>]  manage local peers for `barocss-hub watch` (.hub/peers,
-                       local config, not replicated)
+  peer                 removed: use `barocss-hub remote add <name> file:///path`
   watch [--poll <ms>] [--debounce <ms>] [--sync <ms>]
                        foreground: auto-record working-directory changes,
-                       sync with every peer, apply incoming ops; Ctrl-C stops
+                       sync with every remote, apply incoming ops; Ctrl-C stops
   warnings             list sync warnings (D-008) and pending ops
   reid                 give this repo a fresh replica id (after copying a .hub/;
                        run it BEFORE recording in the copy); clears saved
@@ -1659,7 +1690,7 @@ JSON Lines events); errors as JSON on stderr, exit status 1.
 /// the tests assert each one appears in [`HELP`] (Issue #35), so the help
 /// cannot drift from the dispatch table.
 pub const COMMANDS: &[&str] = &[
-    "init", "peer", "watch", "sync", "publish", "warnings", "reid", "mkdir", "touch", "mv", "rm",
+    "init", "peer", "remote", "serve", "watch", "sync", "publish", "warnings", "reid", "mkdir", "touch", "mv", "rm",
     "ls", "status", "commit", "log", "show", "record", "checkout", "help", "cat", "cat-blob",
 ];
 
@@ -1731,20 +1762,41 @@ pub fn run(
         return Err(usage("help"));
     }
     if a[0] == "init" {
-        if a.len() != 1 {
-            return Err(usage("init"));
+        let (root, bare) = match a.as_slice() {
+            ["init"] => (cwd.to_path_buf(), false),
+            ["init", "--bare"] => (cwd.to_path_buf(), true),
+            ["init", "--bare", d] => (cwd.join(d), true),
+            _ => return Err(usage("init")),
+        };
+        if bare {
+            fs::create_dir_all(&root)?;
         }
-        let r = Repo::init(cwd)?;
+        let r = Repo::init_opts(&root, bare)?;
         writeln!(
             out,
-            "initialized hub repository in {} (replica {:032x})",
+            "initialized {}hub repository in {} (replica {:032x})",
+            if bare { "bare " } else { "" },
             r.dir.display(),
             r.replica_id.0
         )?;
         return Ok(());
     }
     if a[0] == "peer" {
-        return watch::peer_cmd(cwd, &a[1..], out);
+        return errc(
+            Code::Usage,
+            "`peer` was replaced by `remote` (D-041): use `barocss-hub remote add <name> file:///abs/path`",
+        );
+    }
+    if a[0] == "remote" {
+        return remote::remote_cmd(cwd, &a[1..], out);
+    }
+    if a[0] == "serve" {
+        return remote::serve_cmd(cwd, &a[1..]);
+    }
+    if matches!(a[0], "record" | "checkout" | "mkdir" | "touch" | "mv" | "rm" | "watch") {
+        if let Ok(hub) = sync::find_hub(cwd) {
+            remote::refuse_bare(&hub, a[0])?;
+        }
     }
     if a[0] == "watch" {
         let mut opts = watch::parse_opts(&a[1..])?;
@@ -1752,10 +1804,16 @@ pub fn run(
         return watch::watch_cmd(cwd, opts, out, warn);
     }
     if a[0] == "sync" {
-        return match a.as_slice() {
-            ["sync", p] => sync::sync_cmd(cwd, p, out, warn),
-            _ => Err(usage("sync")),
+        let arg = match a.as_slice() {
+            ["sync"] => None,
+            ["sync", p] => Some(*p),
+            _ => return Err(usage("sync")),
         };
+        if json {
+            let r = remote::sync(cwd, arg, true, warn)?;
+            return json::emit(out, json::sync_doc(&r, warn)?);
+        }
+        return remote::sync_cmd(cwd, arg, out, warn);
     }
     // Mutating commands hold an exclusive lock from replay to append (and,
     // for record/checkout, across the working-directory update and index
@@ -1923,11 +1981,11 @@ pub fn run(
                     "pending ops: {npend} (missing deps; retried on the next sync)"
                 )?;
             }
-            let peers = watch::read_peers(&repo.dir)?;
-            if !peers.is_empty() {
-                writeln!(out, "peers:")?;
-                for p in &peers {
-                    writeln!(out, "  {}", p.display())?;
+            let remotes = remote::remotes_view(&repo.dir)?;
+            if !remotes.is_empty() {
+                writeln!(out, "remotes:")?;
+                for r in &remotes {
+                    writeln!(out, "  {} {}", r.name, r.url)?;
                 }
             }
             if let Some(p) = watch::pinned(&repo.dir)? {

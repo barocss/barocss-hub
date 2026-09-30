@@ -740,6 +740,44 @@ pub fn try_lock_exclusive(path: &Path) -> io::Result<Option<File>> {
 }
 
 impl RepoLock {
+    /// [`RepoLock::acquire`] that gives up after `wait` (Issue #43: a
+    /// `serve` persist step never waits forever for another session's
+    /// lock) with `ErrorKind::WouldBlock`.
+    pub fn acquire_timeout(dir: &Path, mode: LockMode, wait: std::time::Duration) -> io::Result<RepoLock> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("lock"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let op = match mode {
+                LockMode::Shared => sys::LOCK_SH,
+                LockMode::Exclusive => sys::LOCK_EX,
+            } | sys::LOCK_NB;
+            let end = std::time::Instant::now() + wait;
+            loop {
+                // SAFETY: valid open fd owned by `file`; flock has no memory effects.
+                if unsafe { sys::flock(file.as_raw_fd(), op) } == 0 {
+                    break;
+                }
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::WouldBlock && e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+                if std::time::Instant::now() >= end {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "repository is locked by another process"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (mode, wait);
+        Ok(RepoLock { _file: file })
+    }
+
     pub fn acquire(dir: &Path, mode: LockMode) -> io::Result<RepoLock> {
         let file = OpenOptions::new()
             .read(true)

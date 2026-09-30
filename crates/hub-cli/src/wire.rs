@@ -627,6 +627,8 @@ pub struct Conn {
     pub theirs: Limits,
     /// Bytes read so far (tests: prove limits are checked pre-allocation).
     pub bytes_in: Arc<AtomicUsize>,
+    /// Session wall-time end (server, §5.2.5): reads never wait past it.
+    pub deadline: Option<Instant>,
 }
 
 /// In-memory duplex pair (tests). The shared [`Cut`] can end both
@@ -664,6 +666,7 @@ impl Conn {
             ours: Limits::default(),
             theirs: Limits::default(),
             bytes_in: Arc::new(AtomicUsize::new(0)),
+            deadline: None,
         }
     }
 
@@ -798,7 +801,10 @@ impl Conn {
     /// Read one frame: the length is checked against our frame limit before
     /// the payload is read or allocated.
     pub fn recv(&mut self, timeout: Duration) -> Result<Frame, Error> {
-        let deadline = Instant::now() + timeout;
+        let mut deadline = Instant::now() + timeout;
+        if let Some(d) = self.deadline {
+            deadline = deadline.min(d);
+        }
         let l = self.read_exact(4, deadline)?;
         let len = u32::from_be_bytes([l[0], l[1], l[2], l[3]]);
         if len == 0 {

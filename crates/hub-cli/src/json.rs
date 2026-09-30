@@ -49,7 +49,7 @@ pub const EXIT_NO_CWD: u8 = 2;
 /// document is `{"schema","command","output":[<its human lines>],"warnings"}`.
 pub const STRUCTURED: &[&str] = &[
     "help", "status", "log", "warnings", "ls", "show", "cat", "cat-blob", "record", "checkout",
-    "commit", "watch",
+    "commit", "watch", "sync",
 ];
 
 /// A JSON value.
@@ -523,7 +523,7 @@ fn status_doc(repo: &Repo, proj: &Projection, warn: &mut dyn Write) -> Result<J,
     let hid = VersionId::of_frontier(&head_f);
     let published = sync::read_published(repo)?.len();
     let (sw, npend) = sync::warnings_view(repo)?;
-    let peers = watch::read_peers(&repo.dir)?;
+    let remotes = crate::remote::remotes_view(&repo.dir)?;
     let pinned = watch::pinned(&repo.dir)?;
     let active = watch::active_watch(&repo.dir)?;
     let interrupted = wd::interrupted(&repo.dir)?.is_some();
@@ -619,8 +619,19 @@ fn status_doc(repo: &Repo, proj: &Projection, warn: &mut dyn Write) -> Result<J,
             ("sync_warnings", sync_warnings(&sw)),
             ("pending_ops", J::n(npend)),
             (
-                "peers",
-                J::strs(peers.iter().map(|p| p.to_string_lossy().into_owned())),
+                "remotes",
+                J::Arr(
+                    remotes
+                        .iter()
+                        .map(|r| {
+                            J::obj(vec![
+                                ("name", J::s(&r.name)),
+                                ("url", J::s(&r.url)),
+                                ("default", J::Bool(r.default)),
+                            ])
+                        })
+                        .collect(),
+                ),
             ),
             ("changes", changes(&infos)),
             (
@@ -811,6 +822,38 @@ pub(crate) fn record_doc(repo: &Repo, r: Option<&crate::Recorded>) -> J {
             ),
         ],
     )
+}
+
+/// Counts object of a sync (`{ops, blobs, checkpoints}`).
+pub fn counts_j(c: &crate::sync::Counts) -> J {
+    J::obj(vec![
+        ("ops", J::n(c.ops)),
+        ("blobs", J::n(c.blobs)),
+        ("checkpoints", J::n(c.checkpoints)),
+    ])
+}
+
+/// `sync --json` (Issue #43): counts, `read_only`, head, and the human
+/// lines as `output`.
+pub fn sync_doc(r: &crate::sync::Synced, warn: &mut dyn Write) -> Result<J, Error> {
+    let mut o = Vec::new();
+    crate::sync::print_report(r, &mut o, warn)?;
+    let text = String::from_utf8_lossy(&o).into_owned();
+    Ok(doc(
+        "sync",
+        vec![
+            ("remote", J::s(&r.remote)),
+            ("received", counts_j(&r.report.received)),
+            ("sent", counts_j(&r.report.sent)),
+            ("read_only", J::Bool(r.report.read_only)),
+            (
+                "head",
+                J::obj(vec![("id", J::s(&r.head_id)), ("short", J::s(&r.head_short))]),
+            ),
+            ("pending_ops", J::n(r.pending)),
+            ("output", J::strs(text.lines().collect::<Vec<_>>())),
+        ],
+    ))
 }
 
 pub(crate) fn checkout_fields(c: &crate::CheckedOut) -> Vec<(&'static str, J)> {
