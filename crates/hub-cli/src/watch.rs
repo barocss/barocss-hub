@@ -275,6 +275,9 @@ pub struct Opts {
     pub sync_every: Duration,
     /// `--json` (Issue #37): JSON Lines events on stdout instead of text.
     pub json: bool,
+    /// `--no-sync` (Issue #45): auto-record and apply only; no remote is
+    /// contacted (VS Code in a restricted workspace).
+    pub no_sync: bool,
 }
 
 impl Default for Opts {
@@ -284,6 +287,7 @@ impl Default for Opts {
             debounce: Duration::from_millis(400),
             sync_every: Duration::from_secs(2),
             json: false,
+            no_sync: false,
         }
     }
 }
@@ -307,8 +311,9 @@ pub fn parse_opts(args: &[&str]) -> Result<Opts, Error> {
             "--poll" => o.poll = ms(it.next())?,
             "--debounce" => o.debounce = ms(it.next())?,
             "--sync" => o.sync_every = ms(it.next())?,
+            "--no-sync" => o.no_sync = true,
             _ => return crate::errc(Code::Usage,
-                "usage: barocss-hub watch [--poll <ms>] [--debounce <ms>] [--sync <ms>]  (see barocss-hub --help)",
+                "usage: barocss-hub watch [--poll <ms>] [--debounce <ms>] [--sync <ms>] [--no-sync]  (see barocss-hub --help)",
             ),
         }
     }
@@ -523,7 +528,12 @@ fn step_events(io: &mut Io, s: &Step) -> Result<(), Error> {
 /// Per-remote failure backoff (Issue #43, D-044): after `n` consecutive
 /// failures a remote is skipped until `2^min(n,5)` sync intervals passed.
 #[derive(Default)]
-struct Backoff(std::collections::HashMap<String, (u32, Instant)>);
+struct Backoff(
+    std::collections::HashMap<String, (u32, Instant)>,
+    /// Untrusted remotes already announced (Issue #45: one event each,
+    /// never an error loop).
+    std::collections::HashSet<String>,
+);
 
 impl Backoff {
     fn due(&self, name: &str) -> bool {
@@ -549,8 +559,34 @@ fn sync_all(hub: &Path, io: &mut Io, backoff: &mut Backoff, every: Duration) -> 
             continue;
         }
         let name = r.name.clone();
-        let res = io.call(|_, warn| crate::remote::sync(&root, Some(&name), true, warn));
+        let res = io.call(|_, warn| {
+            crate::remote::sync(
+                &root,
+                Some(&name),
+                true,
+                crate::remote::TrustMode::Refuse,
+                warn,
+            )
+        });
         match res {
+            Err(e) if e.code() == Code::UntrustedRemote => {
+                // Skipped, not failed: re-checked each cycle (a `remote
+                // trust` takes effect without a restart), announced once.
+                if backoff.1.insert(name.clone()) {
+                    if io.json {
+                        io.event(
+                            "untrusted-remote",
+                            vec![
+                                ("peer", J::s(&name)),
+                                ("url", J::s(&r.url)),
+                                ("message", J::s(&e.0)),
+                            ],
+                        )?;
+                    } else {
+                        io.warning(&format!("skipping remote {name}: {e}"))?;
+                    }
+                }
+            }
             Err(e) => {
                 backoff.fail(&name, every);
                 if io.json {
@@ -569,6 +605,22 @@ fn sync_all(hub: &Path, io: &mut Io, backoff: &mut Backoff, every: Duration) -> 
             }
             Ok(s) => {
                 backoff.ok(&name);
+                backoff.1.remove(&name);
+                if !s.report.rejected.is_empty() {
+                    if io.json {
+                        io.event(
+                            "rejected",
+                            vec![
+                                ("peer", J::s(&name)),
+                                ("ops", crate::json::rejected_j(&s.report.rejected)),
+                            ],
+                        )?;
+                    } else {
+                        for l in crate::sync::rejected_lines(&s.report.rejected) {
+                            io.warning(&format!("{name}: {l}"))?;
+                        }
+                    }
+                }
                 let (g, t) = (s.report.received, s.report.sent);
                 let moved = g.ops + g.blobs + g.checkpoints + t.ops + t.blobs + t.checkpoints > 0;
                 // Only report syncs that moved something.
@@ -646,13 +698,15 @@ pub fn watch_cmd(
                 ("root", J::s(root.to_string_lossy())),
                 ("pid", J::n(std::process::id())),
                 ("remotes", J::n(nremotes)),
+                ("sync", J::Bool(!opts.no_sync)),
             ],
         )?;
     } else {
         writeln!(
             io.out,
-            "watching {} ({nremotes} remote(s)); Ctrl-C to stop",
+            "watching {} ({nremotes} remote(s){}); Ctrl-C to stop",
             root.display(),
+            if opts.no_sync { ", sync off" } else { "" }
         )?;
     }
     io.flush()?;
@@ -670,6 +724,7 @@ pub fn watch_cmd(
         }
     };
     let every = opts.sync_every;
+    let no_sync = opts.no_sync;
     let mut cycle = |do_sync: bool, io: &mut Io| -> Result<(), Error> {
         let recorded = match io.call(|o, w| step(&hub, o, w)) {
             Ok(s) => {
@@ -681,7 +736,7 @@ pub fn watch_cmd(
                 false
             }
         };
-        if (recorded || do_sync) && !stopping() {
+        if (recorded || do_sync) && !stopping() && !no_sync {
             let mid = oplog_len(&hub);
             sync_all(&hub, io, &mut backoff, every)?;
             if oplog_len(&hub) != mid && !stopping() {

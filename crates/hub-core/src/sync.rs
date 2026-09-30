@@ -102,6 +102,41 @@ pub struct RejectWarning {
     pub first_seen: u64,
 }
 
+/// `<counter>.<replica, 32 hex>` (the CLI's op-id form).
+pub fn fmt_node(n: NodeId) -> String {
+    format!("{}.{:032x}", n.counter, n.replica.0)
+}
+
+/// A human description of an op payload (Issue #45: equivocation warnings
+/// say what differs, not Rust `Debug`). Names are quoted with `{:?}`, so
+/// they never contain a raw newline (the kept/received separator).
+pub fn describe_payload(p: &Payload) -> String {
+    match p {
+        Payload::Create { kind, parent, name } => format!(
+            "create {} {name:?} in {}",
+            match kind {
+                crate::tree::Kind::Root => "root",
+                crate::tree::Kind::Directory => "directory",
+                crate::tree::Kind::File => "file",
+            },
+            fmt_node(*parent)
+        ),
+        Payload::Move {
+            node,
+            new_parent,
+            new_name,
+        } => format!(
+            "move {} to {new_name:?} in {}",
+            fmt_node(*node),
+            fmt_node(*new_parent)
+        ),
+        Payload::Delete { node } => format!("delete {}", fmt_node(*node)),
+        Payload::SetContent { node, blob } => {
+            format!("set content of {} to blob {}", fmt_node(*node), blob.hex())
+        }
+    }
+}
+
 /// Draw a replica id from the OS CSPRNG. Never returns `ReplicaId::ZERO`.
 pub fn new_replica_id() -> ReplicaId {
     loop {
@@ -494,7 +529,11 @@ impl SyncReplica {
             .or_else(|| self.rejected.get(&op.id));
         if let Some(prior) = prior {
             if *prior != op {
-                let detail = format!("kept {:?}, rejected {:?}", prior.payload, op.payload);
+                let detail = format!(
+                    "kept: {}\nreceived: {}",
+                    describe_payload(&prior.payload),
+                    describe_payload(&op.payload)
+                );
                 self.warn(
                     peer,
                     Some(op.id.replica),
@@ -569,7 +608,11 @@ impl SyncReplica {
         while let Some(id) = self.ready_q.pop_first() {
             let (op, peer) = self.pending.remove(&id).unwrap();
             if let Some(d) = op.deps.iter().find(|d| **d >= op.id) {
-                let detail = format!("dep {d:?} is not < {:?}", op.id);
+                let detail = format!(
+                    "dep {} is not older than the op {} (Lamport rule)",
+                    fmt_node(*d),
+                    fmt_node(op.id)
+                );
                 self.warn(
                     peer,
                     Some(op.id.replica),

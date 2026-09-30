@@ -65,7 +65,14 @@ pub const MAX_BLOB_SIZE: u64 = 2 << 30;
 /// Longest checkpoint message or note in bytes (§5.2.5, R4).
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
-pub const FEATURES: &[&str] = &["blobs-chunked", "checkpoints", "resume"];
+pub const FEATURES: &[&str] = &["blobs-chunked", "checkpoints", "resume", F_REJECTED_OPS];
+/// Issue #45: the receiver of a push lists the ops it rejected (equivocation,
+/// Lamport violation) in its `Committed` frame, as extra `R <id> <reason>`
+/// lines. Sent only when both Hellos carry it; a pre-#45 peer never sees
+/// the extra lines (its decoder would refuse them) and a pre-#45 server
+/// never sends them (the client then cannot learn about rejections, and
+/// says so in `--json` as `"rejected_reported": false`).
+pub const F_REJECTED_OPS: &str = "rejected-ops";
 pub const F_READ_ONLY: &str = "read-only";
 
 /// Step timeout (no complete frame) and `Hello` timeout (§5.2.5).
@@ -174,7 +181,9 @@ pub enum Frame {
     NoBlob(BlobId),
     Checkpoints(Vec<Checkpoint>),
     Done(String),
-    Committed(Vec<OpId>),
+    /// Frontier, then the ops the sender rejected in this half with a
+    /// reason (`rejected-ops`; always empty towards a peer without it).
+    Committed(Vec<OpId>, Vec<(OpId, String)>),
     Error {
         code: String,
         message: String,
@@ -202,7 +211,7 @@ impl Frame {
             Frame::NoBlob(_) => NO_BLOB,
             Frame::Checkpoints(_) => CHECKPOINTS,
             Frame::Done(_) => DONE,
-            Frame::Committed(_) => COMMITTED,
+            Frame::Committed(..) => COMMITTED,
             Frame::Error { .. } => ERROR,
             Frame::Progress { .. } => PROGRESS,
             Frame::Bye => BYE,
@@ -221,7 +230,7 @@ impl Frame {
             Frame::NoBlob(_) => "NoBlob",
             Frame::Checkpoints(_) => "Checkpoints",
             Frame::Done(_) => "Done",
-            Frame::Committed(_) => "Committed",
+            Frame::Committed(..) => "Committed",
             Frame::Error { .. } => "Error",
             Frame::Progress { .. } => "Progress",
             Frame::Bye => "Bye",
@@ -321,7 +330,14 @@ pub fn encode(f: &Frame) -> Vec<u8> {
             }
             text(s)
         }
-        Frame::Need(ids) | Frame::Committed(ids) => text(fmt_ids(ids)),
+        Frame::Need(ids) => text(fmt_ids(ids)),
+        Frame::Committed(ids, rej) => {
+            let mut s = fmt_ids(ids);
+            for (id, why) in rej {
+                s.push_str(&format!("\nR {} {why}", store::fmt_id(*id)));
+            }
+            text(s)
+        }
         Frame::NeedBlobs(v) => text(if v.is_empty() {
             "-".into()
         } else {
@@ -469,7 +485,29 @@ pub fn decode(ty: u8, p: &[u8], ours: &Limits) -> Result<Frame, Error> {
             }
         }
         NEED => Frame::Need(parse_ids(s)?),
-        COMMITTED => Frame::Committed(parse_ids(s)?),
+        COMMITTED => {
+            let mut lines = s.split('\n');
+            let ids = parse_ids(lines.next().unwrap_or(""))?;
+            let mut rej = Vec::new();
+            for l in lines {
+                if rej.len() >= MAX_LIST {
+                    return Err(lerr(format!("more than {MAX_LIST} rejected ops")));
+                }
+                let t: Vec<&str> = l.split(' ').collect();
+                let ["R", id, why] = t.as_slice() else {
+                    return Err(perr("malformed Committed rejection"));
+                };
+                if why.is_empty()
+                    || why.len() > 64
+                    || !why.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+                {
+                    return Err(perr("bad rejection reason"));
+                }
+                let id = store::parse_id(id).map_err(|e| perr(format!("bad op id: {e}")))?;
+                rej.push((id, why.to_string()));
+            }
+            Frame::Committed(ids, rej)
+        }
         NEED_BLOBS => {
             if s == "-" {
                 Frame::NeedBlobs(Vec::new())
@@ -915,7 +953,14 @@ mod tests {
         )]));
         rt(Frame::Checkpoints(vec![]));
         rt(Frame::Done("meta".into()));
-        rt(Frame::Committed(vec![id]));
+        rt(Frame::Committed(vec![id], vec![]));
+        rt(Frame::Committed(
+            vec![id],
+            vec![
+                (id, "equivocation".into()),
+                (id, "lamport-violation".into()),
+            ],
+        ));
         rt(Frame::Error {
             code: "limit".into(),
             message: "too big: x".into(),

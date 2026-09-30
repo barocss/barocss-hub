@@ -480,12 +480,16 @@ fn sync_warnings(sw: &[hub_core::sync::RejectWarning]) -> J {
         sw.iter()
             .map(|w| {
                 let r = sync::render_warning(w);
+                let sides = sync::equivocation_sides(w);
                 J::obj(vec![
-                    ("reason", J::s(r.split(' ').next().unwrap_or(""))),
+                    ("reason", J::s(sync::reason_str(&w.reason))),
                     ("peer", rid(w.peer.0)),
                     ("author", J::opt(w.author.map(|a| rid(a.0)))),
                     ("op", J::opt(w.rejected.map(id))),
                     ("detail", J::s(&w.detail)),
+                    ("kept", J::opt(sides.map(|(k, _)| J::s(k)))),
+                    ("received", J::opt(sides.map(|(_, r)| J::s(r)))),
+                    ("action", J::s(sync::warning_action(w))),
                     ("stuck", J::Arr(w.stuck.iter().map(|o| id(*o)).collect())),
                     ("first_seen", J::n(w.first_seen)),
                     ("text", J::s(r)),
@@ -854,6 +858,21 @@ pub fn counts_j(c: &crate::sync::Counts) -> J {
     ])
 }
 
+/// Rejected ops as `[{"op","reason","message"}]` (Issue #45).
+pub fn rejected_j(rej: &[(hub_core::tree::OpId, String)]) -> J {
+    J::Arr(
+        rej.iter()
+            .map(|(o, why)| {
+                J::obj(vec![
+                    ("op", id(*o)),
+                    ("reason", J::s(why)),
+                    ("message", J::s(crate::sync::rejected_message(why))),
+                ])
+            })
+            .collect(),
+    )
+}
+
 /// `sync --json` (Issue #43): counts, `read_only`, head, and the human
 /// lines as `output`.
 pub fn sync_doc(r: &crate::sync::Synced, warn: &mut dyn Write) -> Result<J, Error> {
@@ -875,6 +894,8 @@ pub fn sync_doc(r: &crate::sync::Synced, warn: &mut dyn Write) -> Result<J, Erro
                 ]),
             ),
             ("pending_ops", J::n(r.pending)),
+            ("rejected", rejected_j(&r.report.rejected)),
+            ("rejected_reported", J::Bool(r.report.rejected_reported)),
             ("output", J::strs(text.lines().collect::<Vec<_>>())),
         ],
     ))

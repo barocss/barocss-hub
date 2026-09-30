@@ -167,7 +167,7 @@ fn pull(c: &mut Conn) -> Result<(), Error> {
         }
     }
     c.send(&Frame::Done("ops".into()))?;
-    c.send(&Frame::Committed(vec![]))
+    c.send(&Frame::Committed(vec![], vec![]))
 }
 
 type BlobServe<'a> = dyn FnMut(&mut Conn, BlobId, u64) -> Result<(), Error> + 'a;
@@ -186,6 +186,17 @@ fn stream(c: &mut Conn, id: BlobId, bytes: &[u8], off: u64) -> Result<(), Error>
 
 /// The push half: answer the server's `Have` with `ops`; blobs via `serve`.
 fn push(c: &mut Conn, ops: Vec<Op>, serve: &mut BlobServe<'_>) -> Result<Vec<NodeId>, Error> {
+    push_full(c, ops, serve).map(|(f, _)| f)
+}
+
+type Rejected = Vec<(NodeId, String)>;
+
+/// [`push`], also returning the rejections of the server's `Committed`.
+fn push_full(
+    c: &mut Conn,
+    ops: Vec<Op>,
+    serve: &mut BlobServe<'_>,
+) -> Result<(Vec<NodeId>, Rejected), Error> {
     match next(c)? {
         Frame::Have { .. } => {}
         f => panic!("push: expected Have, got {f:?}"),
@@ -212,7 +223,7 @@ fn push(c: &mut Conn, ops: Vec<Op>, serve: &mut BlobServe<'_>) -> Result<Vec<Nod
         }
     }
     match next(c)? {
-        Frame::Committed(f) => Ok(f),
+        Frame::Committed(f, r) => Ok((f, r)),
         f => panic!("push: expected Committed, got {f:?}"),
     }
 }
@@ -226,9 +237,9 @@ fn finish(c: &mut Conn) -> Result<(), Error> {
             f => panic!("meta: {f:?}"),
         }
     }
-    c.send(&Frame::Committed(vec![]))?;
+    c.send(&Frame::Committed(vec![], vec![]))?;
     match next(c)? {
-        Frame::Committed(_) => {}
+        Frame::Committed(..) => {}
         f => panic!("{f:?}"),
     }
     c.send(&Frame::Bye)?;
@@ -324,8 +335,8 @@ fn p22_read_only_server_refuses_every_write_frame_and_is_untouched() {
             f => panic!("{f:?}"),
         }
     }
-    c.send(&Frame::Committed(vec![])).unwrap();
-    assert!(matches!(next(&mut c).unwrap(), Frame::Committed(_)));
+    c.send(&Frame::Committed(vec![], vec![])).unwrap();
+    assert!(matches!(next(&mut c).unwrap(), Frame::Committed(..)));
     c.send(&Frame::Bye).unwrap();
     assert_eq!(next(&mut c).unwrap(), Frame::Bye);
     done(ch);
@@ -970,4 +981,202 @@ fn max_blob_size_is_non_fatal_for_that_blob() {
     let w = ok(&d, &["warnings"]);
     assert!(w.contains("pending op 11."), "{w}");
     assert!(ok(&d, &["ls"]).contains("small"));
+}
+
+// ------------------------------------------------------------ Issue #45
+
+fn hello_features(me: ReplicaId, rejected_ops: bool) -> Hello {
+    let mut h = Hello::new(me, false);
+    if !rejected_ops {
+        h.features.retain(|f| f != wire::F_REJECTED_OPS);
+    }
+    h
+}
+
+/// Issue #45: the server lists the pushed ops it rejected (equivocation,
+/// Lamport violation) in `Committed`, only to a client that negotiated
+/// `rejected-ops`; an old client gets the plain frame.
+#[test]
+fn rejected_ops_are_reported_in_committed_only_when_negotiated() {
+    let d = server_repo("rej");
+    let (ch, mut c) = serve(&d, false);
+    let h = hello_with(&mut c, hello_features(ReplicaId(X), true)).unwrap();
+    assert!(h.has("rejected-ops"));
+    pull(&mut c).unwrap();
+    let (_, r) = push_full(&mut c, vec![create(5, X, &[], "a")], &mut no_blobs).unwrap();
+    assert!(r.is_empty(), "{r:?}");
+    finish(&mut c).unwrap();
+    done(ch);
+    let bad = vec![
+        create(5, X, &[], "b"),                  // equivocation
+        create(9, X, &[], "d"),                  // fine
+        create(7, X, &[NodeId::new(9, X)], "v"), // dep 9 is not < 7
+    ];
+    for feature in [true, false] {
+        let (ch, mut c) = serve(&d, false);
+        hello_with(&mut c, hello_features(ReplicaId(X), feature)).unwrap();
+        pull(&mut c).unwrap();
+        let (_, r) = push_full(&mut c, bad.clone(), &mut no_blobs).unwrap();
+        if feature {
+            assert_eq!(
+                r,
+                vec![
+                    (NodeId::new(5, X), "equivocation".to_string()),
+                    (NodeId::new(7, X), "lamport-violation".to_string()),
+                ]
+            );
+        } else {
+            assert!(
+                r.is_empty(),
+                "an old client must get a plain Committed: {r:?}"
+            );
+        }
+        finish(&mut c).unwrap();
+        done(ch);
+    }
+    // The server's warnings are human text with structured fields.
+    let w = ok(&d, &["warnings"]);
+    assert!(
+        w.contains(&format!(
+            "equivocation: replica {} used op id 5.{:032x} for two different changes",
+            &format!("{X:032x}")[..8],
+            X
+        )),
+        "{w}"
+    );
+    assert!(
+        w.contains("this repository kept: create file \"a\" in 0."),
+        "{w}"
+    );
+    assert!(w.contains("; it dropped: create file \"b\" in 0."), "{w}");
+    assert!(
+        w.contains("What to do: two repositories share a replica id"),
+        "{w}"
+    );
+    assert!(w.contains("lamport-violation: op 7."), "{w}");
+    assert!(
+        !w.contains("Create {") && !w.contains("NodeId"),
+        "Debug text: {w}"
+    );
+    let j = ok(&d, &["warnings", "--json"]);
+    assert!(j.contains("\"reason\":\"equivocation\""), "{j}");
+    assert!(j.contains("\"kept\":\"create file \\\"a\\\" in 0."), "{j}");
+    assert!(
+        j.contains("\"received\":\"create file \\\"b\\\" in 0."),
+        "{j}"
+    );
+    assert!(j.contains("\"action\":"), "{j}");
+}
+
+/// A scripted server over the in-memory transport: advertises
+/// `rejected-ops` or not, and answers the push with `rej`.
+fn scripted_server(mut y: Conn, feature: bool, rej: Rejected) -> Result<usize, Error> {
+    y.send_magic()?;
+    y.send(&Frame::Hello(hello_features(ReplicaId(Y), feature)))?;
+    y.recv_magic(T)?;
+    match next(&mut y)? {
+        Frame::Hello(h) => y.theirs = h.limits,
+        f => panic!("{f:?}"),
+    }
+    assert!(matches!(next(&mut y)?, Frame::Have { .. }));
+    y.send(&Frame::Ops {
+        frontier: vec![],
+        done: true,
+        ops: vec![],
+    })?;
+    loop {
+        match next(&mut y)? {
+            Frame::NeedBlobs(_) => {}
+            Frame::Done(p) if p == "ops" => break,
+            f => panic!("{f:?}"),
+        }
+    }
+    assert!(matches!(next(&mut y)?, Frame::Committed(..)));
+    y.send(&Frame::Have { frontier: vec![] })?;
+    let mut got = 0;
+    loop {
+        match next(&mut y)? {
+            Frame::Ops { done, ops, .. } => {
+                got += ops.len();
+                if done {
+                    break;
+                }
+            }
+            f => panic!("{f:?}"),
+        }
+    }
+    y.send(&Frame::Done("ops".into()))?;
+    y.send(&Frame::Committed(vec![], rej))?;
+    loop {
+        match next(&mut y)? {
+            Frame::Checkpoints(_) => {}
+            Frame::Done(p) if p == "meta" => break,
+            f => panic!("{f:?}"),
+        }
+    }
+    y.send(&Frame::Done("meta".into()))?;
+    assert!(matches!(next(&mut y)?, Frame::Committed(..)));
+    y.send(&Frame::Committed(vec![], vec![]))?;
+    assert_eq!(next(&mut y)?, Frame::Bye);
+    y.send(&Frame::Bye)?;
+    Ok(got)
+}
+
+/// The client side: rejections reach the report (and so `sync`, `--json`
+/// and `watch`); against an old server `rejected_reported` is false.
+#[test]
+fn client_reports_rejections_and_old_servers_are_marked_unreported() {
+    let t = tmp("rejc");
+    let d = t.join("c");
+    fs::create_dir_all(&d).unwrap();
+    ok(&d, &["init"]);
+    fs::write(d.join("f.txt"), "x\n").unwrap();
+    ok(&d, &["record"]);
+    let mine = replica_of(&d);
+    let id = NodeId {
+        counter: 2,
+        replica: mine,
+    };
+    for feature in [true, false] {
+        let rej: Rejected = if feature {
+            vec![(id, "equivocation".into())]
+        } else {
+            vec![]
+        };
+        let repo = Repo::open_dir_with(d.join(".hub"), LockMode::Exclusive).unwrap();
+        let mut side = Side::new(Access::Held(Box::new(repo)), false).unwrap();
+        let (mut x, y, _cut) = wire::pair();
+        let r2 = rej.clone();
+        let th = std::thread::spawn(move || scripted_server(y, feature, r2));
+        let rep = session::client(&mut x, &mut side).unwrap();
+        drop(x);
+        assert!(th.join().unwrap().unwrap() > 0);
+        assert_eq!(rep.rejected, rej);
+        assert_eq!(rep.rejected_reported, feature);
+    }
+    let lines = hub_cli::sync::rejected_lines(&[(id, "equivocation".into())]);
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].starts_with(&format!(
+        "the remote rejected your op 2.{:032x} (equivocation): ",
+        mine.0
+    )));
+    assert!(lines[0].contains("barocss-hub reid"), "{}", lines[0]);
+    let j = hub_cli::json::rejected_j(&[(id, "lamport-violation".into())]).render();
+    assert!(
+        j.starts_with(&format!(
+            "[{{\"op\":\"2.{:032x}\",\"reason\":\"lamport-violation\",\"message\":",
+            mine.0
+        )),
+        "{j}"
+    );
+}
+
+/// Decoding: extra `R` lines only in the documented form.
+#[test]
+fn committed_rejection_lines_are_strict() {
+    let id = NodeId::new(3, X);
+    let f = Frame::Committed(vec![id], vec![(id, "equivocation".into())]);
+    let (mut a, mut b, _cut) = wire::pair();
+    a.send(&f).unwrap();
+    assert_eq!(b.recv(T).unwrap(), f);
 }

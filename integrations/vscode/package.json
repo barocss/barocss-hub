@@ -11,6 +11,12 @@
   "categories": ["SCM Providers"],
   "main": "./out/extension.js",
   "activationEvents": ["onStartupFinished"],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "In Restricted Mode the watcher records and applies changes locally but never syncs with remotes: a folder's remote configuration could point at any host."
+    }
+  },
   "contributes": {
     "commands": [
       { "command": "barocssHub.showActions", "title": "Actions…", "category": "barocss-hub" },

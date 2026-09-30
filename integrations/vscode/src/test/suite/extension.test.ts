@@ -5,6 +5,7 @@ import { spawnSync } from 'child_process';
 import * as vscode from 'vscode';
 import type { Api } from '../../extension';
 import { statusLabel } from '../../repo';
+import { watchNotice } from '../../errors';
 
 const BIN = process.env.BAROCSS_HUB_BIN!;
 const WS = process.env.HUB_TEST_WS!;
@@ -12,7 +13,10 @@ const PEER = process.env.HUB_TEST_PEER!;
 
 /** Fixture driver: the barocss-hub CLI itself (human output is enough here). */
 function hub(cwd: string, ...args: string[]): string {
-  const r = spawnSync(BIN, args, { cwd, encoding: 'utf8' });
+  return hubEnv({}, cwd, ...args);
+}
+function hubEnv(env: Record<string, string>, cwd: string, ...args: string[]): string {
+  const r = spawnSync(BIN, args, { cwd, encoding: 'utf8', env: { ...process.env, ...env } });
   if (r.status !== 0) { throw new Error(`barocss-hub ${args.join(' ')} in ${cwd}: ${r.stderr}`); }
   return r.stdout;
 }
@@ -174,6 +178,59 @@ describe('barocss-hub extension (real CLI, temp repos)', function () {
     const st = await api.repos()[0].cli<{ changes: { path: string }[] }>(['status']);
     console.log(`SAVE-STATUS-CHANGES ${st.changes.map((c) => c.path).join(',')}`);
     assert.ok(seen.has('h.txt'));
+  });
+
+  it('Workspace Trust: restricted mode watches with --no-sync and says so; trusted syncs', async () => {
+    const repo = api.repos()[0];
+    const started: unknown[] = [];
+    const sub = repo.onWatchEvent((ev) => { if (ev.event === 'started') { started.push(ev.sync); } });
+    try {
+      api.setTrustOverride(false);
+      assert.ok(api.watchArgs().includes('--no-sync'));
+      const before = api.notices.length;
+      await vscode.commands.executeCommand('barocssHub.startWatch');
+      await waitFor('started (restricted)', () => started.length === 1);
+      assert.strictEqual(started[0], false);
+      assert.ok(api.notices.slice(before).some((n) => /Restricted Mode/.test(n.message) && n.actions.includes('Manage Workspace Trust')));
+      await vscode.commands.executeCommand('barocssHub.stopWatch');
+      api.setTrustOverride(true);
+      assert.ok(!api.watchArgs().includes('--no-sync'));
+      await vscode.commands.executeCommand('barocssHub.startWatch');
+      await waitFor('started (trusted)', () => started.length === 2);
+      assert.strictEqual(started[1], true);
+      await vscode.commands.executeCommand('barocssHub.stopWatch');
+    } finally { sub.dispose(); api.setTrustOverride(undefined); }
+  });
+
+  it('a planted (never trusted) remote is skipped with one notification, never contacted', async () => {
+    // Added under ANOTHER user's trust store: for this user it is exactly a
+    // remote that came with the folder.
+    hubEnv({ XDG_CONFIG_HOME: process.env.HUB_TEST_OTHER_XDG! }, WS, 'remote', 'add', 'planted', 'ssh://planted.invalid/r');
+    const repo = api.repos()[0];
+    const events: string[] = [];
+    const sub = repo.onWatchEvent((ev) => { events.push(ev.event); });
+    const before = api.notices.length;
+    try {
+      api.setTrustOverride(true);
+      await vscode.commands.executeCommand('barocssHub.startWatch');
+      const n = await waitFor('untrusted notice', () => api.notices.slice(before).find((x) => /not syncing with remote planted/.test(x.message)));
+      assert.match(n.message, /remote trust planted/);
+      await new Promise((r) => setTimeout(r, 1200));
+      assert.strictEqual(events.filter((e) => e === 'untrusted-remote').length, 1);
+      assert.ok(!events.includes('error'), events.join(','));
+    } finally {
+      sub.dispose();
+      api.setTrustOverride(undefined);
+      await vscode.commands.executeCommand('barocssHub.stopWatch');
+      hub(WS, 'remote', 'rm', 'planted');
+    }
+  });
+
+  it('rejected-op events become a warning naming the op and what to do', () => {
+    const n = watchNotice({ schema: 1, event: 'rejected', peer: 'origin', ops: [{ op: '5.00ab', reason: 'equivocation', message: 'run `barocss-hub reid` here' }] })!;
+    assert.strictEqual(n.severity, 'warning');
+    assert.match(n.message, /remote origin rejected 1 of your change\(s\): 5\.00ab \(equivocation\): run `barocss-hub reid` here/);
+    assert.strictEqual(watchNotice({ schema: 1, event: 'synced' }), undefined);
   });
 
   it('deactivate-style stop leaves no watch process', async () => {

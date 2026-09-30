@@ -46,11 +46,25 @@ exec sh -c "$cmd"
     p
 }
 
-fn hub_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+/// Issue #45: every run gets a private trusted-remotes store (never the
+/// user's real `~/.config`). A test may override `XDG_CONFIG_HOME`/`HOME`.
+fn cfg_home() -> &'static str {
+    static D: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    D.get_or_init(|| tmp("xdg").to_string_lossy().into_owned())
+}
+
+fn cmd() -> Command {
     let mut c = Command::new(BIN);
+    c.env("XDG_CONFIG_HOME", cfg_home())
+        .env_remove("BAROCSS_HUB_SERVE_ROOT");
+    c
+}
+
+fn hub_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut c = cmd();
     c.args(args)
         .current_dir(dir)
-        .env_remove("BAROCSS_HUB_SERVE_ROOT");
+        .stdin(std::process::Stdio::null());
     for (k, v) in env {
         c.env(k, v);
     }
@@ -302,7 +316,6 @@ fn forced_command_confinement() {
     for url in [
         format!("ssh://h{}", outside.display()),
         format!("ssh://h{}/srv/../../outside", root.display()),
-        "h:~root/x".to_string(),
         format!("ssh://h{}/link", root.display()),
     ] {
         let o = forced(&url, &[]);
@@ -313,6 +326,10 @@ fn forced_command_confinement() {
             code(&o)
         );
     }
+    // `~user` is refused by the client since #45 (never sent); the server
+    // still refuses it (`remote::confine`, unit-tested with the grammar).
+    let o = forced("h:~root/x", &[]);
+    assert!(code(&o).contains("\"code\":\"usage\""), "{}", code(&o));
     // The environment cannot widen the root under a forced command.
     let o = forced(
         &format!("ssh://h{}", outside.display()),
@@ -354,10 +371,11 @@ fn no_command_injection_through_url_path_or_exec() {
     // The command sent is exactly the §5.6 form, quoting the path.
     let l = fs::read_to_string(&log).unwrap();
     assert!(l.contains("serve --stdio '"), "{l}");
-    // exec values with spaces or quotes are refused at `remote add`.
+    // exec values with spaces or quotes are refused at `remote add`
+    // (the full metacharacter matrix is in `tests/injection45.rs`).
     for bad in ["barocss-hub --x", "a'b", "a\"b"] {
         let err = fail_env(&a, &["remote", "add", "--exec", bad, "o", "h:/p"], &[]);
-        assert!(err.contains("exec must be one word"), "{err}");
+        assert!(err.contains("bad --exec"), "{err}");
     }
     // Option injection through the host is refused before ssh runs.
     let err = fail_env(&a, &["sync", "-oProxyCommand=touch:x"], &env);
@@ -398,7 +416,7 @@ fn central_replica_three_clients_concurrent_ssh_and_file() {
             .map(|c| {
                 let ssh = ssh.clone();
                 std::thread::spawn(move || {
-                    Command::new(BIN)
+                    cmd()
                         .args(["sync"])
                         .current_dir(&c)
                         .env("HUB_SSH_COMMAND", ssh)
@@ -438,7 +456,7 @@ fn watch_syncs_with_remotes() {
     for d in [&a, &b] {
         ok(d, &["remote", "add", "--exec", BIN, "origin", &url]);
     }
-    let w = Command::new(BIN)
+    let w = cmd()
         .args([
             "watch",
             "--json",
@@ -536,6 +554,17 @@ fn new_error_code_goldens() {
         &[("HUB_SSH_COMMAND", &js)],
         &[(&t, "<t>")],
     );
+    // Issue #45: a planted ssh remote, no terminal, no --yes.
+    let p = e.repo("planted");
+    fs::write(
+        p.join(".hub/remotes"),
+        format!(
+            "barocss-hub/remotes/v0\nR sorigin sssh://attacker.example{}/r exec=barocss-hub default=1\n",
+            e.t.display()
+        ),
+    )
+    .unwrap();
+    golden("untrusted-remote", &p, &["sync"], &e.env(), &[(&t, "<t>")]);
     // A remote that never answers.
     let mute = e.t.join("mute-ssh");
     fs::write(&mute, "#!/bin/sh\nexec sleep 30\n").unwrap();

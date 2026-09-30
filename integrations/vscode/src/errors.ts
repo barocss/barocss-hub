@@ -1,6 +1,6 @@
 // Typed CLI error codes (Wiki CLI-JSON §1) -> a clear message and suggested actions.
 
-export type Action = 'Checkout' | 'Force Checkout' | 'Open Settings' | 'Stop Watch' | 'Show Log' | 'Copy reid Command';
+export type Action = 'Checkout' | 'Force Checkout' | 'Open Settings' | 'Stop Watch' | 'Show Log' | 'Copy reid Command' | 'Manage Workspace Trust';
 
 export interface Explained { message: string; actions: Action[]; severity: 'error' | 'warning' | 'info' }
 
@@ -34,9 +34,24 @@ export function explain(code: string, raw: string): Explained {
     case 'no-such-path':
     case 'no-such-blob':
       return { message: `barocss-hub: not found. ${raw}`, actions: [], severity: 'warning' };
+    case 'untrusted-remote':
+      return { message: `barocss-hub: a remote configured in this folder was never used from this machine, so it was not contacted. Check it, then run \`barocss-hub remote trust <name>\` in a terminal. ${raw}`, actions: ['Show Log'], severity: 'warning' };
     case 'io':
       return { message: `barocss-hub: file system error. ${raw}`, actions: ['Show Log'], severity: 'error' };
     default:
       return { message: `barocss-hub: ${raw}`, actions: ['Show Log'], severity: 'error' };
   }
+}
+
+/** Watch events that deserve a notification (Issue #45); undefined for the rest. */
+export function watchNotice(ev: { event: string; [k: string]: unknown }): Explained | undefined {
+  if (ev.event === 'rejected') {
+    const ops = Array.isArray(ev.ops) ? ev.ops as { op?: string; reason?: string; message?: string }[] : [];
+    const list = ops.map((o) => `${String(o.op)} (${String(o.reason)}): ${String(o.message)}`).join('; ');
+    return { message: `barocss-hub: remote ${String(ev.peer)} rejected ${ops.length} of your change(s): ${list}`, actions: ['Show Log'], severity: 'warning' };
+  }
+  if (ev.event === 'untrusted-remote') {
+    return { message: `barocss-hub: not syncing with remote ${String(ev.peer)} (${String(ev.url)}): it is configured in this folder but was never used from this machine. Check it, then run \`barocss-hub remote trust ${String(ev.peer)}\` in a terminal.`, actions: ['Show Log'], severity: 'warning' };
+  }
+  return undefined;
 }

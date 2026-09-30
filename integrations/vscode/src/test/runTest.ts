@@ -15,7 +15,11 @@ async function main() {
   const peer = path.join(run, 'b');
   const userData = path.join(root, 'user-data');
   const extDir = path.join(root, 'extensions');
-  for (const d of [ws, peer, path.join(userData, 'User'), extDir]) { fs.mkdirSync(d, { recursive: true }); }
+  // Issue #45: a private trusted-remotes store (never the user's ~/.config).
+  const xdg = path.join(run, 'xdg');
+  const other = path.join(run, 'xdg-other');
+  process.env.XDG_CONFIG_HOME = xdg;
+  for (const d of [ws, peer, path.join(userData, 'User'), extDir, xdg, other]) { fs.mkdirSync(d, { recursive: true }); }
   for (const d of [ws, peer]) {
     const r = spawnSync(bin, ['init'], { cwd: d });
     if (r.status !== 0) { throw new Error(`init failed in ${d}: ${r.stderr}`); }
@@ -38,7 +42,7 @@ async function main() {
     vscodeExecutablePath,
     extensionDevelopmentPath: ext,
     extensionTestsPath: path.resolve(__dirname, './suite/index'),
-    extensionTestsEnv: { BAROCSS_HUB_BIN: bin, HUB_TEST_WS: ws, HUB_TEST_PEER: peer },
+    extensionTestsEnv: { BAROCSS_HUB_BIN: bin, HUB_TEST_WS: ws, HUB_TEST_PEER: peer, XDG_CONFIG_HOME: xdg, HUB_TEST_OTHER_XDG: other },
     launchArgs: [ws, '--user-data-dir', userData, '--extensions-dir', extDir, '--disable-extensions', '--disable-workspace-trust', '--skip-welcome', '--skip-release-notes', '--disable-gpu', '--new-window'],
   });
   process.exit(code);

@@ -59,6 +59,51 @@ pub struct Remote {
 // ------------------------------------------------------------ remotes file
 
 pub fn read_remotes(hub: &Path) -> Result<Vec<Remote>, Error> {
+    let rs = read_remotes_unchecked(hub)?;
+    let p = hub.join("remotes");
+    for r in &rs {
+        if let Err(why) = check_remote(r) {
+            return errc(
+                Code::Corrupt,
+                format!(
+                    "refusing {}: remote {:?} is unsafe: {why}; nothing was run. \
+                     Fix the line, or remove it with `barocss-hub remote rm {}`",
+                    p.display(),
+                    r.name,
+                    if remote_name_ok(&r.name) {
+                        r.name.as_str()
+                    } else {
+                        "<name>"
+                    }
+                ),
+            );
+        }
+    }
+    Ok(rs)
+}
+
+/// Every stored field is re-validated at load (Issue #45): a hand-edited or
+/// planted `.hub/remotes` can never feed an unchecked exec, host, user or
+/// path to ssh.
+pub fn check_remote(r: &Remote) -> Result<(), String> {
+    if !remote_name_ok(&r.name) {
+        return Err(format!("invalid remote name {:?}", r.name));
+    }
+    if let Some(e) = &r.exec {
+        exec_check(e)?;
+    }
+    match parse_url(&r.url, Path::new("/")) {
+        Ok(Url::Ssh { .. }) => {}
+        Ok(Url::File(_)) if r.url.starts_with("file:///") => {}
+        Ok(Url::File(_)) => return Err(format!("url {:?} is not file:///<abs> or ssh", r.url)),
+        Err(e) => return Err(e.0),
+    }
+    Ok(())
+}
+
+/// The file as written, without the safety check (only `remote rm` uses
+/// it, so an unsafe line can be removed).
+fn read_remotes_unchecked(hub: &Path) -> Result<Vec<Remote>, Error> {
     let p = hub.join("remotes");
     let text = match fs::read_to_string(&p) {
         Ok(t) => t,
@@ -187,7 +232,7 @@ pub fn migrate_peers(hub: &Path) -> Result<(), Error> {
     if !peers.exists() {
         return Ok(());
     }
-    let (rs, changed) = merged(hub, read_remotes(hub)?)?;
+    let (rs, changed) = merged(hub, read_remotes_unchecked(hub)?)?;
     if changed {
         write_remotes(hub, &rs, true)?;
     }
@@ -201,10 +246,29 @@ pub fn remote_name_ok(n: &str) -> bool {
     valid_name(n) && !n.bytes().any(|b| b <= 0x20 || b == 0x7f)
 }
 
-fn exec_ok(e: &str) -> bool {
-    !e.is_empty()
-        && e.bytes()
-            .all(|b| (0x21..=0x7e).contains(&b) && b != b'\'' && b != b'"')
+/// The remote program (`exec=`, Issue #45): one word of
+/// `[A-Za-z0-9._/~+-]`, not starting with `-`, at most 1024 bytes. It is
+/// the first word of the remote shell command, so nothing in it may be
+/// special to any shell (no space, quote, `;`, `$`, backquote, glob, ...).
+pub fn exec_check(e: &str) -> Result<(), String> {
+    if e.is_empty() {
+        return Err("exec is empty".into());
+    }
+    if e.len() > 1024 {
+        return Err("exec is longer than 1024 bytes".into());
+    }
+    if e.starts_with('-') {
+        return Err(format!("exec {e:?} starts with '-'"));
+    }
+    if let Some(c) = e
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '~' | '+' | '-')))
+    {
+        return Err(format!(
+            "exec {e:?} contains {c:?}; only letters, digits and . _ / ~ + - are allowed"
+        ));
+    }
+    Ok(())
 }
 
 /// `barocss-hub remote add|list|rm|set-url`.
@@ -213,7 +277,7 @@ pub fn remote_cmd(cwd: &Path, args: &[&str], out: &mut dyn Write) -> Result<(), 
     let usage = || {
         Error::new(
             Code::Usage,
-            "usage: barocss-hub remote add [--default] [--exec <path>] [<name>] <url> | list | rm <name> | set-url <name> <url>  (see barocss-hub --help)",
+            "usage: barocss-hub remote add [--default] [--exec <path>] [<name>] <url> | list | rm <name> | set-url <name> <url> | trust <name>  (see barocss-hub --help)",
         )
     };
     if args == ["list"] {
@@ -231,7 +295,12 @@ pub fn remote_cmd(cwd: &Path, args: &[&str], out: &mut dyn Write) -> Result<(), 
     }
     let _l = RepoLock::acquire(&hub, LockMode::Exclusive)?;
     migrate_peers(&hub)?;
-    let mut rs = read_remotes(&hub)?;
+    // `rm` must work on a file that fails the safety check (to repair it).
+    let mut rs = if matches!(args, ["rm", _]) {
+        read_remotes_unchecked(&hub)?
+    } else {
+        read_remotes(&hub)?
+    };
     match args {
         ["add", rest @ ..] => {
             let mut default = false;
@@ -254,11 +323,8 @@ pub fn remote_cmd(cwd: &Path, args: &[&str], out: &mut dyn Write) -> Result<(), 
                 return errc(Code::InvalidPath, format!("invalid remote name {name:?}"));
             }
             if let Some(e) = &exec {
-                if !exec_ok(e) {
-                    return errc(
-                        Code::Usage,
-                        "exec must be one word: no spaces, quotes or control characters",
-                    );
+                if let Err(why) = exec_check(e) {
+                    return errc(Code::Usage, format!("bad --exec: {why}"));
                 }
             }
             if rs.iter().any(|r| r.name == name) {
@@ -289,14 +355,16 @@ pub fn remote_cmd(cwd: &Path, args: &[&str], out: &mut dyn Write) -> Result<(), 
                 }
             }
             let default = default || rs.is_empty();
-            rs.push(Remote {
+            let r = Remote {
                 name: name.into(),
                 url: url.clone(),
                 exec,
                 default,
-            });
+            };
+            rs.push(r.clone());
             write_remotes(&hub, &rs, false)?;
             writeln!(out, "added remote {name} {url}")?;
+            trust_added(&r, out)?;
         }
         ["rm", name] => {
             let before = rs.len();
@@ -319,8 +387,21 @@ pub fn remote_cmd(cwd: &Path, args: &[&str], out: &mut dyn Write) -> Result<(), 
                 return errc(Code::NotFound, format!("no remote named {name}"));
             };
             r.url = url.clone();
+            let r = r.clone();
             write_remotes(&hub, &rs, false)?;
             writeln!(out, "remote {name} is now {url}")?;
+            trust_added(&r, out)?;
+        }
+        ["trust", name] => {
+            let Some(r) = rs.iter().find(|r| r.name == *name) else {
+                return errc(Code::NotFound, format!("no remote named {name}"));
+            };
+            let Some(key) = trust_key(r)? else {
+                writeln!(out, "remote {name} is local (file://); no trust needed")?;
+                return Ok(());
+            };
+            crate::trust::add(&key)?;
+            writeln!(out, "trusted remote {name} ({})", key.describe())?;
         }
         _ => return Err(usage()),
     }
@@ -341,12 +422,38 @@ pub enum Url {
     },
 }
 
-fn word_ok(s: &str) -> bool {
+/// A user name: `[A-Za-z0-9._-]`, not starting with `-` (Issue #45).
+fn user_ok(s: &str) -> bool {
     !s.is_empty()
+        && s.len() <= 255
         && !s.starts_with('-')
-        && s.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'[' | b']' | b':' | b'%')
-        })
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// A host: a DNS name or IPv4 (`[A-Za-z0-9._-]`, not starting with `-`
+/// or `.`), or a bracketed IPv6 literal `[hex:...[%zone]]`. Nothing that
+/// ssh's `%h` expansion could hand to a `ProxyCommand` shell as syntax
+/// (Issue #45; cf. CVE-2023-51385).
+fn host_ok(s: &str) -> bool {
+    if s.is_empty() || s.len() > 255 {
+        return false;
+    }
+    if let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        let (addr, zone) = inner.split_once('%').unwrap_or((inner, "x"));
+        return addr.contains(':')
+            && addr
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'))
+            && !zone.is_empty()
+            && zone
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+    }
+    !s.starts_with('-')
+        && !s.starts_with('.')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 fn path_ok(p: &str) -> Result<(), Error> {
@@ -355,6 +462,31 @@ fn path_ok(p: &str) -> Result<(), Error> {
             Code::Usage,
             "remote path is empty or contains a newline or NUL",
         );
+    }
+    Ok(())
+}
+
+/// A remote (ssh) path (Issue #45): absolute or `~/…` (so it can never be
+/// read as an option of `serve`), printable ASCII (the §5.9.6 forced-command
+/// grammar), and none of `\` or `!`, which some login shells (fish, csh)
+/// treat specially even inside single quotes. It is always sent
+/// single-quoted ([`shell_quote`]).
+pub fn ssh_path_check(p: &str) -> Result<(), String> {
+    if !(p.starts_with('/') || p == "~" || p.starts_with("~/")) {
+        return Err(format!(
+            "remote path {p:?} must be absolute or start with ~/"
+        ));
+    }
+    if p.len() > 4096 {
+        return Err("remote path is longer than 4096 bytes".into());
+    }
+    if let Some(c) = p
+        .chars()
+        .find(|c| !(' '..='~').contains(c) || matches!(c, '\\' | '!'))
+    {
+        return Err(format!(
+            "remote path {p:?} contains {c:?} (control, non-ASCII, backslash and ! are refused)"
+        ));
     }
     Ok(())
 }
@@ -378,29 +510,28 @@ pub fn parse_url(s: &str, cwd: &Path) -> Result<Url, Error> {
             if u.contains(':') {
                 return Err(usage("passwords in URLs are refused; use ssh keys"));
             }
-            if !word_ok(u) {
-                return Err(usage("bad user"));
+            if !user_ok(u) {
+                return Err(usage("bad user (letters, digits, . _ - only)"));
             }
         }
-        if !word_ok(host) {
-            return Err(usage("bad host"));
+        if !host_ok(host) {
+            return Err(usage("bad host (a DNS name, IPv4, or [IPv6])"));
         }
         Ok((user.map(String::from), host.to_string()))
     };
     if let Some(rest) = s.strip_prefix("ssh://") {
         let (auth, path) = rest.split_at(rest.find('/').ok_or_else(|| usage("no path"))?);
         let (auth, port) = match auth.rsplit_once(':') {
-            Some((a, p)) if !a.ends_with(']') || p.bytes().all(|b| b.is_ascii_digit()) => {
-                (a, Some(p.parse::<u16>().map_err(|_| usage("bad port"))?))
-            }
-            _ => (auth, None),
+            Some(_) if auth.ends_with(']') => (auth, None),
+            Some((a, p)) => (a, Some(p.parse::<u16>().map_err(|_| usage("bad port"))?)),
+            None => (auth, None),
         };
         let (user, host) = userhost(auth)?;
         let path = match path.strip_prefix("/~/") {
             Some(p) => format!("~/{p}"),
             None => path.to_string(),
         };
-        path_ok(&path)?;
+        ssh_path_check(&path).map_err(|m| usage(&m))?;
         return Ok(Url::Ssh {
             user,
             host,
@@ -426,6 +557,7 @@ pub fn parse_url(s: &str, cwd: &Path) -> Result<Url, Error> {
             } else {
                 format!("~/{p}")
             };
+            ssh_path_check(&path).map_err(|m| usage(&m))?;
             return Ok(Url::Ssh {
                 user,
                 host,
@@ -472,6 +604,19 @@ pub fn ssh_argv(url: &Url, exec: Option<&str>, batch: bool) -> Result<Vec<String
     else {
         return errc(Code::Error, "internal: not an ssh url");
     };
+    // Defense in depth (Issue #45): re-check every component that reaches
+    // ssh or the remote shell, whatever produced `url` and `exec`.
+    let unsafe_ = |m: String| Error::new(Code::Usage, format!("refusing to run ssh: {m}"));
+    if user.as_deref().is_some_and(|u| !user_ok(u)) || !host_ok(host) {
+        return Err(unsafe_("bad user or host".into()));
+    }
+    ssh_path_check(path).map_err(unsafe_)?;
+    let exec = exec.unwrap_or("barocss-hub");
+    exec_check(exec).map_err(unsafe_)?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     let prog = std::env::var("HUB_SSH_COMMAND")
         .or_else(|_| std::env::var("BAROCSS_HUB_SSH"))
         .unwrap_or_else(|_| "ssh".into());
@@ -489,12 +634,8 @@ pub fn ssh_argv(url: &Url, exec: Option<&str>, batch: bool) -> Result<Vec<String
         "-o".into(),
         format!("BatchMode={}", if batch { "yes" } else { "no" }),
         "--".into(),
-        host.clone(),
-        format!(
-            "{} serve --stdio {}",
-            exec.unwrap_or("barocss-hub"),
-            shell_quote(path)
-        ),
+        host.to_string(),
+        format!("{exec} serve --stdio {}", shell_quote(path)),
     ]);
     Ok(v)
 }
@@ -502,7 +643,7 @@ pub fn ssh_argv(url: &Url, exec: Option<&str>, batch: bool) -> Result<Vec<String
 // ------------------------------------------------------------ sync
 
 /// Resolve a `sync` argument (remote name, URL or path; none = default).
-pub fn resolve(cwd: &Path, arg: Option<&str>) -> Result<(String, Url, Option<String>), Error> {
+pub fn resolve(cwd: &Path, arg: Option<&str>) -> Result<Resolved, Error> {
     let hub = find_hub(cwd)?;
     let rs = remotes_view(&hub)?;
     let r = match arg {
@@ -517,8 +658,8 @@ pub fn resolve(cwd: &Path, arg: Option<&str>) -> Result<(String, Url, Option<Str
                     "no remote configured; run `barocss-hub remote add <name> <url>` or give a url",
                 )
             })?,
-        Some(a) => match rs.into_iter().find(|r| r.name == a) {
-            Some(r) => r,
+        Some(a) => match rs.iter().find(|r| r.name == a) {
+            Some(r) => r.clone(),
             None => Remote {
                 name: a.into(),
                 url: a.into(),
@@ -534,7 +675,119 @@ pub fn resolve(cwd: &Path, arg: Option<&str>) -> Result<(String, Url, Option<Str
         &root
     };
     let url = parse_url(&r.url, base)?;
-    Ok((r.name, url, r.exec))
+    // Configured = read from `.hub/remotes` (possibly planted), as opposed
+    // to a URL or path typed on this command line.
+    let configured = rs.iter().any(|x| x.name == r.name && x.url == r.url);
+    Ok(Resolved {
+        name: r.name,
+        url,
+        exec: r.exec,
+        configured,
+    })
+}
+
+pub struct Resolved {
+    pub name: String,
+    pub url: Url,
+    pub exec: Option<String>,
+    pub configured: bool,
+}
+
+/// How a first contact with an untrusted ssh remote is handled (#45).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrustMode {
+    /// `--yes`: record it and go on.
+    Yes,
+    /// Ask on the terminal (stdin and stderr are TTYs, no `--json`).
+    Ask,
+    /// Refuse with `untrusted-remote` (non-interactive, `watch`).
+    Refuse,
+}
+
+/// The trust-store key of a remote (`None` for `file://`).
+pub fn trust_key(r: &Remote) -> Result<Option<crate::trust::TrustKey>, Error> {
+    Ok(key_of(
+        &parse_url(&r.url, Path::new("/"))?,
+        r.exec.as_deref(),
+    ))
+}
+
+fn key_of(url: &Url, exec: Option<&str>) -> Option<crate::trust::TrustKey> {
+    match url {
+        Url::File(_) => None,
+        Url::Ssh { .. } => Some(crate::trust::TrustKey {
+            url: url_text(url),
+            exec: exec.unwrap_or("barocss-hub").to_string(),
+        }),
+    }
+}
+
+/// `remote add`/`set-url` are the user's own act: trust the result.
+fn trust_added(r: &Remote, out: &mut dyn Write) -> Result<(), Error> {
+    if let Some(k) = trust_key(r)? {
+        if let Err(e) = crate::trust::add(&k) {
+            writeln!(
+                out,
+                "note: could not record {} as trusted ({e}); the first sync will ask",
+                r.name
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The first-contact gate (Issue #45).
+fn check_trust(res: &Resolved, mode: TrustMode) -> Result<(), Error> {
+    if !res.configured {
+        return Ok(());
+    }
+    let Some(k) = key_of(&res.url, res.exec.as_deref()) else {
+        return Ok(());
+    };
+    if crate::trust::is_trusted(&k).unwrap_or(false) {
+        return Ok(());
+    }
+    let what = format!(
+        "remote {} ({}) is configured in this repository but was never added or confirmed by you on this machine; .hub/remotes may come from a copied or downloaded folder",
+        res.name,
+        k.describe()
+    );
+    let go = match mode {
+        TrustMode::Yes => true,
+        TrustMode::Ask => {
+            eprint!(
+                "barocss-hub: {what}.
+Trust it and connect now? [y/N] "
+            );
+            let mut l = String::new();
+            let _ = std::io::stdin().read_line(&mut l);
+            matches!(l.trim(), "y" | "Y" | "yes" | "YES" | "Yes")
+        }
+        TrustMode::Refuse => false,
+    };
+    if !go {
+        return errc(
+            Code::UntrustedRemote,
+            format!(
+                "{what}. Check it (`barocss-hub remote list`), then run `barocss-hub remote trust {}` or `barocss-hub sync --yes {}`",
+                res.name, res.name
+            ),
+        );
+    }
+    // Recording can fail (no HOME): the confirmed sync still goes on.
+    let _ = crate::trust::add(&k);
+    Ok(())
+}
+
+/// The CLI's trust mode: `--yes`, else ask on a terminal, else refuse.
+pub fn cli_trust_mode(yes: bool, json: bool) -> TrustMode {
+    if yes {
+        TrustMode::Yes
+    } else if !json && stdin_is_tty() && stderr_is_tty() {
+        TrustMode::Ask
+    } else {
+        TrustMode::Refuse
+    }
 }
 
 /// Run one sync; `batch` = ssh BatchMode (non-interactive).
@@ -542,9 +795,12 @@ pub fn sync(
     cwd: &Path,
     arg: Option<&str>,
     batch: bool,
+    trust: TrustMode,
     warn: &mut dyn Write,
 ) -> Result<Synced, Error> {
-    let (_name, url, exec) = resolve(cwd, arg)?;
+    let res = resolve(cwd, arg)?;
+    check_trust(&res, trust)?;
+    let Resolved { url, exec, .. } = res;
     match &url {
         Url::File(p) => sync::sync_local(cwd, p, sync::env_stop(), warn),
         Url::Ssh { .. } => sync_ssh(cwd, &url, exec.as_deref(), batch, warn),
@@ -555,24 +811,36 @@ pub fn sync(
 pub fn sync_cmd(
     cwd: &Path,
     arg: Option<&str>,
+    yes: bool,
     out: &mut dyn Write,
     warn: &mut dyn Write,
 ) -> Result<(), Error> {
-    let r = sync(cwd, arg, !stdin_is_tty(), warn)?;
+    let r = sync(cwd, arg, !stdin_is_tty(), cli_trust_mode(yes, false), warn)?;
     sync::print_report(&r, out, warn)
 }
 
-fn stdin_is_tty() -> bool {
+fn is_tty(fd: i32) -> bool {
     #[cfg(unix)]
     {
         extern "C" {
             fn isatty(fd: std::os::raw::c_int) -> std::os::raw::c_int;
         }
         // SAFETY: isatty only inspects the descriptor.
-        unsafe { isatty(0) == 1 }
+        unsafe { isatty(fd) == 1 }
     }
     #[cfg(not(unix))]
-    false
+    {
+        let _ = fd;
+        false
+    }
+}
+
+fn stdin_is_tty() -> bool {
+    is_tty(0)
+}
+
+fn stderr_is_tty() -> bool {
+    is_tty(2)
 }
 
 fn url_text(url: &Url) -> String {
@@ -978,6 +1246,57 @@ mod tests {
         ] {
             assert!(parse_url(bad, c).is_err(), "{bad}");
         }
+        // Issue #45: bracketed IPv6 (with and without a port), strict
+        // user/host, and the path rules.
+        let v6 = parse_url("ssh://[fe80::1%en0]:2222/srv", c).unwrap();
+        assert_eq!(
+            v6,
+            Url::Ssh {
+                user: None,
+                host: "[fe80::1%en0]".into(),
+                port: Some(2222),
+                path: "/srv".into()
+            }
+        );
+        let a = ssh_argv(&parse_url("ssh://[::1]/srv", c).unwrap(), None, true).unwrap();
+        assert_eq!(a[a.len() - 2], "::1");
+        assert!(!a.contains(&"-p".to_string()));
+        for bad in [
+            "ssh://h%x/p",
+            "ssh://[::1;x]/p",
+            "ssh://[h]/p",
+            "ssh://u%x@h/p",
+            "ssh://.h/p",
+            "ssh://h/p!x",
+            "ssh://h/p\\x",
+            "ssh://h/p\tx",
+            "ssh://h/\u{e9}",
+            "h:~root/p",
+        ] {
+            assert!(parse_url(bad, c).is_err(), "{bad}");
+        }
+        assert!(exec_check("barocss-hub").is_ok());
+        assert!(exec_check("~/.cargo/bin/barocss-hub").is_ok());
+        for bad in [
+            "", "-x", "a b", "a;b", "a$b", "a`b", "a'b", "a\"b", "a|b", "a\nb", "a\\b", "é",
+        ] {
+            assert!(exec_check(bad).is_err(), "{bad:?}");
+        }
+        // ssh_argv re-checks whatever it is given.
+        let u = Url::Ssh {
+            user: None,
+            host: "h".into(),
+            port: None,
+            path: "/p".into(),
+        };
+        assert!(ssh_argv(&u, Some("x;id"), true).is_err());
+        let evil = Url::Ssh {
+            user: Some("-oProxyCommand=id".into()),
+            host: "h".into(),
+            port: None,
+            path: "/p".into(),
+        };
+        assert!(ssh_argv(&evil, None, true).is_err());
         let a = ssh_argv(&parse_url("h:/it's; rm -rf ~", c).unwrap(), None, true).unwrap();
         let last = a.last().unwrap();
         assert_eq!(last, "barocss-hub serve --stdio '/it'\\''s; rm -rf ~'");

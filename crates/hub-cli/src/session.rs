@@ -78,6 +78,9 @@ pub struct Side {
     /// Blobs streamed to the peer.
     pub blobs_sent: usize,
     pub got: Counts,
+    /// Ops received in the last persisted half that were rejected
+    /// (equivocation, Lamport violation), with the reason (Issue #45).
+    pub rejected_last: Vec<(OpId, String)>,
 }
 
 /// What a finished client session reports.
@@ -89,6 +92,11 @@ pub struct Report {
     /// Our head frontier equals the remote's after the session.
     pub same_head: bool,
     pub remote_replica: Option<ReplicaId>,
+    /// Our pushed ops the remote rejected, with its reason (Issue #45).
+    pub rejected: Vec<(OpId, String)>,
+    /// The remote speaks `rejected-ops`, so `rejected` is authoritative
+    /// (false: a pre-#45 server, or nothing was pushed to a read-only one).
+    pub rejected_reported: bool,
 }
 
 fn lock_wait() -> Duration {
@@ -192,6 +200,7 @@ impl Side {
             blobs_in: 0,
             blobs_sent: 0,
             got: Counts::default(),
+            rejected_last: Vec::new(),
         })
     }
 
@@ -235,10 +244,12 @@ impl Side {
         let d0 = dups(&s);
         let mut files: HashMap<BlobId, PathBuf> = HashMap::new();
         let mut ckpts: Vec<Checkpoint> = Vec::new();
+        let mut received: Vec<Op> = Vec::new();
         for item in log {
             match item {
                 Recv::Ops(v) => {
                     for o in v {
+                        received.push(o.clone());
                         s.receive(peer, o);
                     }
                 }
@@ -287,6 +298,7 @@ impl Side {
                 "received ops authored under our own replica id that we never authored",
             ));
         }
+        self.rejected_last = rejections(&s, &received);
         let mut n = self.appended.load(Ordering::SeqCst);
         let r = sync::persist_with(repo, &s, &files, &mut n, self.stop);
         self.appended.store(n, Ordering::SeqCst);
@@ -755,10 +767,11 @@ impl Side {
         }
     }
 
-    fn expect_committed(&self, conn: &mut Conn) -> Result<Vec<OpId>, Error> {
+    #[allow(clippy::type_complexity)]
+    fn expect_committed(&self, conn: &mut Conn) -> Result<(Vec<OpId>, Vec<(OpId, String)>), Error> {
         loop {
             match conn.recv(wire::step_timeout())? {
-                Frame::Committed(f) => return Ok(f),
+                Frame::Committed(f, rej) => return Ok((f, rej)),
                 f => self.other(f)?,
             }
         }
@@ -773,6 +786,39 @@ impl Side {
             }
         }
     }
+}
+
+/// The received ops that did not make it into the applied set or the
+/// pending buffer: rejected (Issue #45). An id held with another payload
+/// is `equivocation`; an op neither applied nor pending was dropped by the
+/// Lamport rule (`lamport-violation`).
+fn rejections(s: &SyncReplica, received: &[Op]) -> Vec<(OpId, String)> {
+    let mut out: Vec<(OpId, String)> = Vec::new();
+    let mut pending: Option<HashMap<OpId, Op>> = None;
+    for o in received {
+        if out.iter().any(|(i, _)| *i == o.id) {
+            continue;
+        }
+        let why = match s.store().get(&o.id) {
+            Some(x) if x == o => continue,
+            Some(_) => "equivocation",
+            None => {
+                let p = pending.get_or_insert_with(|| {
+                    s.pending_ops()
+                        .into_iter()
+                        .map(|(o, _)| (o.id, o))
+                        .collect()
+                });
+                match p.get(&o.id) {
+                    Some(x) if x == o => continue,
+                    Some(_) => "equivocation",
+                    None => "lamport-violation",
+                }
+            }
+        };
+        out.push((o.id, why.to_string()));
+    }
+    out
 }
 
 /// `Hello` both ways (§5.2.3). Returns the peer's `Hello`.
@@ -861,7 +907,7 @@ fn client_inner(conn: &mut Conn, side: &mut Side) -> Result<Report, Error> {
     // Pull.
     let log = side.request(conn, peer, resume)?;
     rep.received = side.persist(log, peer)?;
-    conn.send(&Frame::Committed(side.sr.frontier()))?;
+    conn.send(&Frame::Committed(side.sr.frontier(), vec![]))?;
     // Push.
     if !ro {
         let before = loop {
@@ -872,7 +918,9 @@ fn client_inner(conn: &mut Conn, side: &mut Side) -> Result<Report, Error> {
         };
         let sent0 = side.blobs_sent;
         side.answer(conn, before.clone())?;
-        let after = side.expect_committed(conn)?;
+        let (after, rejected) = side.expect_committed(conn)?;
+        rep.rejected_reported = h.has(wire::F_REJECTED_OPS);
+        rep.rejected = rejected;
         let st = side.sr.store();
         rep.sent.ops = match (count(st, &before), count(st, &after)) {
             (Some(a), Some(b)) => b.saturating_sub(a),
@@ -898,8 +946,8 @@ fn client_inner(conn: &mut Conn, side: &mut Side) -> Result<Report, Error> {
     rep.sent.checkpoints = mine.iter().filter(|c| !theirs.contains(c)).count();
     let got = side.persist(vec![Recv::Ckpts(theirs)], peer)?;
     rep.received.checkpoints = got.checkpoints;
-    conn.send(&Frame::Committed(side.sr.frontier()))?;
-    let remote_head = side.expect_committed(conn)?;
+    conn.send(&Frame::Committed(side.sr.frontier(), vec![]))?;
+    let (remote_head, _) = side.expect_committed(conn)?;
     rep.same_head = remote_head == side.sr.frontier();
     side.bye(conn)?;
     Ok(rep)
@@ -928,7 +976,12 @@ fn server_inner(conn: &mut Conn, side: &mut Side) -> Result<(), Error> {
     if !side.read_only {
         let log = side.request(conn, peer, resume)?;
         side.got = side.persist(log, peer)?;
-        conn.send(&Frame::Committed(side.sr.frontier()))?;
+        let rej = if h.has(wire::F_REJECTED_OPS) {
+            std::mem::take(&mut side.rejected_last)
+        } else {
+            Vec::new()
+        };
+        conn.send(&Frame::Committed(side.sr.frontier(), rej))?;
     }
     side.send_checkpoints(conn)?;
     conn.send(&Frame::Done("meta".into()))?;
@@ -936,7 +989,7 @@ fn server_inner(conn: &mut Conn, side: &mut Side) -> Result<(), Error> {
     if !got.is_empty() && !side.read_only {
         side.got.checkpoints = side.persist(vec![Recv::Ckpts(got)], peer)?.checkpoints;
     }
-    conn.send(&Frame::Committed(side.sr.frontier()))?;
+    conn.send(&Frame::Committed(side.sr.frontier(), vec![]))?;
     side.expect_committed(conn)?;
     side.bye(conn)
 }
