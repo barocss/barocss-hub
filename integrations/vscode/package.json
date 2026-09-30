@@ -1,0 +1,88 @@
+{
+  "name": "barocss-hub-vscode",
+  "displayName": "barocss-hub",
+  "description": "VS Code integration for barocss-hub (CRDT-native source control). Talks to the core only through `barocss-hub --json`.",
+  "version": "0.0.1",
+  "publisher": "barocss",
+  "license": "MIT",
+  "private": true,
+  "repository": { "type": "git", "url": "https://github.com/barocss/barocss-hub" },
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["SCM Providers"],
+  "main": "./out/extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "commands": [
+      { "command": "barocssHub.showActions", "title": "Actions…", "category": "barocss-hub" },
+      { "command": "barocssHub.refresh", "title": "Refresh", "category": "barocss-hub", "icon": "$(refresh)" },
+      { "command": "barocssHub.startWatch", "title": "Start Watch", "category": "barocss-hub" },
+      { "command": "barocssHub.stopWatch", "title": "Stop Watch", "category": "barocss-hub" },
+      { "command": "barocssHub.record", "title": "Record Checkpoint…", "category": "barocss-hub" },
+      { "command": "barocssHub.checkout", "title": "Checkout Latest (head)", "category": "barocss-hub" },
+      { "command": "barocssHub.publish", "title": "Publish Checkpoint…", "category": "barocss-hub" },
+      { "command": "barocssHub.compareConflict", "title": "Compare with Losing Version", "category": "barocss-hub", "icon": "$(diff)" },
+      { "command": "barocssHub.openVersion", "title": "Open Version (read-only)", "category": "barocss-hub" }
+    ],
+    "views": {
+      "explorer": [
+        { "id": "barocssHub.conflicts", "name": "barocss-hub Conflicts" },
+        { "id": "barocssHub.history", "name": "barocss-hub File History" }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        { "command": "barocssHub.refresh", "when": "view == barocssHub.conflicts || view == barocssHub.history", "group": "navigation" }
+      ],
+      "view/item/context": [
+        { "command": "barocssHub.compareConflict", "when": "view == barocssHub.conflicts && viewItem == content-conflict", "group": "inline" }
+      ],
+      "commandPalette": [
+        { "command": "barocssHub.compareConflict", "when": "false" },
+        { "command": "barocssHub.openVersion", "when": "false" }
+      ]
+    },
+    "configuration": {
+      "title": "barocss-hub",
+      "properties": {
+        "barocssHub.binaryPath": {
+          "type": "string",
+          "default": "barocss-hub",
+          "scope": "machine-overridable",
+          "description": "Path to the barocss-hub binary (an absolute path is safest: VS Code started from the Dock may not see your shell PATH)."
+        },
+        "barocssHub.autoStartWatch": {
+          "type": "boolean",
+          "default": false,
+          "description": "Start `barocss-hub watch` for every workspace folder that is a barocss-hub repository when VS Code opens."
+        },
+        "barocssHub.watchArgs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra arguments for `barocss-hub watch`, e.g. [\"--sync\", \"2000\"]."
+        },
+        "barocssHub.pollInterval": {
+          "type": "number",
+          "default": 15000,
+          "description": "Milliseconds between background `status --json` refreshes (0 disables; saves and watch events always refresh)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "lint": "tsc -p ./ --noEmit && node scripts/check-boundary.js",
+    "pretest": "npm run compile && npm run lint",
+    "test": "node ./out/test/runTest.js",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^20.11.0",
+    "@types/vscode": "1.90.0",
+    "@vscode/test-electron": "^2.4.1",
+    "@vscode/vsce": "^3.2.1",
+    "mocha": "^10.4.0",
+    "typescript": "^5.5.0"
+  }
+}
