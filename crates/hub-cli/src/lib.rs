@@ -36,7 +36,9 @@ pub const HUB_DIR: &str = ".hub";
 /// A command error: the human message and its code, chosen where the
 /// error is constructed (Issue #37 repair; `--json` `error.code`).
 #[derive(Debug)]
-pub struct Error(pub String, pub Code);
+/// The third field is true for an error the remote reported in a wire
+/// `Error` frame (Issue #43; `--json` adds `"remote": true`).
+pub struct Error(pub String, pub Code, pub bool);
 
 /// Stable error codes (schema 1, Wiki CLI-JSON). Never derived from text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +80,21 @@ pub enum Code {
     /// A damaged `.hub/` file or blob.
     Corrupt,
     Io,
+    /// Wire protocol violation: malformed or unexpected frame (Issue #43).
+    Protocol,
+    /// No common wire protocol version with the remote.
+    VersionMismatch,
+    /// A wire limit (frame, chunk, list, blob, record size) was exceeded.
+    Limit,
+    /// The remote sent nothing within the step timeout.
+    Timeout,
+    /// A feature or URL scheme that is not negotiated or not implemented.
+    Unsupported,
+    /// Refused by the server: path confinement, a forced command, or a
+    /// write to a read-only server.
+    Forbidden,
+    /// The command needs a working directory; this is a bare repository.
+    Bare,
     /// Anything else.
     Error,
 }
@@ -105,6 +122,13 @@ impl Code {
         Code::DuplicateReplica,
         Code::Corrupt,
         Code::Io,
+        Code::Protocol,
+        Code::VersionMismatch,
+        Code::Limit,
+        Code::Timeout,
+        Code::Unsupported,
+        Code::Forbidden,
+        Code::Bare,
         Code::Error,
     ];
     pub fn as_str(self) -> &'static str {
@@ -130,6 +154,13 @@ impl Code {
             Code::DuplicateReplica => "duplicate-replica",
             Code::Corrupt => "corrupt",
             Code::Io => "io",
+            Code::Protocol => "protocol",
+            Code::VersionMismatch => "version-mismatch",
+            Code::Limit => "limit",
+            Code::Timeout => "timeout",
+            Code::Unsupported => "unsupported",
+            Code::Forbidden => "forbidden",
+            Code::Bare => "bare",
             Code::Error => "error",
         }
     }
@@ -137,14 +168,21 @@ impl Code {
 
 impl Error {
     pub fn new(code: Code, msg: impl Into<String>) -> Error {
-        Error(msg.into(), code)
+        Error(msg.into(), code, false)
+    }
+    /// An error reported by the remote end of a sync (wire `Error` frame).
+    pub fn remote(code: Code, msg: impl Into<String>) -> Error {
+        Error(msg.into(), code, true)
+    }
+    pub fn is_remote(&self) -> bool {
+        self.2
     }
     pub fn code(&self) -> Code {
         self.1
     }
     /// Same code, message prefixed with `<p>: `.
     pub fn prefix(self, p: &str) -> Error {
-        Error(format!("{p}: {}", self.0), self.1)
+        Error(format!("{p}: {}", self.0), self.1, self.2)
     }
 }
 
@@ -1533,7 +1571,7 @@ pub(crate) fn checkout(
         },
     );
     let plan = match plan {
-        Err(Error(m, _)) if !force && crate::watch::pinned(&repo.dir)?.is_some() => {
+        Err(Error(m, _, _)) if !force && crate::watch::pinned(&repo.dir)?.is_some() => {
             return Err(Error::new(Code::Pinned, format!("{m}\n{PINNED_WAY_OUT}")));
         }
         p => p?,

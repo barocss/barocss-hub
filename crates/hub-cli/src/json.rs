@@ -217,10 +217,16 @@ pub fn error_doc(e: &Error, warnings: &[String]) -> J {
         ("program", J::s(crate::PROGRAM)),
         (
             "error",
-            J::obj(vec![
-                ("code", J::s(e.code().as_str())),
-                ("message", J::s(&e.0)),
-            ]),
+            {
+                let mut f = vec![
+                    ("code", J::s(e.code().as_str())),
+                    ("message", J::s(&e.0)),
+                ];
+                if e.is_remote() {
+                    f.push(("remote", J::Bool(true)));
+                }
+                J::obj(f)
+            },
         ),
         ("warnings", J::strs(warnings)),
     ])
