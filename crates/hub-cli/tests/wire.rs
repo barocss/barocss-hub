@@ -124,7 +124,7 @@ fn rerr(code: &str, msg: &str) -> Error {
 fn next(c: &mut Conn) -> Result<Frame, Error> {
     loop {
         match c.recv(T)? {
-            Frame::Progress { .. } => continue,
+            Frame::Progress { .. } | Frame::Error { fatal: false, .. } => continue,
             Frame::Error {
                 code,
                 message,
@@ -935,4 +935,39 @@ fn p11_garbage_frames_touch_nothing_outside_the_repo() {
     assert_eq!(outside(&parent), before);
     assert_eq!(fs::read(d.join(".hub/ops.log")).unwrap(), log0);
     ok(&d, &["status"]);
+}
+
+/// §5.2.5 `max_blob_size`: a larger blob gets a non-fatal `Error limit`;
+/// its chunks are discarded, its op stays pending, the session goes on.
+#[test]
+fn max_blob_size_is_non_fatal_for_that_blob() {
+    let d = server_repo("maxblob");
+    let mut c = Command::new(BIN);
+    let mut ch = c
+        .args(["serve", "--stdio"])
+        .arg(&d)
+        .env("HUB_TEST_MAX_BLOB_SIZE", "1000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut conn = Conn::from_io(ch.stdout.take().unwrap(), ch.stdin.take().unwrap());
+    let bytes = vec![3u8; 200_000];
+    let id = BlobId::of(&bytes);
+    hello(&mut conn, ReplicaId(X)).unwrap();
+    pull(&mut conn).unwrap();
+    let n = create(10, X, &[], "blobfile");
+    let s = set(11, X, n.id, id);
+    let small = create(12, X, &[], "small");
+    push(&mut conn, vec![n, s, small], &mut |c, id, off| {
+        stream(c, id, &bytes, off)
+    })
+    .unwrap();
+    finish(&mut conn).unwrap();
+    done(ch);
+    assert!(!d.join(".hub/blobs").join(id.hex()).exists());
+    let w = ok(&d, &["warnings"]);
+    assert!(w.contains("pending op 11."), "{w}");
+    assert!(ok(&d, &["ls"]).contains("small"));
 }

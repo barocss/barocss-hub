@@ -484,24 +484,32 @@ fn new_error_code_goldens() {
     let e = Env::new("codes");
     let srv = e.bare("srv");
     let a = e.repo("a");
-    let golden = |name: &str, dir: &Path, args: &[&str], env: &[(&str, &str)], subs: &[(&str, &str)]| {
-        let o = hub_env(dir, &[args, &["--json"]].concat(), env);
-        assert!(!o.status.success());
-        let mut g = String::from_utf8(o.stderr).unwrap();
-        for (f, t) in subs {
-            g = g.replace(f, t);
-        }
-        assert!(g.contains(&format!("\"code\":\"{name}\"")), "{name}: {g}");
-        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/golden/json/code-{name}.json"));
-        if std::env::var("UPDATE_GOLDEN").is_ok() {
-            fs::write(&p, &g).unwrap();
-        } else {
-            assert_eq!(g, fs::read_to_string(&p).unwrap(), "golden code-{name}");
-        }
-    };
+    let golden =
+        |name: &str, dir: &Path, args: &[&str], env: &[(&str, &str)], subs: &[(&str, &str)]| {
+            let o = hub_env(dir, &[args, &["--json"]].concat(), env);
+            assert!(!o.status.success());
+            let mut g = String::from_utf8(o.stderr).unwrap();
+            for (f, t) in subs {
+                g = g.replace(f, t);
+            }
+            assert!(g.contains(&format!("\"code\":\"{name}\"")), "{name}: {g}");
+            let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("tests/golden/json/code-{name}.json"));
+            if std::env::var("UPDATE_GOLDEN").is_ok() {
+                fs::write(&p, &g).unwrap();
+            } else {
+                assert_eq!(g, fs::read_to_string(&p).unwrap(), "golden code-{name}");
+            }
+        };
     let t = e.t.to_string_lossy().into_owned();
     golden("bare", &srv, &["record"], &[], &[]);
-    golden("unsupported", &a, &["sync", "https://example.invalid/r"], &[], &[]);
+    golden(
+        "unsupported",
+        &a,
+        &["sync", "https://example.invalid/r"],
+        &[],
+        &[],
+    );
     // A remote refusal carries `"remote": true`.
     let root = e.t.join("root");
     fs::create_dir_all(&root).unwrap();
@@ -521,7 +529,13 @@ fn new_error_code_goldens() {
     fs::write(&junk, "#!/bin/sh\necho 'Welcome to host'\ncat >/dev/null\n").unwrap();
     Command::new("chmod").arg("+x").arg(&junk).status().unwrap();
     let js = junk.to_string_lossy().into_owned();
-    golden("protocol", &a, &["sync", "h:/r"], &[("HUB_SSH_COMMAND", &js)], &[(&t, "<t>")]);
+    golden(
+        "protocol",
+        &a,
+        &["sync", "h:/r"],
+        &[("HUB_SSH_COMMAND", &js)],
+        &[(&t, "<t>")],
+    );
     // A remote that never answers.
     let mute = e.t.join("mute-ssh");
     fs::write(&mute, "#!/bin/sh\nexec sleep 30\n").unwrap();
@@ -531,7 +545,10 @@ fn new_error_code_goldens() {
         "timeout",
         &a,
         &["sync", "h:/r"],
-        &[("HUB_SSH_COMMAND", &ms), ("HUB_TEST_WIRE_TIMEOUT_MS", "300")],
+        &[
+            ("HUB_SSH_COMMAND", &ms),
+            ("HUB_TEST_WIRE_TIMEOUT_MS", "300"),
+        ],
         &[(&t, "<t>")],
     );
 }
