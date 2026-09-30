@@ -141,6 +141,46 @@ classes, backslash escapes other than a leading `\#` or `\!`, nested
   if one is in the way, it refuses and names it; move it away and retry.
 - Sync is unaffected: rules only apply when scanning the working directory.
 
+### Built-in default ignores (Issue #37)
+
+Editor and OS temp files are ignored even without a `.hubignore`. The list
+(`hub_cli::ignore::DEFAULTS`) is read as if it were the first lines of
+`.hubignore`, so a `!pattern` line in the file re-includes any of them:
+
+| pattern | what |
+|---|---|
+| `*.swp` `*.swo` `*.swn` `*.swx` | vim swap files |
+| `*___jb_tmp___` `*___jb_old___` | JetBrains "safe write" temp files |
+| `.~lock.*#` | LibreOffice / OpenOffice lock files |
+| `.goutputstream-*` | GNOME (GIO) atomic-replace temp files |
+| `.DS_Store` `Thumbs.db` `desktop.ini` | macOS / Windows folder metadata |
+
+Names that editors use but that could also be real files are ignored
+**only while they look like the editor's file**; otherwise they are
+recorded like any file (never silently dropped):
+
+| pattern | ignored only when |
+|---|---|
+| `4913` | it is an empty regular file (vim's write probe) |
+| `*~` | the file without the `~` exists next to it (`x~` beside `x`: a backup) |
+| `#*#` | the file without the `#`s exists next to it (`#x#` beside `x`: emacs auto-save) |
+| `.#*` | it is a symlink, or a regular file of at most 256 bytes on one line containing `@` (emacs lock `user@host.pid:boot`) |
+
+Directories never match these four. `record`, `status` and `watch` use the
+same rules. Plain `status` prints `N file(s) hidden by default ignore rules
+(see `barocss-hub status --ignored`)` when defaults hide something
+(`--json`: `hidden_by_defaults`, and `"default": true` on each `ignored`
+entry).
+
+As with any rule, a file that is already tracked stays tracked. Saves by
+vim (`backupcopy=no`), VS Code-style atomic writes (temp + rename) and
+JetBrains safe write are recorded as a content edit of the same node
+(`crates/hub-cli/tests/editor.rs`). While a tracked file is missing and its
+own `x~`, `x___jb_old___` or `x___jb_tmp___` exists, `barocss-hub watch`
+waits for the save to finish (at most 5 s, `HUB_WATCH_SAVE_WAIT_MS`)
+instead of recording a delete. (After a real delete, a leftover `x~` no
+longer has its sibling, so it is recorded.)
+
 ## Live sync between two folders (`barocss-hub watch`)
 
 `barocss-hub watch` records working-directory edits automatically, syncs with every
@@ -191,6 +231,35 @@ watch stopped
 - After a crash or `kill -9`, just start `barocss-hub watch` (or any command) again:
   an interrupted checkout is resumed, a torn log tail is dropped, temps are
   swept. A second `barocss-hub watch` on the same repo refuses while one runs.
+
+## Machine-readable output (`--json`, Issue #37)
+
+`--json` anywhere on the command line switches stdout to exactly one JSON
+document (schema 1), for tools such as editor extensions. The schema is
+documented in the Wiki page `CLI-JSON`; golden documents are in
+`crates/hub-cli/tests/golden/json/`.
+
+```sh
+barocss-hub status --json            # head, workdir state (at-head/behind/pinned), watch pid,
+                                     # conflicts (with blob ids), changes, blocked, ignored
+barocss-hub log --json --path a.txt  # checkpoints containing the file + every op on its node
+barocss-hub cat <version> a.txt      # raw bytes (--json: base64 in a document)
+barocss-hub cat-blob <64-hex>        # raw bytes of a stored blob
+barocss-hub watch --json             # JSON Lines events: started, recorded, synced,
+                                     # checked-out, deferred, paused, resumed, warning, error, stopped
+```
+
+- Warnings are the document's `"warnings"` array; nothing else is printed.
+- On an error stdout is empty, stderr holds
+  `{"schema":1,"program":"barocss-hub","error":{"code":...,"message":...},"warnings":[...]}`
+  and the exit status is 1 (2: the current directory cannot be read).
+  `code` is set where the error is raised (`hub_cli::Code`): `usage`,
+  `not-a-repository`, `already-exists`, `invalid-path`, `no-such-path`,
+  `not-a-file`, `not-a-directory`, `bad-version`, `not-found`, `ambiguous`,
+  `no-such-blob`, `bad-blob-id`, `locked`, `behind`, `pinned`,
+  `interrupted`, `blocked`, `refused`, `duplicate-replica`, `corrupt`, `io`,
+  `error`.
+- Human output is unchanged; human errors are prefixed `barocss-hub: `.
 
 ## Storage (`.hub/`)
 

@@ -6,6 +6,7 @@
 //! the switch, [`finish`] rolls the remaining steps forward on every open
 //! until they are done.
 
+use crate::{errc, Code};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -27,27 +28,28 @@ pub enum Format {
 /// Parse `.hub/replica`: format and replica id.
 pub fn read_replica(dir: &Path) -> Result<(Format, u128), Error> {
     let rp = dir.join("replica");
-    let rtext =
-        fs::read_to_string(&rp).map_err(|e| Error(format!("cannot read {}: {e}", rp.display())))?;
+    let rtext = fs::read_to_string(&rp)
+        .map_err(|e| Error::new(Code::Io, format!("cannot read {}: {e}", rp.display())))?;
     let lines: Vec<&str> = rtext.lines().collect();
     let fmt = match lines.first() {
         Some(h) if *h == store::REPLICA_HEADER => Format::V1,
         Some(h) if *h == store::REPLICA_HEADER_V0 => Format::V0,
         Some(h) if h.starts_with(store::REPLICA_HEADER_PREFIX) => {
-            return err(format!(
+            return errc(Code::Corrupt, format!(
                 "unsupported repository format '{}' in {} (this hub understands v0 and v1; use a newer hub)",
                 &h[store::REPLICA_HEADER_PREFIX.len()..],
                 rp.display()
             ))
         }
-        _ => return err(format!("corrupt {}", rp.display())),
+        _ => return errc(Code::Corrupt, format!("corrupt {}", rp.display())),
     };
     match lines.as_slice() {
         [_, id] if id.len() == 32 => Ok((
             fmt,
-            u128::from_str_radix(id, 16).map_err(|_| Error("bad replica id".into()))?,
+            u128::from_str_radix(id, 16)
+                .map_err(|_| Error::new(Code::Corrupt, "bad replica id"))?,
         )),
-        _ => err(format!("corrupt {}", rp.display())),
+        _ => errc(Code::Corrupt, format!("corrupt {}", rp.display())),
     }
 }
 
@@ -65,7 +67,7 @@ pub fn needs_finish(dir: &Path) -> bool {
 pub fn check_format(dir: &Path) -> Result<(), Error> {
     match fs::read_to_string(dir.join("format")) {
         Ok(t) if t == store::FORMAT_V1 => Ok(()),
-        Ok(t) => err(format!(
+        Ok(t) => errc(Code::Corrupt, format!(
             "unsupported repository format '{}' in {} (this hub understands v0 and v1; use a newer hub)",
             t.trim(),
             dir.join("format").display()

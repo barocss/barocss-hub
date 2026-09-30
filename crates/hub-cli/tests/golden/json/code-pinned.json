@@ -1,0 +1,1 @@
+{"schema":1,"program":"barocss-hub","error":{"code":"pinned","message":"working directory is at version 861e1549, not head 12a1d212; run `barocss-hub checkout` to return to head first"},"warnings":[]}

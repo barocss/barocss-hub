@@ -31,6 +31,7 @@
 //! A missing index means nothing was materialized yet: base = genesis, no
 //! entries.
 
+use crate::Code;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
@@ -122,14 +123,22 @@ impl Index {
         let text = match fs::read_to_string(&p) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Index::default()),
-            Err(e) => return Err(Error(format!("cannot read {}: {e}", p.display()))),
+            Err(e) => {
+                return Err(Error::new(
+                    Code::Io,
+                    format!("cannot read {}: {e}", p.display()),
+                ))
+            }
         };
         let stamp = fs::metadata(&p).map(|m| mtime_ns(&m)).unwrap_or(0);
         let bad = |line: usize, why: &str| {
-            Error(format!(
-                "corrupt {} line {line}: {why} (repair: `barocss-hub checkout --force`)",
-                p.display()
-            ))
+            Error::new(
+                Code::Corrupt,
+                format!(
+                    "corrupt {} line {line}: {why} (repair: `barocss-hub checkout --force`)",
+                    p.display()
+                ),
+            )
         };
         let mut lines = text.lines();
         if lines.next() != Some(INDEX_HEADER) {
@@ -831,10 +840,13 @@ pub fn plan(
                 };
                 if write {
                     let bytes = blobs.get(b).map_err(|e| match e {
-                        BlobError::Missing(_) => Error(format!(
-                            "cannot check out '{path}': {e} (content not available locally)"
-                        )),
-                        e => Error(format!("cannot check out '{path}': {e}")),
+                        BlobError::Missing(_) => Error::new(
+                            Code::NoSuchBlob,
+                            format!(
+                                "cannot check out '{path}': {e} (content not available locally)"
+                            ),
+                        ),
+                        e => crate::blob_error(e).prefix(&format!("cannot check out '{path}'")),
                     })?;
                     p.write_files.push((path.clone(), bytes));
                     p.index.insert(
@@ -898,11 +910,14 @@ pub fn plan(
         } else {
             " (it would overwrite or delete unrecorded working-directory changes; nothing was appended)"
         };
-        return Err(Error(format!(
-            "refusing to {}{hint}:\n  {}",
-            opts.verb,
-            refused.join("\n  ")
-        )));
+        return Err(Error::new(
+            Code::Refused,
+            format!(
+                "refusing to {}{hint}:\n  {}",
+                opts.verb,
+                refused.join("\n  ")
+            ),
+        ));
     }
     p.remove_dirs.sort_by(|a, b| b.cmp(a));
     Ok(p)
@@ -955,8 +970,13 @@ pub fn interrupted(hub_dir: &Path) -> Result<Option<Vec<OpId>>, Error> {
             .split(',')
             .map(parse_id)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|w| Error(format!("corrupt {}: {w}", p.display())))?,
-        None => return Err(Error(format!("corrupt {}", p.display()))),
+            .map_err(|w| Error::new(Code::Corrupt, format!("corrupt {}: {w}", p.display())))?,
+        None => {
+            return Err(Error::new(
+                Code::Corrupt,
+                format!("corrupt {}", p.display()),
+            ))
+        }
     };
     Ok(Some(f))
 }
@@ -1029,7 +1049,7 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
     let tmp_dir = hub_dir.join(TMP_DIR);
     fs::create_dir_all(&tmp_dir)?;
     if !same_device(root, &tmp_dir)? {
-        return Err(Error(format!(
+        return Err(Error::new(Code::Io, format!(
             "{} is on a different filesystem than the working directory; atomic writes need both on one filesystem",
             tmp_dir.display()
         )));

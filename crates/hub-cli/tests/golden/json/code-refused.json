@@ -1,0 +1,1 @@
+{"schema":1,"program":"barocss-hub","error":{"code":"refused","message":"refusing to check out (use --force to discard unrecorded changes):\n  'f.txt' has unrecorded changes and would be overwritten"},"warnings":[]}

@@ -5,19 +5,23 @@ fn main() -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("hub: cannot read current directory: {e}");
-            return ExitCode::from(2);
+            let msg = format!("cannot read current directory: {e}");
+            if args.iter().any(|a| a == hub_cli::json::FLAG) {
+                let _ = hub_cli::json::emit(
+                    &mut std::io::stderr(),
+                    hub_cli::json::error_doc(
+                        &hub_cli::Error::new(hub_cli::Code::Io, msg.clone()),
+                        &[],
+                    ),
+                );
+            } else {
+                eprintln!("{}: {msg}", hub_cli::PROGRAM);
+            }
+            return ExitCode::from(hub_cli::json::EXIT_NO_CWD);
         }
     };
     // One command per process: skip freeing the replayed repository (#33).
     hub_cli::set_fast_exit();
     let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
-    match hub_cli::run(&args, &cwd, &mut out, &mut err) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) if e.is_broken_pipe() => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("hub: {e}");
-            ExitCode::FAILURE
-        }
-    }
+    ExitCode::from(hub_cli::main_with(&args, &cwd, &mut out, &mut err))
 }

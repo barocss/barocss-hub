@@ -28,6 +28,7 @@
 //!   `W <peer> <author|-> <opid|-> <reason> <first_seen> <str detail>`
 //! - `published.log` `barocss-hub/published/v0`: checkpoint `K ...` records.
 
+use crate::Code;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
@@ -90,7 +91,10 @@ fn rewrite(path: &Path, header: &str, bodies: &[String]) -> Result<(), Error> {
 }
 
 fn corrupt(path: &Path, i: usize, why: String) -> Error {
-    Error(format!("corrupt {} line {}: {why}", path.display(), i + 2))
+    Error::new(
+        Code::Corrupt,
+        format!("corrupt {} line {}: {why}", path.display(), i + 2),
+    )
 }
 
 fn hex_rid(t: &str) -> Result<ReplicaId, String> {
@@ -289,12 +293,15 @@ fn load(repo: &Repo) -> Result<SyncReplica, Error> {
     for o in repo.store.values() {
         if let Some(b) = content_blob(o) {
             if b != hub_core::tree::BlobId::empty() && !on_disk.contains(&b) {
-                return Err(Error(format!(
-                    "cannot sync {}: {} (named by op {})",
-                    repo.root().display(),
-                    crate::blobs::BlobError::Missing(b),
-                    store::fmt_id(o.id)
-                )));
+                return Err(Error::new(
+                    Code::NoSuchBlob,
+                    format!(
+                        "cannot sync {}: {} (named by op {})",
+                        repo.root().display(),
+                        crate::blobs::BlobError::Missing(b),
+                        store::fmt_id(o.id)
+                    ),
+                ));
             }
             bs.mark_held(b);
         }
@@ -322,9 +329,12 @@ fn fetch_blob(repo: &Repo, s: &SyncReplica, id: &hub_core::tree::BlobId) -> Resu
     if let Some(b) = s.blobs().get(id) {
         return Ok(b.to_vec());
     }
-    repo.blobs()?
-        .get(id)
-        .map_err(|e| Error(format!("cannot sync {}: {e}", repo.root().display())))
+    repo.blobs()?.get(id).map_err(|e| {
+        Error::new(
+            Code::Error,
+            format!("cannot sync {}: {e}", repo.root().display()),
+        )
+    })
 }
 
 struct Counts {
@@ -380,10 +390,10 @@ fn persist(
     let mut batch = disk.batch_direct();
     for b in want {
         if let Some(bytes) = s.blobs().get(&b) {
-            batch.add(bytes).map_err(|e| Error(e.to_string()))?;
+            batch.add(bytes).map_err(crate::blob_error)?;
         }
     }
-    let nblobs = batch.commit().map_err(|e| Error(e.to_string()))?;
+    let nblobs = batch.commit().map_err(crate::blob_error)?;
     // 2. Ops in `<` order.
     // One batch, so the view is refreshed once (Issue #28).
     let base = *appended;
@@ -426,10 +436,13 @@ pub fn find_hub(start: &Path) -> Result<PathBuf, Error> {
         }
         cur = c.parent();
     }
-    err(format!(
-        "not a hub repository (no .hub/ in {} or any parent)",
-        start.display()
-    ))
+    crate::errc(
+        Code::NotARepository,
+        format!(
+            "not a hub repository (no .hub/ in {} or any parent)",
+            start.display()
+        ),
+    )
 }
 
 fn dup_warning(peer: ReplicaId, other: &Path) -> RejectWarning {
@@ -473,12 +486,12 @@ pub fn sync_with(
     let mine = fs::canonicalize(find_hub(cwd)?)?;
     let peer_path = cwd.join(peer_arg);
     if !peer_path.is_dir() {
-        return err(format!("no such directory: {peer_arg}"));
+        return crate::errc(Code::NoSuchPath, format!("no such directory: {peer_arg}"));
     }
     // Canonicalize before the upward walk: `a/../b` must not find a's hub.
     let theirs = fs::canonicalize(find_hub(&fs::canonicalize(&peer_path)?)?)?;
     if mine == theirs {
-        return err("cannot sync a repository with itself");
+        return crate::errc(Code::Usage, "cannot sync a repository with itself");
     }
     // Lock order: canonical path, so opposite syncs cannot deadlock.
     let (mut a, mut b) = if mine < theirs {
@@ -497,10 +510,13 @@ pub fn sync_with(
     let mut sa = load(&a)?;
     let mut sb = load(&b)?;
     let dup_msg = |why: &str| {
-        Error(format!(
-            "sync aborted: {why} (duplicate replica id, D-022). One repository is probably a \
+        Error::new(
+            Code::DuplicateReplica,
+            format!(
+                "sync aborted: {why} (duplicate replica id, D-022). One repository is probably a \
              copy of the other's .hub/; run `barocss-hub reid` in one of them, then sync again"
-        ))
+            ),
+        )
     };
     if a.replica_id == b.replica_id {
         let wa = sa
