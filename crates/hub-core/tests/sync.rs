@@ -753,3 +753,38 @@ fn warnings_are_local() {
     assert_eq!(a.warnings().len(), 1);
     assert!(b.warnings().is_empty());
 }
+
+/// Issue #34: `pull` sends only the blobs the receiver lacks.
+#[test]
+fn pull_sends_only_lacking_blobs() {
+    let file = |r: &mut SyncReplica, name: &str, bytes: &[u8]| {
+        let f = r.author(Payload::Create {
+            kind: Kind::File,
+            parent: ROOT,
+            name: name.into(),
+        });
+        let blob = r.put_blob(bytes);
+        r.author(Payload::SetContent { node: f.id, blob });
+    };
+    let mut a = SyncReplica::with_id(ReplicaId(1));
+    let mut b = SyncReplica::with_id(ReplicaId(2));
+    for i in 0..4 {
+        let bytes = format!("shared {i}");
+        file(&mut a, &format!("a{i}"), bytes.as_bytes());
+        file(&mut b, &format!("b{i}"), bytes.as_bytes());
+    }
+    sync(&mut a, &mut b, 3);
+    assert_eq!(a.store(), b.store());
+    assert_eq!((a.blob_bytes_received(), a.blobs_received()), (0, 0));
+    assert_eq!((b.blob_bytes_received(), b.blobs_received()), (0, 0));
+    // Partial overlap: only the new bytes travel, once.
+    file(&mut a, "x", b"shared 1");
+    file(&mut a, "y", b"new in a");
+    file(&mut a, "z", b"new in a");
+    sync(&mut b, &mut a, 1);
+    assert_eq!(a.store(), b.store());
+    assert_eq!(b.blob_bytes_received(), 8);
+    assert_eq!(b.blobs_received(), 1);
+    assert_eq!(a.blob_bytes_received(), 0);
+    assert_eq!(a.state(), b.state());
+}

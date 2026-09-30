@@ -50,6 +50,27 @@ pub const PUBLISHED_HEADER: &str = "barocss-hub/published/v0";
 #[doc(hidden)]
 pub const CRASH_ENV: &str = "HUB_TEST_CRASH_IN_SYNC";
 
+/// Test-only instrumentation (Issue #34): when set, each sync appends
+/// `blobs-in <this> <bytes> <count>` and `blobs-in <peer> <bytes> <count>`
+/// lines (the blob bytes each side received) to this file.
+#[doc(hidden)]
+pub const STATS_LOG_ENV: &str = "HUB_TEST_SYNC_STATS";
+
+fn stats_log(a: &SyncReplica, b: &SyncReplica) -> Result<(), Error> {
+    if let Some(p) = std::env::var_os(STATS_LOG_ENV) {
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(p)?;
+        for (name, s) in [("this", a), ("peer", b)] {
+            writeln!(
+                f,
+                "blobs-in {name} {} {}",
+                s.blob_bytes_received(),
+                s.blobs_received()
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Ops per `Ops` batch.
 const BATCH: usize = 256;
 
@@ -255,20 +276,27 @@ fn content_blob(o: &Op) -> Option<hub_core::tree::BlobId> {
     }
 }
 
+/// Load a side for sync. Issue #34: blob bytes are not read. Blobs named by
+/// applied ops are only checked to exist (one directory listing; the
+/// applied-set invariant says they were durable before their op) and marked
+/// held; they are read, verified, only if they are sent
+/// ([`fetch_blob`]). Blobs of pending ops are read and verified as before.
 fn load(repo: &Repo) -> Result<SyncReplica, Error> {
     let disk = repo.blobs()?;
     disk.sweep_temps()?;
+    let on_disk: std::collections::HashSet<_> = disk.list()?.into_iter().collect();
     let mut bs = BlobStore::new();
     for o in repo.store.values() {
         if let Some(b) = content_blob(o) {
-            let bytes = disk.get(&b).map_err(|e| {
-                Error(format!(
-                    "cannot sync {}: {e} (named by op {})",
+            if b != hub_core::tree::BlobId::empty() && !on_disk.contains(&b) {
+                return Err(Error(format!(
+                    "cannot sync {}: {} (named by op {})",
                     repo.root().display(),
+                    crate::blobs::BlobError::Missing(b),
                     store::fmt_id(o.id)
-                ))
-            })?;
-            bs.put(&bytes);
+                )));
+            }
+            bs.mark_held(b);
         }
     }
     let pending = read_pending(&repo.dir)?;
@@ -285,6 +313,18 @@ fn load(repo: &Repo) -> Result<SyncReplica, Error> {
         read_warnings(&repo.dir)?,
         read_published(repo)?,
     ))
+}
+
+/// Sender side of the Issue #34 `NeedBlobs` step: bytes of a blob the
+/// receiver lacks, from memory (a pending op's blob) or read and verified
+/// from disk.
+fn fetch_blob(repo: &Repo, s: &SyncReplica, id: &hub_core::tree::BlobId) -> Result<Vec<u8>, Error> {
+    if let Some(b) = s.blobs().get(id) {
+        return Ok(b.to_vec());
+    }
+    repo.blobs()?
+        .get(id)
+        .map_err(|e| Error(format!("cannot sync {}: {e}", repo.root().display())))
 }
 
 struct Counts {
@@ -327,25 +367,23 @@ fn persist(
         .collect();
     let pending = s.pending_ops();
     // 1. Blobs first: an op on disk never names a missing blob.
+    // Issue #34: only loaded bytes can be new (received, or a pending op's
+    // blob read from this disk, which `add` skips); held blobs are on disk.
     let disk = repo.blobs()?;
-    let mut nblobs = 0;
     let want: BTreeSet<_> = new_ops
         .iter()
         .chain(pending.iter().map(|(o, _)| o))
         .filter_map(content_blob)
         .collect();
-    // Group commit (Issue #29): one barrier and one dir fsync for all.
-    let mut batch = disk.batch();
+    // Group commit (Issue #29): one barrier for all; direct writes, no
+    // renames (Issue #34, Appendix A.1).
+    let mut batch = disk.batch_direct();
     for b in want {
-        if disk.contains(&b) {
-            continue;
-        }
         if let Some(bytes) = s.blobs().get(&b) {
             batch.add(bytes).map_err(|e| Error(e.to_string()))?;
-            nblobs += 1;
         }
     }
-    batch.commit().map_err(|e| Error(e.to_string()))?;
+    let nblobs = batch.commit().map_err(|e| Error(e.to_string()))?;
     // 2. Ops in `<` order.
     // One batch, so the view is refreshed once (Issue #28).
     let base = *appended;
@@ -500,7 +538,14 @@ pub fn sync_with(
             .count()
     };
     let (da, db) = (dups(&sa), dups(&sb));
-    core::sync(&mut sa, &mut sb, BATCH);
+    core::sync_with(
+        &mut sa,
+        &mut sb,
+        BATCH,
+        &mut |s, id| fetch_blob(&a, s, id),
+        &mut |s, id| fetch_blob(&b, s, id),
+    )?;
+    stats_log(&sa, &sb)?;
     if dups(&sa) > da || dups(&sb) > db {
         // Keep the warnings (D-021), persist no ops (D-022).
         persist_warnings(&a, &sa)?;
@@ -622,7 +667,7 @@ mod warnings_view_tests {
     use proptest::prelude::*;
 
     proptest! {
-        #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+        #![proptest_config(ProptestConfig { cases: crate::test_cases(128), ..ProptestConfig::default() })]
 
         #[test]
         fn warnings_view_equals_full_clone(seed in any::<u64>(), nops in 1usize..12, npend in 0usize..10) {

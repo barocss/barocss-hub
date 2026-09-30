@@ -506,3 +506,120 @@ fn dir_replaced_by_file_in_same_apply() {
     }
     assert!(ok(&d, &["record"]).contains("nothing to record"));
 }
+
+// ------------------------------------------------ #34 repair: blob durability
+
+const BLOB_STAGES: &[&str] = &[
+    durable::BLOBS_WRITTEN,
+    durable::BLOBS_BARRIERED,
+    durable::BLOBS_RENAMED,
+];
+
+/// Rerun `args` in `d` with the barrier and flush logs, aborting at the
+/// first `ops-appended`: whatever the logs hold was done before any op line
+/// was written. Returns (barrier lines, flush lines).
+fn rerun_until_op_append(d: &Path, args: &[&str], tag: &str) -> (Vec<String>, Vec<String>) {
+    let t = tmp(&format!("{tag}-logs"));
+    let (bl, fl) = (t.join("bar"), t.join("flush"));
+    let o = hub_env(
+        d,
+        args,
+        &[
+            (CRASH_STAGE_ENV, durable::OPS_APPENDED),
+            (hub_cli::blobs::BARRIER_LOG_ENV, bl.to_str().unwrap()),
+            (durable::FLUSH_LOG_ENV, fl.to_str().unwrap()),
+        ],
+    );
+    assert!(!o.status.success(), "{tag}: rerun must reach the op append");
+    let read = |p: &Path| -> Vec<String> {
+        fs::read_to_string(p)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    let r = (read(&bl), read(&fl));
+    let _ = fs::remove_dir_all(t);
+    r
+}
+
+fn assert_blobs_durable_first(d: &Path, bars: &[String], flushes: &[String], tag: &str) {
+    let blobs = fs::canonicalize(d.join(".hub/blobs")).unwrap();
+    let canon = |p: &str| fs::canonicalize(p).ok();
+    assert!(
+        bars.iter().any(|l| {
+            let rest = l.strip_prefix("blob-barrier ").unwrap();
+            let (dir, _) = rest.rsplit_once(' ').unwrap();
+            canon(dir) == Some(blobs.clone())
+        }),
+        "{tag}: no blob barrier before the op append: {bars:?}"
+    );
+    assert!(
+        flushes.iter().any(|l| canon(l) == Some(blobs.clone())),
+        "{tag}: .hub/blobs not flushed before the op append: {flushes:?}"
+    );
+}
+
+/// After a crash in the blob group commit, the rerun must flush and barrier
+/// the blobs (including files left hash-valid but never barriered) before
+/// it appends any op naming them.
+#[test]
+fn rerun_after_blob_crash_barriers_blobs_before_ops() {
+    for st in BLOB_STAGES {
+        // record
+        let (d, acked) = setup(&format!("r34-rec-{st}"));
+        crash(&d, &["record", "-m", "x"], st);
+        let (b, f) = rerun_until_op_append(&d, &["record", "-m", "x"], &format!("rec-{st}"));
+        assert_blobs_durable_first(&d, &b, &f, &format!("record {st}"));
+        recover_and_check(&d, &acked, &format!("r34-rec-{st}"));
+        // sync
+        let (a, _) = setup(&format!("r34-syn-{st}"));
+        ok(&a, &["record", "-m", "more"]);
+        let s = tmp(&format!("r34-syn-{st}-b"));
+        ok(&s, &["init"]);
+        crash(&s, &["sync", a.to_str().unwrap()], st);
+        let (b, f) =
+            rerun_until_op_append(&s, &["sync", a.to_str().unwrap()], &format!("syn-{st}"));
+        assert_blobs_durable_first(&s, &b, &f, &format!("sync {st}"));
+        ok(&s, &["sync", a.to_str().unwrap()]);
+        ok(&s, &["checkout"]);
+        assert_eq!(snapshot(&s), snapshot(&a), "{st}");
+    }
+}
+
+/// Non-truncated orphans: hash-valid blob files that no op names (left by a
+/// crash before the barrier, so not provably durable). A record of the same
+/// bytes and a sync that brings ops naming them must both flush and barrier
+/// them before the ops are appended, even though nothing is rewritten.
+#[test]
+fn intact_orphan_blobs_are_made_durable_before_use() {
+    // sync: every blob of the batch is left intact after the crash.
+    let (a, _) = setup("r34-orph-a");
+    ok(&a, &["record", "-m", "more"]);
+    let s = tmp("r34-orph-s");
+    ok(&s, &["init"]);
+    crash(&s, &["sync", a.to_str().unwrap()], durable::BLOBS_WRITTEN);
+    let n = fs::read_dir(s.join(".hub/blobs")).unwrap().count();
+    assert!(n >= 8, "direct-written blobs present: {n}");
+    let (b, f) = rerun_until_op_append(&s, &["sync", a.to_str().unwrap()], "orph-sync");
+    assert_blobs_durable_first(&s, &b, &f, "sync orphan");
+    let batched: usize = b
+        .iter()
+        .map(|l| l.rsplit(' ').next().unwrap().parse::<usize>().unwrap())
+        .sum();
+    assert!(batched >= n, "every orphan joins the batch: {b:?}");
+    ok(&s, &["sync", a.to_str().unwrap()]);
+    ok(&s, &["checkout"]);
+    assert_eq!(snapshot(&s), snapshot(&a));
+    // record of the same bytes as intact orphans.
+    let r = tmp("r34-orph-r");
+    ok(&r, &["init"]);
+    for i in 0..4 {
+        write(&r, &format!("o{i}"), format!("orphan {i}\n").as_bytes());
+    }
+    crash(&r, &["record"], durable::BLOBS_RENAMED);
+    let (b, f) = rerun_until_op_append(&r, &["record"], "orph-rec");
+    assert_blobs_durable_first(&r, &b, &f, "record orphan");
+    ok(&r, &["record"]);
+    ok(&r, &["status"]);
+}

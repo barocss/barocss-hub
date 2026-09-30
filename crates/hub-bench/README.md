@@ -26,6 +26,8 @@ $T 1800 $E blobs    --root $B --count 1 --mb 1024 --timeout 600
 $T 1800 $E blobs    --root $B --count 1024 --mb 1 --timeout 600
 $T 600  $E watch    --root $B --n 1000,10000 --secs 60
 $T 5400 $E scenario --root $B --r 2,10,50 --files 300 --edits 3 --timeout 600
+$T 2400 $E d030     --root $B --r 100 --topo star --rounds 10 --per 100 --timeout 900   # D-030, Issue #34
+$T 1300 $E d030     --root $B --r 100 --topo ring --rounds 10 --per 100 --timeout 900
 rm -rf $B
 ps -ax | grep -E 'hub (watch|record|sync)|hub-bench' | grep -v grep   # must be empty
 ```
@@ -43,6 +45,7 @@ Common flags: `--root` (data dir), `--hub` (default `target/release/hub`),
 | `blobs --count C --mb M` | C files of M MiB: record, status, sync into empty repo, checkout |
 | `watch --n N,.. --secs S` | CPU time of an idle `hub watch` (default `--poll 100`) over S seconds, via `ps -o time`; then SIGINT + SIGKILL |
 | `scenario --r R,.. --files F --edits E` | R replicas cloned from one base each record E offline rounds (5 edits, 1 add, sometimes a delete or move), then ring and star sync passes until all heads agree (max 4 passes); asserts equal head and identical checked-out trees; exit 1 if any run does not converge |
+| `d030 --r R --topo star\|ring --files F --rounds N --per P [--passes M --every K]` | D-030 (Issue #34): R replicas copied from one base (`cp -R` + `hub reid`), each records N rounds of P unique-content edits (~R*N*P ops, one blob each); star (every replica syncs with replica 0) or ring passes until heads agree (max M); prints every K-th sync of pass 1 (wall, peak RSS), pass totals, status/record at replica 0; asserts same head and identical trees |
 
 ## Profiling
 

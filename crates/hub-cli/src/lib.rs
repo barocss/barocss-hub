@@ -115,6 +115,18 @@ struct HeadMemo {
     max_counter: Option<u64>,
 }
 
+/// Case count for the in-crate CLI proptests (Issue #34 test time: each
+/// case spawns whole repositories, so 512 cases cost ~400 s serial). The
+/// default is `default`; `PROPTEST_CASES=<n>` restores any larger count,
+/// e.g. `PROPTEST_CASES=512` for the pre-#34 depth.
+#[cfg(test)]
+pub(crate) fn test_cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test-only switch (Issue #32): run every command on the pre-#32 paths
@@ -1786,7 +1798,7 @@ mod lazy_ckpt_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+        #![proptest_config(ProptestConfig { cases: crate::test_cases(128), ..ProptestConfig::default() })]
 
         #[test]
         fn cli_lazy_decode_equals_eager(
@@ -2139,7 +2151,7 @@ mod perf32_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+        #![proptest_config(ProptestConfig { cases: crate::test_cases(128), ..ProptestConfig::default() })]
 
         #[test]
         /// Issue #33: also with a snapshot after every write (copy `c`) and

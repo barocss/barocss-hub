@@ -720,3 +720,198 @@ fn record_refuses_rename_that_would_delete_ignored_file() {
     assert_eq!(fs::read(a.join("f1")).unwrap(), b"same\n");
     assert_eq!(ok(&a, &["record"]).trim(), "nothing to record");
 }
+
+// ---------------------------------------------------------------- Issue #34
+
+/// `hub sync` (run in `a`) with the blob-transfer and blob-barrier logs.
+/// Returns (stdout, `blobs-in` lines as (side, bytes, count), barrier lines
+/// as (blobs dir, n)).
+#[allow(clippy::type_complexity)]
+fn sync_logged(a: &Path, b: &Path) -> (String, Vec<(String, u64, usize)>, Vec<(PathBuf, usize)>) {
+    let t = tmp("logs");
+    let (sl, bl) = (t.join("stats"), t.join("barriers"));
+    let o = hub_env(
+        a,
+        &["sync", b.to_str().unwrap()],
+        &[
+            (hub_cli::sync::STATS_LOG_ENV, sl.to_str().unwrap()),
+            (hub_cli::blobs::BARRIER_LOG_ENV, bl.to_str().unwrap()),
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let stats = fs::read_to_string(&sl)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let v: Vec<&str> = l.split(' ').collect();
+            assert_eq!(v[0], "blobs-in");
+            (
+                v[1].to_string(),
+                v[2].parse().unwrap(),
+                v[3].parse().unwrap(),
+            )
+        })
+        .collect();
+    let bars = fs::read_to_string(&bl)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            let (rest, n) = l.rsplit_once(' ').unwrap();
+            let dir = rest.strip_prefix("blob-barrier ").unwrap();
+            (fs::canonicalize(dir).unwrap(), n.parse().unwrap())
+        })
+        .collect();
+    let _ = fs::remove_dir_all(t);
+    (String::from_utf8(o.stdout).unwrap(), stats, bars)
+}
+
+fn blobs_dir(d: &Path) -> PathBuf {
+    fs::canonicalize(d.join(".hub/blobs")).unwrap()
+}
+
+#[test]
+fn already_held_blobs_transfer_zero_bytes() {
+    let (_t, r) = repos("held34", &["a", "b"]);
+    let (a, b) = (&r[0], &r[1]);
+    // Same bytes recorded independently: different ops, same blobs.
+    for d in [a, b] {
+        for i in 0..5 {
+            fs::write(d.join(format!("f{i}")), format!("shared {i}\n")).unwrap();
+        }
+        ok(d, &["record"]);
+    }
+    let (out, stats, bars) = sync_logged(b, a);
+    assert!(out.contains("received 10 op(s), 0 blob(s)"), "{out}");
+    assert!(out.contains("sent 10 op(s), 0 blob(s)"), "{out}");
+    assert_eq!(
+        stats,
+        vec![("this".into(), 0, 0), ("peer".into(), 0, 0)],
+        "no blob bytes may be sent to a side that holds them"
+    );
+    assert!(
+        bars.is_empty(),
+        "no blob group commit without new blobs: {bars:?}"
+    );
+    assert_eq!(head(a), head(b));
+    // Nothing new: a second sync moves no bytes either.
+    let (_, stats, bars) = sync_logged(a, b);
+    assert_eq!(stats, vec![("this".into(), 0, 0), ("peer".into(), 0, 0)]);
+    assert!(bars.is_empty());
+}
+
+#[test]
+fn partial_blob_overlap_sends_only_missing_bytes() {
+    let (_t, r) = repos("partial34", &["a", "b"]);
+    let (a, b) = (&r[0], &r[1]);
+    fs::write(a.join("x"), "same\n").unwrap();
+    fs::write(a.join("y"), "only in a\n").unwrap();
+    fs::write(a.join("y2"), "also only in a\n").unwrap();
+    ok(a, &["record"]);
+    fs::write(b.join("z"), "same\n").unwrap();
+    fs::write(b.join("w"), "only in b\n").unwrap();
+    ok(b, &["record"]);
+    let (_, stats, bars) = sync_logged(b, a);
+    let want_b = ("only in a\n".len() + "also only in a\n".len()) as u64;
+    assert_eq!(
+        stats,
+        vec![
+            ("this".into(), want_b, 2),
+            ("peer".into(), "only in b\n".len() as u64, 1)
+        ]
+    );
+    // Exactly one blob barrier per receiving side, whatever the count.
+    let mut bars = bars;
+    bars.sort();
+    let mut want = vec![(blobs_dir(a), 1), (blobs_dir(b), 2)];
+    want.sort();
+    assert_eq!(bars, want);
+    ok(a, &["checkout"]);
+    ok(b, &["checkout"]);
+    assert_eq!(snapshot(a), snapshot(b));
+}
+
+#[test]
+fn many_new_blobs_one_barrier_per_sync() {
+    let (_t, r) = repos("bar34", &["a", "b"]);
+    let (a, b) = (&r[0], &r[1]);
+    for i in 0..60 {
+        fs::write(a.join(format!("f{i:02}")), format!("unique {i}\n")).unwrap();
+    }
+    ok(a, &["record"]);
+    let (_, stats, bars) = sync_logged(b, a);
+    assert_eq!(stats[0].2, 60);
+    assert_eq!(stats[1], ("peer".into(), 0, 0));
+    assert_eq!(bars, vec![(blobs_dir(b), 60)]);
+    let (_, stats, bars) = sync_logged(b, a);
+    assert_eq!(stats, vec![("this".into(), 0, 0), ("peer".into(), 0, 0)]);
+    assert!(bars.is_empty());
+    ok(b, &["checkout"]);
+    assert_eq!(snapshot(a), snapshot(b));
+}
+
+/// Issue #34 direct blob writes: a crash before the blob barrier may leave
+/// final-named blob files with torn bytes (simulated: every new blob file is
+/// truncated or emptied). No op names them, so both repos stay valid, and
+/// the rerun rewrites them.
+#[test]
+fn torn_direct_blob_writes_after_crash_recover() {
+    let (_t, r) = repos("torn34", &["a", "b"]);
+    let (a, b) = (&r[0], &r[1]);
+    for i in 0..8 {
+        fs::write(a.join(format!("f{i}")), format!("content number {i}\n")).unwrap();
+    }
+    ok(a, &["record"]);
+    let before: BTreeSet<_> = fs::read_dir(b.join(".hub/blobs"))
+        .map(|r| r.map(|e| e.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    let o = hub_env(
+        b,
+        &["sync", a.to_str().unwrap()],
+        &[("HUB_TEST_CRASH_STAGE", "blobs-written")],
+    );
+    assert!(!o.status.success(), "must have aborted");
+    let mut n = 0;
+    for e in fs::read_dir(b.join(".hub/blobs")).unwrap() {
+        let e = e.unwrap();
+        if !before.contains(&e.file_name()) {
+            n += 1;
+            let f = fs::OpenOptions::new().write(true).open(e.path()).unwrap();
+            f.set_len(if n % 2 == 0 { 0 } else { 3 }).unwrap();
+        }
+    }
+    assert_eq!(n, 8, "direct writes use final names, no temps");
+    ok(b, &["status"]);
+    ok(a, &["status"]);
+    // A record of the same bytes must not trust the torn file: `add`
+    // verifies the hash before skipping a write.
+    for i in [1usize, 2] {
+        let bytes = format!("content number {i}\n");
+        fs::write(b.join(format!("local{i}")), &bytes).unwrap();
+    }
+    ok(b, &["record"]);
+    for i in [1usize, 2] {
+        let bytes = format!("content number {i}\n");
+        let p = b
+            .join(".hub/blobs")
+            .join(hub_core::tree::BlobId::of(bytes.as_bytes()).hex());
+        assert_eq!(
+            fs::read(p).unwrap(),
+            bytes.as_bytes(),
+            "record reused a torn blob"
+        );
+    }
+    // The rerun re-fetches the 6 blobs that are still torn (an unreferenced
+    // file is never counted as held) and converges.
+    let s = sync(b, a);
+    assert!(s.contains("received 16 op(s), 6 blob(s)"), "{s}");
+    for i in 0..8 {
+        let bytes = format!("content number {i}\n");
+        let p = b
+            .join(".hub/blobs")
+            .join(hub_core::tree::BlobId::of(bytes.as_bytes()).hex());
+        assert_eq!(fs::read(p).unwrap(), bytes.as_bytes());
+    }
+    ok(b, &["checkout"]);
+    ok(a, &["checkout"]);
+    assert_eq!(snapshot(a), snapshot(b));
+}

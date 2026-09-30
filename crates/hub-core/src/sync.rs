@@ -9,11 +9,13 @@
 //!   become `invalid-op` conflicts in `tree::evaluate`), and rejects
 //!   equivocation and Lamport violations with a local D-008
 //!   [`RejectWarning`].
-//! * Blobs (Issue #21 choice: *include*, not `Need`): an [`Ops`] batch carries
-//!   the bytes of every blob referenced by a `SetContent` in the batch. The
-//!   sender cannot know which blobs the receiver lacks (`Have` names ops, not
-//!   blobs), so it sends all of them; the receiver verifies SHA-256 against
-//!   the `BlobId` and ignores duplicates. A `SetContent` is applied only when
+//! * Blobs: [`SyncReplica::answer`] (Issue #21) attaches the bytes of every
+//!   blob a batch's `SetContent` ops name. [`pull`] (Issue #34) instead
+//!   sends each batch without bytes ([`SyncReplica::answer_ops`]); the
+//!   receiver names the blob ids it lacks ([`SyncReplica::lacking_blobs`],
+//!   a `NeedBlobs` step) and only those bytes are sent, so a receiver never
+//!   gets a blob it already holds. Either way the receiver verifies SHA-256
+//!   against the `BlobId` and ignores duplicates. A `SetContent` is applied only when
 //!   its deps *and* its blob are present; otherwise it stays pending, exactly
 //!   like an op with an unknown dep. A blob whose bytes do not hash to its id
 //!   is dropped with a [`RejectReason::CorruptBlob`] warning; the ops that
@@ -148,6 +150,9 @@ pub struct SyncReplica {
     warnings: Vec<RejectWarning>,
     tick: u64,
     published: Vec<Checkpoint>,
+    /// Issue #34 instrumentation: blob bytes (and blobs) received.
+    blob_bytes_in: u64,
+    blobs_in: usize,
 }
 
 impl SyncReplica {
@@ -173,6 +178,8 @@ impl SyncReplica {
             warnings: Vec::new(),
             tick: 0,
             published: Vec::new(),
+            blob_bytes_in: 0,
+            blobs_in: 0,
         }
     }
 
@@ -318,6 +325,56 @@ impl SyncReplica {
             .collect()
     }
 
+    /// [`SyncReplica::answer`] without blob bytes (Issue #34): the receiver
+    /// asks for the blobs it lacks with [`SyncReplica::lacking_blobs`].
+    pub fn answer_ops(&self, have: &Have, batch: usize) -> Vec<Ops> {
+        let d = delta(&self.store, have);
+        let sender_frontier = self.frontier();
+        let n = d.len().div_ceil(batch.max(1)).max(1);
+        let mut out: Vec<Ops> = d
+            .chunks(batch.max(1))
+            .map(|c| Ops {
+                ops: c.to_vec(),
+                blobs: Vec::new(),
+                sender_frontier: sender_frontier.clone(),
+                done: false,
+            })
+            .collect();
+        if out.is_empty() {
+            out.push(Ops {
+                ops: Vec::new(),
+                blobs: Vec::new(),
+                sender_frontier,
+                done: false,
+            });
+        }
+        debug_assert_eq!(out.len(), n);
+        out.last_mut().expect("one batch").done = true;
+        out
+    }
+
+    /// Blob ids named by `SetContent` ops in `ops` that this replica does
+    /// not hold, deduplicated, sorted (the Issue #34 `NeedBlobs` request).
+    pub fn lacking_blobs(&self, ops: &[Op]) -> Vec<BlobId> {
+        ops.iter()
+            .filter_map(|o| match &o.payload {
+                Payload::SetContent { blob, .. } if !self.blobs.contains(blob) => Some(*blob),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Blob bytes received so far (Issue #34 instrumentation).
+    pub fn blob_bytes_received(&self) -> u64 {
+        self.blob_bytes_in
+    }
+    /// Blobs received so far (Issue #34 instrumentation).
+    pub fn blobs_received(&self) -> usize {
+        self.blobs_in
+    }
+
     /// Answer a `Need`: the named ops we hold (with their blobs), `<` order.
     /// Not causally closed by itself; the receiver buffers as needed.
     pub fn answer_need(&self, need: &Need) -> Ops {
@@ -390,6 +447,8 @@ impl SyncReplica {
     /// Verify and store one blob. Returns false (and warns) if corrupt.
     pub fn receive_blob(&mut self, peer: PeerId, id: BlobId, bytes: &[u8]) -> bool {
         self.tick += 1;
+        self.blob_bytes_in += bytes.len() as u64;
+        self.blobs_in += 1;
         if BlobId::of(bytes) != id {
             self.warn(peer, None, None, RejectReason::CorruptBlob, id.hex());
             return false;
@@ -605,23 +664,77 @@ impl Default for SyncReplica {
 }
 
 /// One full pull `a ← b`: `Have`, all batches, then one `Need` round.
+/// Blob bytes come from `b`'s in-memory store; only blobs `a` lacks are
+/// sent (Issue #34).
 pub fn pull(a: &mut SyncReplica, b: &SyncReplica, batch: usize, with_hint: bool) {
+    let r: Result<(), std::convert::Infallible> =
+        pull_with(a, b, batch, with_hint, &mut |b, id| {
+            Ok(b.blobs.get(id).expect("sender holds its blobs").to_vec())
+        });
+    r.unwrap_or_else(|e| match e {});
+}
+
+/// Sender-side blob source: the bytes of blob `id`, which the sender holds.
+pub type FetchBlob<'a, E> = dyn FnMut(&SyncReplica, &BlobId) -> Result<Vec<u8>, E> + 'a;
+
+/// [`pull`] with the sender's blob bytes supplied by `fetch` (Issue #34: a
+/// persisted sender reads only the blobs it sends). Every batch is sent
+/// without bytes, the receiver names the blobs it lacks, and exactly those
+/// are fetched and received ahead of the batch's ops, as in
+/// [`SyncReplica::receive_ops`].
+pub fn pull_with<E>(
+    a: &mut SyncReplica,
+    b: &SyncReplica,
+    batch: usize,
+    with_hint: bool,
+    fetch: &mut FetchBlob<'_, E>,
+) -> Result<(), E> {
+    let mut fill = |a: &SyncReplica, mut msg: Ops| -> Result<Ops, E> {
+        for id in a.lacking_blobs(&msg.ops) {
+            msg.blobs.push((id, fetch(b, &id)?));
+        }
+        Ok(msg)
+    };
     let have = a.have(with_hint);
     let mut last_frontier = Vec::new();
-    for msg in b.answer(&have, batch) {
+    for msg in b.answer_ops(&have, batch) {
+        let msg = fill(a, msg)?;
         a.receive_ops(b.id(), &msg);
         last_frontier = msg.sender_frontier.clone();
     }
     let need = a.need(&last_frontier);
     if !need.ids.is_empty() {
-        a.receive_ops(b.id(), &b.answer_need(&need));
+        let mut msg = b.answer_need(&need);
+        msg.blobs.clear();
+        let msg = fill(a, msg)?;
+        a.receive_ops(b.id(), &msg);
     }
+    Ok(())
 }
 
 /// Full sync: pull both ways, then exchange published checkpoints.
 pub fn sync(a: &mut SyncReplica, b: &mut SyncReplica, batch: usize) {
     pull(a, b, batch, true);
     pull(b, a, batch, true);
+    exchange_checkpoints(a, b);
+}
+
+/// [`sync`] with blob sources for each side (see [`pull_with`]):
+/// `fetch_a` reads `a`'s blobs (sent to `b`), `fetch_b` reads `b`'s.
+pub fn sync_with<E>(
+    a: &mut SyncReplica,
+    b: &mut SyncReplica,
+    batch: usize,
+    fetch_a: &mut FetchBlob<'_, E>,
+    fetch_b: &mut FetchBlob<'_, E>,
+) -> Result<(), E> {
+    pull_with(a, b, batch, true, fetch_b)?;
+    pull_with(b, a, batch, true, fetch_a)?;
+    exchange_checkpoints(a, b);
+    Ok(())
+}
+
+fn exchange_checkpoints(a: &mut SyncReplica, b: &mut SyncReplica) {
     let ma = a.checkpoints_msg();
     let mb = b.checkpoints_msg();
     b.receive_checkpoints(&ma);

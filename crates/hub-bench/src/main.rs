@@ -600,6 +600,153 @@ fn case_scenario(ctx: &Ctx, r: usize, topo: &str, files: usize, edits: usize) ->
     conv
 }
 
+/// D-030 (Issue #34): R replicas copied from one base (`cp -R` + `hub reid`),
+/// each records `rounds` rounds of `per` unique-content edits (about
+/// R*rounds*per SetContent ops in total), then star (every replica syncs
+/// with replica 0) or ring passes until all heads agree (max `max_passes`).
+/// Reports every sync of the first pass (k = sync index) with wall and peak
+/// RSS, pass totals, status/record at replica 0, and asserts convergence:
+/// same head short id and identical checked-out trees.
+#[allow(clippy::too_many_arguments)]
+fn case_d030(
+    ctx: &Ctx,
+    r: usize,
+    topo: &str,
+    files: usize,
+    rounds: usize,
+    per: usize,
+    max_passes: usize,
+    every: usize,
+) -> bool {
+    let size = format!("R={r} {topo} {}x{}x{}", r, rounds, per);
+    let base = ctx.fresh("d30-base");
+    gen_tree(&base, files, 64, 30);
+    ctx.run(&base, &["init"], false);
+    ctx.run(&base, &["record", "-m", "base"], false);
+    let t_build = Instant::now();
+    let mut reps = Vec::new();
+    let mut rng = Rng::new(3000 + r as u64);
+    for i in 0..r {
+        let d = ctx.root.join(format!("d30-r{i:03}"));
+        let _ = fs::remove_dir_all(&d);
+        let st = Command::new("cp")
+            .arg("-R")
+            .arg(&base)
+            .arg(&d)
+            .status()
+            .unwrap();
+        assert!(st.success(), "cp -R");
+        let m = ctx.run(&d, &["reid"], false);
+        assert!(m.ok, "reid");
+        for _ in 0..rounds {
+            edit_files(&d, files, per, &mut rng, None);
+            let m = ctx.run(&d, &["record"], false);
+            if !m.ok {
+                ctx.report("d030", &size, "offline record", &m, "");
+            }
+        }
+        reps.push(d);
+    }
+    let build = Meas {
+        wall: t_build.elapsed().as_secs_f64(),
+        rss_mb: 0.0,
+        ok: true,
+        timed_out: false,
+        stdout: String::new(),
+    };
+    ctx.report("d030", &size, "build replicas", &build, "");
+    let heads = |reps: &Vec<PathBuf>| -> Vec<String> {
+        reps.iter()
+            .map(|d| head_of(&ctx.run(d, &["status"], true).stdout))
+            .collect()
+    };
+    let t0 = Instant::now();
+    let mut passes = 0;
+    let mut worst = 0.0f64;
+    let mut worst_rss = 0.0f64;
+    let mut syncs = 0;
+    let mut failed = false;
+    loop {
+        passes += 1;
+        let tp = Instant::now();
+        let pairs: Vec<(usize, usize)> = match topo {
+            "ring" => (0..r).map(|i| (i, (i + 1) % r)).collect(),
+            _ => (1..r).map(|i| (i, 0)).collect(),
+        };
+        for (k, (i, j)) in pairs.into_iter().enumerate() {
+            let m = ctx.run(&reps[i], &["sync", reps[j].to_str().unwrap()], false);
+            worst = worst.max(m.wall);
+            worst_rss = worst_rss.max(m.rss_mb);
+            syncs += 1;
+            let k = k + 1;
+            if !m.ok {
+                ctx.report("d030", &size, &format!("pass {passes} sync k={k}"), &m, "");
+                failed = true;
+                break;
+            }
+            if passes == 1 && (k == 1 || k % every == 0 || k + 1 == r) {
+                ctx.report("d030", &size, &format!("pass 1 sync k={k}"), &m, "");
+            }
+        }
+        let pm = Meas {
+            wall: tp.elapsed().as_secs_f64(),
+            rss_mb: 0.0,
+            ok: !failed,
+            timed_out: false,
+            stdout: String::new(),
+        };
+        ctx.report("d030", &size, &format!("pass {passes} total"), &pm, "");
+        if failed {
+            break;
+        }
+        let h = heads(&reps);
+        if h.iter().all(|x| *x == h[0]) || passes >= max_passes {
+            break;
+        }
+    }
+    let sync_time = t0.elapsed().as_secs_f64();
+    let st = ctx.run(&reps[0], &["status"], true);
+    ctx.report("d030", &size, "status at replica 0", &st, "");
+    let h = heads(&reps);
+    let mut hashes = Vec::new();
+    for d in &reps {
+        let m = ctx.run(d, &["checkout"], false);
+        if !m.ok {
+            ctx.report("d030", &size, "checkout", &m, "");
+        }
+        hashes.push(tree_hash(d));
+    }
+    edit_files(&reps[0], files, 10, &mut rng, None);
+    let rec = ctx.run(&reps[0], &["record"], false);
+    ctx.report("d030", &size, "record 10 edits at replica 0", &rec, "");
+    let same_head = h.iter().all(|x| *x == h[0]);
+    let same_tree = hashes.iter().all(|x| *x == hashes[0]);
+    let conv = !failed && same_head && same_tree;
+    let m = Meas {
+        wall: sync_time,
+        rss_mb: worst_rss,
+        ok: conv,
+        timed_out: false,
+        stdout: String::new(),
+    };
+    ctx.report(
+        "d030",
+        &size,
+        "mesh sync total",
+        &m,
+        &format!(
+            "{passes} passes, {syncs} syncs, slowest sync {worst:.3}s, head {} ops {}, converged={conv} (head {same_head}, tree {same_tree})",
+            h[0],
+            ops_of(&st.stdout)
+        ),
+    );
+    for d in reps {
+        let _ = fs::remove_dir_all(d);
+    }
+    let _ = fs::remove_dir_all(base);
+    conv
+}
+
 fn list(s: &str) -> Vec<usize> {
     s.split(',')
         .map(|x| x.parse().expect("number list"))
@@ -667,9 +814,26 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "d030" => {
+            let r: usize = flag("--r", "100").parse().unwrap();
+            let ok = case_d030(
+                &ctx,
+                r,
+                &flag("--topo", "star"),
+                flag("--files", "1000").parse().unwrap(),
+                flag("--rounds", "10").parse().unwrap(),
+                flag("--per", "100").parse().unwrap(),
+                flag("--passes", "4").parse().unwrap(),
+                flag("--every", "10").parse().unwrap(),
+            );
+            if !ok {
+                eprintln!("d030: NOT converged");
+                std::process::exit(1);
+            }
+        }
         _ => {
             eprintln!(
-                "usage: hub-bench <files|ops|delta|blobs|watch|scenario> [--root DIR] [--hub PATH] [--timeout S] [case flags]\n\
+                "usage: hub-bench <files|ops|delta|blobs|watch|scenario|d030> [--root DIR] [--hub PATH] [--timeout S] [case flags]\n\
                  see crates/hub-bench/README.md"
             );
             std::process::exit(2);

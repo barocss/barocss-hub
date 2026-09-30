@@ -12,6 +12,18 @@
 //! to readers and removed by [`Blobs::sweep_temps`] (called by writers holding
 //! the exclusive repo lock).
 //!
+//! Direct writes (Issue #34, used by sync, Appendix A.1): [`Blobs::batch_direct`]
+//! writes each blob straight to its final name and flushes it, then one
+//! directory flush and one barrier for the whole batch; no temps, no
+//! renames (on macOS a rename costs ~130-180 us, and a sync that receives
+//! 100k blobs spent most of its time in `rename(2)`). A crash before the
+//! barrier may leave a final-named file with torn bytes. That is safe
+//! because no op names it yet (ops are appended only after the barrier):
+//! readers verify the hash, a torn file reads as [`BlobError::Corrupt`], and
+//! any later write of that blob (`add` treats a corrupt blob as absent)
+//! replaces it. The layout is unchanged, so older binaries read such
+//! repositories unchanged.
+//!
 //! Reads verify SHA-256(bytes) == id; a mismatch is [`BlobError::Corrupt`].
 //! [`Blobs::put`] over an existing corrupt blob rewrites it.
 //!
@@ -130,7 +142,31 @@ impl Blobs {
             temps: Vec::new(),
             seen: BTreeSet::new(),
             last: None,
+            direct: false,
+            reflushed: 0,
         }
+    }
+
+    /// A group commit that writes final names directly (Issue #34; see the
+    /// module docs): one directory flush and one barrier, no renames.
+    pub fn batch_direct(&self) -> BlobBatch<'_> {
+        BlobBatch {
+            direct: true,
+            ..self.batch()
+        }
+    }
+
+    /// Write `bytes` to `id`'s final name and [`durable::flush`] it.
+    fn write_final_flushed(&self, id: &BlobId, bytes: &[u8]) -> io::Result<File> {
+        let mut f = File::create(self.path(id))?;
+        if std::env::var_os(CRASH_ENV).is_some() {
+            f.write_all(&bytes[..bytes.len() / 2])?;
+            f.sync_all()?;
+            std::process::abort();
+        }
+        f.write_all(bytes)?;
+        durable::flush(&f)?;
+        Ok(f)
     }
 
     /// Read and verify a blob.
@@ -199,21 +235,59 @@ pub struct BlobBatch<'a> {
     temps: Vec<(PathBuf, BlobId)>,
     seen: BTreeSet<BlobId>,
     last: Option<File>,
+    direct: bool,
+    /// Existing verified files re-flushed into this batch (#34 repair).
+    reflushed: usize,
+}
+
+/// Test-only instrumentation (Issue #34): when set, every blob group commit
+/// appends `blob-barrier <blobs dir> <n>` (one line per barrier issued, `n`
+/// blobs in the batch) to this file.
+#[doc(hidden)]
+pub const BARRIER_LOG_ENV: &str = "HUB_TEST_BLOB_BARRIER_LOG";
+
+fn log_barrier(dir: &Path, n: usize) -> io::Result<()> {
+    if let Some(p) = std::env::var_os(BARRIER_LOG_ENV) {
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(p)?;
+        writeln!(f, "blob-barrier {} {n}", dir.display())?;
+    }
+    Ok(())
 }
 
 impl BlobBatch<'_> {
-    /// Stage `bytes` (skipped if empty, already stored, or already staged).
+    /// Stage `bytes` (skipped if empty or already staged). An existing,
+    /// hash-verified file is not rewritten but is flushed and joins the
+    /// batch's barrier (#34 repair); a missing or corrupt one is written.
     pub fn add(&mut self, bytes: &[u8]) -> Result<BlobId, BlobError> {
         let id = BlobId::of(bytes);
         if id == BlobId::empty() || self.seen.contains(&id) {
             return Ok(id);
         }
         match self.blobs.get(&id) {
-            Ok(_) => return Ok(id),
+            Ok(_) => {
+                // #34 repair: a hash-valid file is not proof of durability
+                // (a crash after a direct write, before the barrier, leaves
+                // valid bytes that a power loss can still lose). Flush it
+                // and make it part of this batch, so the directory flush and
+                // the barrier happen before any op naming it is appended.
+                let f = File::open(self.blobs.path(&id))?;
+                durable::flush(&f)?;
+                self.seen.insert(id);
+                self.reflushed += 1;
+                self.last = Some(f);
+                return Ok(id);
+            }
             Err(BlobError::Missing(_) | BlobError::Corrupt { .. }) => {}
             Err(e) => return Err(e),
         }
-        let (tmp, f) = self.blobs.write_temp_flushed(bytes)?;
+        let (tmp, f) = if self.direct {
+            (
+                self.blobs.path(&id),
+                self.blobs.write_final_flushed(&id, bytes)?,
+            )
+        } else {
+            self.blobs.write_temp_flushed(bytes)?
+        };
         self.temps.push((tmp, id));
         self.seen.insert(id);
         self.last = Some(f);
@@ -227,6 +301,17 @@ impl BlobBatch<'_> {
             return Ok(0);
         };
         durable::crash_point(durable::BLOBS_WRITTEN);
+        if self.direct {
+            drop(last);
+            let d = File::open(&self.blobs.dir)?;
+            durable::flush_dir(&self.blobs.dir, &d)?;
+            log_barrier(&self.blobs.dir, self.temps.len() + self.reflushed)?;
+            durable::barrier(&d)?;
+            durable::crash_point(durable::BLOBS_BARRIERED);
+            durable::crash_point(durable::BLOBS_RENAMED);
+            return Ok(self.temps.len());
+        }
+        log_barrier(&self.blobs.dir, self.temps.len() + self.reflushed)?;
         durable::barrier(&last)?;
         drop(last);
         durable::crash_point(durable::BLOBS_BARRIERED);
@@ -234,7 +319,9 @@ impl BlobBatch<'_> {
             fs::rename(tmp, self.blobs.path(id))?;
         }
         durable::crash_point(durable::BLOBS_RENAMED);
-        File::open(&self.blobs.dir)?.sync_all()?;
+        let d = File::open(&self.blobs.dir)?;
+        durable::flush_dir(&self.blobs.dir, &d)?;
+        durable::barrier(&d)?;
         Ok(self.temps.len())
     }
 }
