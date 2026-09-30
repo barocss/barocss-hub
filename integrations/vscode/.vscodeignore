@@ -1,0 +1,8 @@
+src/**
+scripts/**
+out/test/**
+**/*.map
+tsconfig.json
+.gitignore
+node_modules/**
+.vscode-test/**
