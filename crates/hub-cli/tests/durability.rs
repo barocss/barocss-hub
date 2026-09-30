@@ -24,7 +24,7 @@ fn tmp(tag: &str) -> PathBuf {
 }
 
 fn hub_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_hub"));
+    let mut c = Command::new(env!("CARGO_BIN_EXE_barocss-hub"));
     c.args(args).current_dir(dir);
     for (k, v) in env {
         c.env(k, v);

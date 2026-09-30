@@ -16,7 +16,7 @@ fn tmp(tag: &str) -> PathBuf {
 }
 
 fn hub(dir: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_hub"))
+    Command::new(env!("CARGO_BIN_EXE_barocss-hub"))
         .args(args)
         .current_dir(dir)
         .output()
@@ -39,15 +39,87 @@ fn fail(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(o.stderr).unwrap()
 }
 
+/// The command words `run` dispatches on, read from its source: every
+/// `a[0] == "x"` test, every `matches!(a[0], "x" | ..)` and every
+/// `["x", ..]` slice pattern in `pub fn run`.
+fn dispatched_in_source() -> std::collections::BTreeSet<String> {
+    let src = include_str!("../src/lib.rs");
+    let start = src.find("pub fn run(").expect("pub fn run");
+    let body = &src[start..];
+    let body = &body[..body.find("\n}\n").expect("end of run")];
+    let mut words = std::collections::BTreeSet::new();
+    let lit = |t: &str| -> Option<String> {
+        let t = t.strip_prefix('"')?;
+        let w = &t[..t.find('"')?];
+        (!w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase())).then(|| w.to_string())
+    };
+    for (i, _) in body.match_indices("a[0] == ") {
+        words.extend(lit(&body[i + 8..]));
+    }
+    for (i, _) in body.match_indices("[\"") {
+        words.extend(lit(&body[i + 1..]));
+    }
+    for (i, _) in body.match_indices("a[0],") {
+        let rest = &body[i + 5..];
+        for part in rest[..rest.find(')').unwrap()].split('|') {
+            words.extend(lit(part.trim()));
+        }
+    }
+    words
+}
+
+/// Issue #35: `--help` lists every dispatchable command (derived from the
+/// dispatch code and `COMMANDS`), each as the first word of a help line.
 #[test]
-fn help_lists_all_commands() {
+fn help_lists_every_dispatchable_command() {
     let d = tmp("help");
     let h = ok(&d, &["--help"]);
-    for c in [
-        "init", "mkdir", "touch", "mv", "rm", "ls", "status", "commit", "log", "show",
-    ] {
-        assert!(h.contains(&format!("  {c}")), "missing {c} in help");
+    assert_eq!(h, hub_cli::HELP);
+    assert!(h.starts_with("barocss-hub "), "{h}");
+    let firsts: Vec<&str> = h
+        .lines()
+        .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
+        .filter_map(|l| l.split_whitespace().next())
+        .map(|w| w.trim_end_matches(','))
+        .collect();
+    let src = dispatched_in_source();
+    assert!(src.contains("peer") && src.contains("watch") && src.contains("sync"));
+    for c in &src {
+        assert!(
+            hub_cli::COMMANDS.contains(&c.as_str()),
+            "run dispatches '{c}' but COMMANDS lacks it"
+        );
     }
+    for c in hub_cli::COMMANDS {
+        assert!(firsts.contains(c), "--help does not list '{c}':\n{h}");
+        // Dispatchable: never "unknown command", even outside a repository.
+        let e = tmp(&format!("disp-{c}"));
+        let o = Command::new(env!("CARGO_BIN_EXE_barocss-hub"))
+            .arg(c)
+            .arg("--no-such-flag")
+            .current_dir(&e)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(!err.contains("unknown command"), "{c}: {err}");
+    }
+    assert!(fail(&d, &["frobnicate"]).contains("unknown command 'frobnicate'"));
+    for alias in ["help", "-h", "--help"] {
+        assert_eq!(ok(&d, &[alias]), hub_cli::HELP);
+    }
+    assert_eq!(ok(&d, &[]), hub_cli::HELP);
+}
+
+/// Issue #35: `--version` / `-V` print the package version.
+#[test]
+fn version_flag() {
+    let d = tmp("version");
+    let want = format!("barocss-hub {}\n", env!("CARGO_PKG_VERSION"));
+    assert_eq!(ok(&d, &["--version"]), want);
+    assert_eq!(ok(&d, &["-V"]), want);
+    assert_eq!(hub_cli::VERSION, want);
+    assert!(ok(&d, &["--help"]).contains("--version"));
 }
 
 #[test]
@@ -170,7 +242,7 @@ fn truncated_tail_is_recovered_and_reported() {
     assert_eq!(fs::read(&log).unwrap(), good);
     // Issue #19: the index still names the dropped op, so the working
     // directory is "not at head" until a checkout re-materializes head.
-    assert!(fail(&d, &["touch", "a/y"]).contains("run `hub checkout`"));
+    assert!(fail(&d, &["touch", "a/y"]).contains("run `barocss-hub checkout`"));
     // The index names an op the log no longer has, so it is distrusted:
     // `a/y` is treated as unrecorded and kept (never deleted as "clean").
     let o = hub(&d, &["checkout"]);
@@ -210,7 +282,7 @@ fn parallel_writers_do_not_lose_ops() {
     ok(&d, &["init"]);
     let kids: Vec<_> = (0..N)
         .map(|i| {
-            Command::new(env!("CARGO_BIN_EXE_hub"))
+            Command::new(env!("CARGO_BIN_EXE_barocss-hub"))
                 .args(["mkdir", &format!("d{i}")])
                 .current_dir(&d)
                 .stdout(std::process::Stdio::null())
@@ -316,11 +388,11 @@ fn crc_valid_tail_without_newline_is_torn() {
 fn usage_shows_arguments() {
     let d = tmp("usage");
     ok(&d, &["init"]);
-    assert!(fail(&d, &["commit"]).contains("usage: hub commit -m <msg>"));
-    assert!(fail(&d, &["commit", "-m", "a", "x"]).contains("usage: hub commit -m <msg>"));
-    assert!(fail(&d, &["mkdir"]).contains("usage: hub mkdir <path>"));
-    assert!(fail(&d, &["mv", "a"]).contains("usage: hub mv <from> <to>"));
-    assert!(fail(&d, &["init", "x"]).contains("usage: hub init"));
+    assert!(fail(&d, &["commit"]).contains("usage: barocss-hub commit -m <msg>"));
+    assert!(fail(&d, &["commit", "-m", "a", "x"]).contains("usage: barocss-hub commit -m <msg>"));
+    assert!(fail(&d, &["mkdir"]).contains("usage: barocss-hub mkdir <path>"));
+    assert!(fail(&d, &["mv", "a"]).contains("usage: barocss-hub mv <from> <to>"));
+    assert!(fail(&d, &["init", "x"]).contains("usage: barocss-hub init"));
 }
 
 #[test]
@@ -409,7 +481,7 @@ fn pinned_conflicting_checkout_explains_way_out() {
     let e = fail(&d, &["checkout"]);
     assert!(e.contains("refusing to check out"), "{e}");
     assert!(e.contains(hub_cli::PINNED_WAY_OUT), "{e}");
-    assert!(e.contains("hub checkout --force"), "{e}");
+    assert!(e.contains("barocss-hub checkout --force"), "{e}");
     assert!(d.join(".hub/pinned").exists(), "refusal must not unpin");
     // Not pinned: the plain hint only.
     let aside = fs::read(d.join("notes.txt")).unwrap();

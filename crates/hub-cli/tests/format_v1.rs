@@ -37,7 +37,7 @@ fn hub_bin(bin: &Path, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Outpu
 }
 
 fn hub_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
-    hub_bin(Path::new(env!("CARGO_BIN_EXE_hub")), dir, args, env)
+    hub_bin(Path::new(env!("CARGO_BIN_EXE_barocss-hub")), dir, args, env)
 }
 
 /// Snapshot on every write (the policy's minimum set to 1 op).
