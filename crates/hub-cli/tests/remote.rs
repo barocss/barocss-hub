@@ -648,6 +648,9 @@ fn diverge_repro(via: &str) {
     // never silent.
     let o = hub_env(&c, &["sync"], &e.env());
     assert_eq!(o.status.code(), Some(3));
+    // Localization asks for ids only: no blob crosses for evidence (#46 R(b)).
+    let so = String::from_utf8_lossy(&o.stdout);
+    assert!(so.contains("sent 0 op(s), 0 blob(s)"), "{so}");
     assert!(String::from_utf8_lossy(&o.stderr).contains("(equivocation)"));
     assert!(ok(&c, &["warnings"]).contains("equivocation"));
 }

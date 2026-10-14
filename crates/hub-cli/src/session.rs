@@ -88,6 +88,13 @@ pub struct Side {
     /// another payload (Issue #46): persist stops the session if its
     /// equivocation warning is new.
     diverged: bool,
+    /// Localization rounds (#46): the evidence is the ops' ids and
+    /// payloads; their blobs are never requested.
+    no_blobs: bool,
+    /// Digest of the whole applied store at the frontier it was computed
+    /// for (#46: one LtHash pass per side per frontier; a frontier names
+    /// one causally closed set, and keep-first never changes an op).
+    total: Option<(Vec<OpId>, Sums)>,
 }
 
 /// What a finished client session reports.
@@ -220,6 +227,8 @@ impl Side {
             rejected_last: Vec::new(),
             digest: false,
             diverged: false,
+            no_blobs: false,
+            total: None,
         })
     }
 
@@ -354,6 +363,7 @@ impl Side {
         );
         if self.digest {
             // Issue #46: the digest of K = downclose(F_A ∩ V_B) = V_B \ Δ.
+            let total = d.is_empty().then(|| self.total_sums());
             let st = self.sr.store();
             let resolved: Vec<OpId> = frontier
                 .iter()
@@ -363,6 +373,8 @@ impl Side {
             // Δ is a `<`-ordered subsequence of the store: a merge walk.
             let k = if d.len() == st.len() {
                 Sums::default()
+            } else if let Some(k) = total {
+                k
             } else {
                 let mut di = d.iter().peekable();
                 let ops: Vec<&Op> = st
@@ -376,7 +388,7 @@ impl Side {
                         }
                     })
                     .collect();
-                Sums::par_of(&ops)
+                Sums::of_sorted(&ops)
             };
             conn.send(&Frame::Sums {
                 resolved: (resolved.len() != frontier.len()).then_some(resolved),
@@ -596,16 +608,31 @@ impl Side {
         Ok(log)
     }
 
+    /// The digest of the whole applied store (cached per frontier).
+    fn total_sums(&mut self) -> Sums {
+        let f = self.sr.frontier();
+        if let Some((cf, s)) = &self.total {
+            if *cf == f {
+                return s.clone();
+            }
+        }
+        let ops: Vec<&Op> = self.sr.store().values().collect();
+        let s = Sums::of_sorted(&ops);
+        self.total = Some((f, s.clone()));
+        s
+    }
+
     /// Issue #46: read the answerer's `Sums` and compare with ours over
     /// `downclose(resolved)`. Returns our ops of every mismatching author,
     /// newest first (the localization candidates).
-    fn compare_sums(&self, conn: &mut Conn, mine: &[OpId]) -> Result<Vec<OpId>, Error> {
+    fn compare_sums(&mut self, conn: &mut Conn, mine: &[OpId]) -> Result<Vec<OpId>, Error> {
         let (resolved, theirs) = loop {
             match conn.recv(wire::step_timeout())? {
                 Frame::Sums { resolved, sums } => break (resolved, sums),
                 f => self.other(f)?,
             }
         };
+        let total = resolved.is_none().then(|| self.total_sums());
         let st = self.sr.store();
         let known: Option<Version> = match resolved {
             None => None,
@@ -620,13 +647,15 @@ impl Side {
             }
         };
         let inside = |id: &OpId| known.as_ref().is_none_or(|v| v.contains(*id));
-        let ops: Vec<&Op> = match &known {
-            None => st.values().collect(),
-            Some(v) if v.is_empty() => Vec::new(),
-            Some(_) => st.values().filter(|o| inside(&o.id)).collect(),
+        let ours = match &known {
+            None => total.expect("computed above"),
+            Some(v) if v.is_empty() => Sums::default(),
+            Some(_) => {
+                let ops: Vec<&Op> = st.values().filter(|o| inside(&o.id)).collect();
+                Sums::of_sorted(&ops)
+            }
         };
-        let ours = Sums::par_of(&ops);
-        let bad = ours.mismatch(&Sums::from_wire(&theirs));
+        let bad = ours.mismatch(&theirs);
         if bad.is_empty() {
             return Ok(Vec::new());
         }
@@ -661,7 +690,10 @@ impl Side {
         for g in suspects.chunks(LOCALIZE_ROUND) {
             conn.send(&Frame::Need(g.to_vec()))?;
             let n0 = log.len();
-            self.recv_ops(conn, peer, resume, log, requested, outstanding)?;
+            self.no_blobs = true;
+            let r = self.recv_ops(conn, peer, resume, log, requested, outstanding);
+            self.no_blobs = false;
+            r?;
             self.recv_blobs(conn, peer, log, outstanding, retried)?;
             let hit = log[n0..].iter().any(|x| match x {
                 Recv::Ops(v) => v.iter().any(|o| ours.get(&o.id).is_some_and(|m| m != o)),
@@ -699,7 +731,12 @@ impl Side {
                         self.sr.receive(peer, o.clone());
                     }
                     let mut want: BTreeMap<BlobId, u64> = BTreeMap::new();
-                    for b in self.sr.lacking_blobs(&ops) {
+                    let lack = if self.no_blobs {
+                        Vec::new()
+                    } else {
+                        self.sr.lacking_blobs(&ops)
+                    };
+                    for b in lack {
                         if requested.insert(b) {
                             let off = if resume {
                                 fs::metadata(part_name(&self.bdir(), &b))
@@ -1041,12 +1078,34 @@ fn hello(conn: &mut Conn, side: &mut Side) -> Result<Hello, Error> {
 
 /// Send our error to the peer (unless it came from the peer) and return it.
 fn fail<T>(conn: &mut Conn, r: Result<T, Error>) -> Result<T, Error> {
+    // Review R1 (#46): a write that failed because the peer already closed
+    // (it stopped with its own error, e.g. `duplicate-replica`, and sent
+    // an `Error` frame first): report the peer's error, not `io`.
+    let r = match r {
+        Err(e) if e.code() == Code::Io && !e.is_remote() => Err(peer_error(conn).unwrap_or(e)),
+        r => r,
+    };
     if let Err(e) = &r {
         if !e.is_remote() && !matches!(e.code(), Code::Io | Code::Timeout) {
             conn.send_error(e, true);
         }
     }
     r
+}
+
+/// The `Error` frame the peer sent before closing, if one is buffered.
+fn peer_error(conn: &mut Conn) -> Option<Error> {
+    if !conn.magic_seen {
+        conn.recv_magic(Duration::from_secs(2)).ok()?;
+    }
+    for _ in 0..64 {
+        match conn.recv(Duration::from_secs(2)) {
+            Ok(Frame::Error { code, message, .. }) => return Some(remote_err(&code, &message)),
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 fn count(store: &hub_core::version::Store, f: &[OpId]) -> Option<usize> {
@@ -1321,6 +1380,14 @@ mod diverge46_tests {
         }
     }
 
+    /// Review R1 regression (merge-gate seed): one side stopped with
+    /// `duplicate-replica` while the other was still writing; the user must
+    /// see `duplicate-replica` (and `reid`), never `io` broken pipe.
+    #[test]
+    fn regression_seed_broken_pipe_is_duplicate_replica() {
+        run(15947950576429011519, 9, true).unwrap();
+    }
+
     /// The property has teeth: random schedules do produce ids held with
     /// two payloads by both sides of a completed sync (each then checked
     /// as warned), and the fixed copy-then-server scenario is detected on
@@ -1363,5 +1430,42 @@ mod diverge46_tests {
         let _ = fs::remove_dir_all(&base);
         matches!(second, Err(e) if e.code() == Code::DuplicateReplica)
             && w.iter().any(|w| w.reason == RejectReason::Equivocation)
+    }
+}
+
+/// Review R1 (#46): the peer sends a fatal `Error` and closes; our next
+/// write fails with a broken pipe. The client must report the peer's
+/// error code (here `duplicate-replica`), not `io`. Same `fail` path as a
+/// `serve --stdio` child that exits after its `Error` (EPIPE on the pipe).
+#[cfg(test)]
+mod epipe_tests {
+    use super::*;
+    use crate::wire::{self, Frame, Hello};
+
+    #[test]
+    fn write_after_peer_error_reports_peer_error() {
+        let root = std::env::temp_dir().join(format!("hub-epipe46-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let repo = Repo::init(&root).unwrap();
+        let mut side = Side::new(Access::Held(Box::new(repo)), false).unwrap();
+        let (mut x, mut y, _cut) = wire::pair();
+        let th = std::thread::spawn(move || {
+            y.send_magic().unwrap();
+            y.send(&Frame::Hello(Hello::new(ReplicaId(0x5eed), false)))
+                .unwrap();
+            y.send(&Frame::Error {
+                code: "duplicate-replica".into(),
+                message: "sync aborted: test".into(),
+                fatal: true,
+            })
+            .unwrap();
+            drop(y);
+        });
+        th.join().unwrap();
+        let e = client(&mut x, &mut side).unwrap_err();
+        assert_eq!(e.code(), Code::DuplicateReplica, "{e:?}");
+        drop(side);
+        let _ = fs::remove_dir_all(&root);
     }
 }
