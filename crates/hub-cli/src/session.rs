@@ -92,7 +92,7 @@ pub struct Side {
     /// payloads; their blobs are never requested.
     no_blobs: bool,
     /// Digest of the whole applied store at the frontier it was computed
-    /// for (#46: one LtHash pass per side per frontier; a frontier names
+    /// for (#46: one sequence-digest pass ([`Sums`]) per side per frontier; a frontier names
     /// one causally closed set, and keep-first never changes an op).
     total: Option<(Vec<OpId>, Sums)>,
 }

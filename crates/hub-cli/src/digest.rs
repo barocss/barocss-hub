@@ -10,6 +10,10 @@
 //! to Wagner's generalized birthday attack). The wire carries a 32-byte
 //! BLAKE3 checksum of each value. Nothing is stored: sums are computed from
 //! the loaded store per session, so there is no format change.
+//!
+//! The full-replica wire path uses [`Sums`] (SHA-256 sequence digest). The
+//! LtHash16 parts ([`Lt`], [`LtSums`], for partial replicas, #47) and their
+//! `blake3` dependency are behind the off-by-default `lthash` feature (#50).
 
 use std::collections::BTreeMap;
 
@@ -76,31 +80,38 @@ pub fn op_hash(o: &Op) -> [u8; 32] {
 }
 
 /// LtHash16 lanes (Lewi et al., IACR ePrint 2019/227): n = 1024, d = 16.
+#[cfg(feature = "lthash")]
 pub const LANES: usize = 1024;
+#[cfg(feature = "lthash")]
 const XOF_CONTEXT: &str = "barocss-hub 2026-10 lthash16 op v1";
 
 /// One LtHash16 value: 1024 lanes of u16, combined by lane-wise addition
 /// mod 2^16. Additive, so `D(A ∪ B) = D(A) + D(B)` for disjoint sets, and
 /// order-independent.
+#[cfg(feature = "lthash")]
 #[derive(Clone, PartialEq, Eq)]
 pub struct Lt(Box<[u16; LANES]>);
 
+#[cfg(feature = "lthash")]
 impl std::fmt::Debug for Lt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Lt({})", hex(&self.checksum()))
     }
 }
 
+#[cfg(feature = "lthash")]
 impl Default for Lt {
     fn default() -> Self {
         Lt(Box::new([0; LANES]))
     }
 }
 
+#[cfg(feature = "lthash")]
 fn hex(d: &[u8; 32]) -> String {
     d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+#[cfg(feature = "lthash")]
 impl Lt {
     /// The element of one op: 2 KiB of BLAKE3 XOF output (derive-key mode,
     /// domain-separated) over the op's SHA-256 content hash.
@@ -227,9 +238,11 @@ impl Sums {
 /// Per-author `(count, LtHash16)` of an op set: the additive digest for
 /// partial replicas (#47: `D_r(B) + D_r(W)`). Not on the full-replica wire
 /// path (cost, see [`Sums`]).
+#[cfg(feature = "lthash")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LtSums(pub BTreeMap<ReplicaId, (u64, Lt)>);
 
+#[cfg(feature = "lthash")]
 impl LtSums {
     pub fn of<'a>(ops: impl IntoIterator<Item = &'a Op>) -> LtSums {
         let mut s = LtSums::default();
@@ -319,7 +332,9 @@ impl LtSums {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hub_core::tree::{BlobId, ROOT};
+    #[cfg(feature = "lthash")]
+    use hub_core::tree::BlobId;
+    use hub_core::tree::ROOT;
     use std::collections::BTreeSet;
 
     fn op(c: u64, r: u128, name: &str) -> Op {
@@ -334,10 +349,12 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lthash")]
     fn wire(s: &LtSums) -> Vec<(ReplicaId, u64, [u8; 32])> {
         s.to_wire()
     }
 
+    #[cfg(feature = "lthash")]
     #[test]
     fn order_independent_and_content_sensitive() {
         let (a, b, c) = (op(2, 1, "a"), op(3, 1, "b"), op(4, 2, "c"));
@@ -361,6 +378,7 @@ mod tests {
         assert!(LtSums::default().mismatch(&[]).is_empty());
     }
 
+    #[cfg(feature = "lthash")]
     #[test]
     fn additive_and_subtractive() {
         let ops: Vec<Op> = (0..50).map(|i| op(i + 2, 1, &format!("n{i}"))).collect();
@@ -413,6 +431,7 @@ mod tests {
         assert_eq!(Sums::of_sorted(&v), base);
     }
 
+    #[cfg(feature = "lthash")]
     #[test]
     fn every_single_op_change_is_detected() {
         let ops: Vec<Op> = (0..200)
@@ -428,6 +447,7 @@ mod tests {
     }
 
     /// Release-only timing probe (`cargo test --release -- --ignored`).
+    #[cfg(feature = "lthash")]
     #[test]
     #[ignore]
     fn timing_probe() {
@@ -443,6 +463,7 @@ mod tests {
         eprintln!("200k ops single-thread: {:?}", t.elapsed());
     }
 
+    #[cfg(feature = "lthash")]
     #[test]
     fn parallel_equals_direct() {
         let ops: Vec<Op> = (0..5000)
