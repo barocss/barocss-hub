@@ -198,6 +198,13 @@ pub fn add(k: &TrustKey) -> Result<(), Error> {
     }
     fs::rename(&tmp, &p)?;
     if let Some(l) = legacy {
+        // Issue #46: make the rename durable (directory entry flushed, then
+        // a barrier) before the old macOS file goes, so a crash in between
+        // can never leave neither file holding the merged entries.
+        let d = fs::File::open(dir)?;
+        crate::durable::flush_dir(dir, &d)?;
+        crate::durable::barrier(&d)?;
+        crate::durable::crash_point(crate::durable::TRUST_MOVED);
         // Merged above: the old macOS file has moved.
         let _ = fs::remove_file(l);
     }

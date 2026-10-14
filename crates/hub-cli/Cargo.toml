@@ -16,6 +16,8 @@ path = "src/main.rs"
 [dependencies]
 hub-core = { package = "barocss-hub-core", path = "../hub-core" }
 sha2 = "0.10"
+# Issue #46 R2: XOF for the LtHash16 divergence digest.
+blake3 = "=1.8.2"
 
 [dev-dependencies]
 proptest = "1"

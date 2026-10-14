@@ -4,6 +4,7 @@
 //! can be tested without spawning a process. `main.rs` is a thin wrapper.
 
 pub mod blobs;
+pub mod digest;
 pub mod durable;
 pub mod ignore;
 pub mod json;
