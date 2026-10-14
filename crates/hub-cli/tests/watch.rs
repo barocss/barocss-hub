@@ -26,6 +26,10 @@ fn tmp(tag: &str) -> PathBuf {
 fn hub(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_barocss-hub"))
         .env("XDG_CONFIG_HOME", xdg())
+        .env(
+            "BAROCSS_HUB_CONFIG_DIR",
+            std::path::Path::new(&xdg()).join("barocss-hub"),
+        )
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -60,7 +64,10 @@ impl Watcher {
         ));
         let f = fs::File::create(&log).unwrap();
         let mut c = Command::new(env!("CARGO_BIN_EXE_barocss-hub"));
-        c.env("XDG_CONFIG_HOME", xdg());
+        c.env("XDG_CONFIG_HOME", xdg()).env(
+            "BAROCSS_HUB_CONFIG_DIR",
+            std::path::Path::new(&xdg()).join("barocss-hub"),
+        );
         c.args([
             "watch",
             "--poll",

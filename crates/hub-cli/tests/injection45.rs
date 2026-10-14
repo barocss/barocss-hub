@@ -70,6 +70,10 @@ exec sh -c "$cmd"
             .env("HUB_SSH_COMMAND", &self.ssh)
             .env("FAKE_SSH_LOG", &self.log)
             .env("XDG_CONFIG_HOME", &self.xdg)
+            .env(
+                "BAROCSS_HUB_CONFIG_DIR",
+                std::path::Path::new(&self.xdg).join("barocss-hub"),
+            )
             .env_remove("BAROCSS_HUB_SERVE_ROOT")
             .env("HUB_TEST_WIRE_TIMEOUT_MS", "3000")
             .stdin(Stdio::null())

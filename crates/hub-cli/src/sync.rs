@@ -579,6 +579,9 @@ pub fn print_report(r: &Synced, out: &mut dyn Write, warn: &mut dyn Write) -> Re
             )?;
         }
     }
+    if !r.report.rejected.is_empty() {
+        crate::note_rejected();
+    }
     for l in rejected_lines(&r.report.rejected) {
         writeln!(warn, "warning: {l}")?;
     }

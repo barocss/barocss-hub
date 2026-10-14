@@ -205,7 +205,7 @@ describe('barocss-hub extension (real CLI, temp repos)', function () {
   it('a planted (never trusted) remote is skipped with one notification, never contacted', async () => {
     // Added under ANOTHER user's trust store: for this user it is exactly a
     // remote that came with the folder.
-    hubEnv({ XDG_CONFIG_HOME: process.env.HUB_TEST_OTHER_XDG! }, WS, 'remote', 'add', 'planted', 'ssh://planted.invalid/r');
+    hubEnv({ XDG_CONFIG_HOME: process.env.HUB_TEST_OTHER_XDG!, BAROCSS_HUB_CONFIG_DIR: path.join(process.env.HUB_TEST_OTHER_XDG!, 'barocss-hub') }, WS, 'remote', 'add', 'planted', 'ssh://planted.invalid/r');
     const repo = api.repos()[0];
     const events: string[] = [];
     const sub = repo.onWatchEvent((ev) => { events.push(ev.event); });

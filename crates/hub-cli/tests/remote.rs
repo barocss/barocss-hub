@@ -56,6 +56,10 @@ fn cfg_home() -> &'static str {
 fn cmd() -> Command {
     let mut c = Command::new(BIN);
     c.env("XDG_CONFIG_HOME", cfg_home())
+        .env(
+            "BAROCSS_HUB_CONFIG_DIR",
+            std::path::Path::new(&cfg_home()).join("barocss-hub"),
+        )
         .env_remove("BAROCSS_HUB_SERVE_ROOT");
     c
 }

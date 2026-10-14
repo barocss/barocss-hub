@@ -1691,7 +1691,9 @@ Commands:
   remote add [--default] [--exec <path>] [<name>] <url> | list | rm <name> | set-url <name> <url> | trust <name>
                        manage remotes (.hub/remotes, local config, not replicated);
                        --exec: one word of [A-Za-z0-9._/~+-]; trust: mark a
-                       remote as used from this machine (~/.config/barocss-hub)
+                       remote as used from this repository on this machine
+                       (macOS: ~/Library/Application Support/barocss-hub;
+                       else $XDG_CONFIG_HOME or ~/.config/barocss-hub)
   serve --stdio [--read-only] [--root <dir>] <path>
                        speak the sync protocol on stdin/stdout for one repository
                        (the remote end of ssh; see --from-ssh-original-command)
@@ -1700,7 +1702,7 @@ Commands:
   watch [--poll <ms>] [--debounce <ms>] [--sync <ms>] [--no-sync]
                        foreground: auto-record working-directory changes,
                        sync with every remote, apply incoming ops; Ctrl-C stops
-                       (untrusted ssh remotes are skipped; --no-sync: local only)
+                       (untrusted remotes are skipped; --no-sync: local only)
   warnings             list sync warnings (D-008) and pending ops
   reid                 give this repo a fresh replica id (after copying a .hub/;
                        run it BEFORE recording in the copy); clears saved
@@ -1709,7 +1711,8 @@ Commands:
   --version, -V        print the version
 
 --json (any command): one JSON document on stdout (schema 1; `watch --json`:
-JSON Lines events); errors as JSON on stderr, exit status 1.
+JSON Lines events); errors as JSON on stderr, exit status 1. Exit status 3: `sync` finished but
+the remote rejected some of this repository's ops (see the warnings).
 ";
 
 /// Every dispatchable command name. `run` rejects any other first word, and
@@ -2311,6 +2314,18 @@ pub fn run(
 /// `--json` error documents.
 pub const PROGRAM: &str = "barocss-hub";
 
+thread_local! {
+    /// Set when a `sync` report lists ops the remote rejected (D-045);
+    /// read and cleared by [`main_with`].
+    static REJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A `sync` report carried rejected ops: the process exits
+/// [`json::EXIT_REJECTED`] instead of 0 (D-045). `watch` never calls this.
+pub(crate) fn note_rejected() {
+    REJECTED.with(|c| c.set(true));
+}
+
 /// The whole process behaviour of `barocss-hub` (Issue #37): run `args`,
 /// print errors, return the exit status (see [`json`] for the exit codes).
 ///
@@ -2320,9 +2335,17 @@ pub const PROGRAM: &str = "barocss-hub";
 /// nothing on `out` and one JSON error document on `err`. `watch --json`
 /// streams events on `out` as it runs.
 pub fn main_with(args: &[String], cwd: &Path, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    REJECTED.with(|c| c.set(false));
+    let ok = || {
+        if REJECTED.with(|c| c.replace(false)) {
+            json::EXIT_REJECTED
+        } else {
+            0
+        }
+    };
     if !args.iter().any(|x| x == json::FLAG) {
         return match run(args, cwd, out, err) {
-            Ok(()) => 0,
+            Ok(()) => ok(),
             Err(e) if e.is_broken_pipe() => 0,
             Err(e) => {
                 let _ = writeln!(err, "{PROGRAM}: {e}");
@@ -2343,7 +2366,7 @@ pub fn main_with(args: &[String], cwd: &Path, out: &mut dyn Write, err: &mut dyn
             if !streaming {
                 let _ = out.write_all(&json::with_warnings(&doc, &warnings));
             }
-            0
+            ok()
         }
         Err(e) if e.is_broken_pipe() => 0,
         Err(e) => {

@@ -1,6 +1,6 @@
 //! Issue #45: planted remotes and first contact. A `.hub/remotes` that came
 //! with a folder must not make `sync` or `watch` contact its ssh remote
-//! silently. Every test uses a private `XDG_CONFIG_HOME` (or `HOME`), never
+//! silently. Every test uses a private `BAROCSS_HUB_CONFIG_DIR` (or `HOME`), never
 //! the user's real configuration.
 
 use std::fs;
@@ -61,6 +61,10 @@ exec sh -c "$2"
             .env("HUB_SSH_COMMAND", &self.ssh)
             .env("FAKE_SSH_LOG", &self.log)
             .env("XDG_CONFIG_HOME", &self.xdg)
+            .env(
+                "BAROCSS_HUB_CONFIG_DIR",
+                std::path::Path::new(&self.xdg).join("barocss-hub"),
+            )
             .env_remove("BAROCSS_HUB_SERVE_ROOT")
             .stdin(Stdio::null());
         c
@@ -399,30 +403,68 @@ fn watch_skips_untrusted_file_remote() {
     assert_eq!(tree(&victim), tv);
 }
 
+/// D-046: where the store lives without the test override.
 #[test]
-fn home_fallback_when_xdg_is_unset_or_relative() {
+fn store_location_per_platform_and_macos_migration() {
     let e = Env::new("home");
     let (a, _, _) = planted(&e);
     let home = e.t.join("home");
+    let xdg = e.t.join("xdg2");
     fs::create_dir_all(&home).unwrap();
-    for xdg in [None, Some("relative/dir")] {
-        let mut c = e.cmd(&a, &["sync", "--yes"]);
-        c.env_remove("XDG_CONFIG_HOME").env("HOME", &home);
-        if let Some(x) = xdg {
+    let cmd = |args: &[&str], xdg_v: Option<&Path>| {
+        let mut c = e.cmd(&a, args);
+        c.env_remove("BAROCSS_HUB_CONFIG_DIR")
+            .env_remove("XDG_CONFIG_HOME")
+            .env("HOME", &home);
+        if let Some(x) = xdg_v {
             c.env("XDG_CONFIG_HOME", x);
         }
-        assert!(c.output().unwrap().status.success());
+        c.output().unwrap()
+    };
+    let mac = home.join("Library/Application Support/barocss-hub/trusted-remotes");
+    let dotcfg = home.join(".config/barocss-hub/trusted-remotes");
+    let xdgf = xdg.join("barocss-hub/trusted-remotes");
+    assert!(cmd(&["sync", "--yes"], Some(&xdg)).status.success());
+    if cfg!(target_os = "macos") {
+        // XDG_CONFIG_HOME is not consulted on macOS.
+        assert!(mac.is_file());
+        assert!(!xdgf.exists() && !dotcfg.exists());
+        // Migration: a pre-D-046 ~/.config store is read, then moved.
+        let entry = fs::read_to_string(&mac).unwrap();
+        fs::remove_file(&mac).unwrap();
+        fs::create_dir_all(dotcfg.parent().unwrap()).unwrap();
+        fs::write(&dotcfg, &entry).unwrap();
+        assert!(
+            cmd(&["sync"], None).status.success(),
+            "legacy entry not read"
+        );
+        assert!(dotcfg.is_file(), "a read must not move the file");
+        assert!(cmd(&["remote", "trust", "origin"], None).status.success());
+        assert!(!dotcfg.exists(), "not moved");
+        assert_eq!(fs::read_to_string(&mac).unwrap(), entry);
+        assert!(cmd(&["sync"], None).status.success());
+    } else {
+        assert!(xdgf.is_file());
+        assert!(!mac.exists());
+        for x in [None, Some(Path::new("relative/dir"))] {
+            let _ = fs::remove_file(&dotcfg);
+            assert!(cmd(&["sync", "--yes"], x).status.success());
+            assert!(dotcfg.is_file());
+        }
     }
-    assert!(home.join(".config/barocss-hub/trusted-remotes").is_file());
     assert!(!e.store().exists());
-    // Neither variable usable: refused (nothing to remember it in) unless
+    // No usable variable: refused (nothing to remember it in) unless
     // --yes, which still syncs.
     let mut c = e.cmd(&a, &["sync", "--json"]);
-    c.env_remove("XDG_CONFIG_HOME").env_remove("HOME");
+    c.env_remove("BAROCSS_HUB_CONFIG_DIR")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME");
     let o = c.output().unwrap();
     assert!(String::from_utf8_lossy(&o.stderr).contains("untrusted-remote"));
     let mut c = e.cmd(&a, &["sync", "--yes"]);
-    c.env_remove("XDG_CONFIG_HOME").env_remove("HOME");
+    c.env_remove("BAROCSS_HUB_CONFIG_DIR")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME");
     assert!(c.output().unwrap().status.success());
 }
 
@@ -447,6 +489,10 @@ fn terminal_prompt_asks_on_first_contact() {
             .env("HUB_SSH_COMMAND", &e.ssh)
             .env("FAKE_SSH_LOG", &e.log)
             .env("XDG_CONFIG_HOME", &e.xdg)
+            .env(
+                "BAROCSS_HUB_CONFIG_DIR",
+                std::path::Path::new(&e.xdg).join("barocss-hub"),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

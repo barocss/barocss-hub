@@ -96,7 +96,9 @@ export function run<T = Record<string, unknown>>(bin: string, cwd: string, args:
       clearTimeout(timer);
       const stdout = Buffer.concat(out).toString('utf8');
       const stderr = Buffer.concat(err).toString('utf8');
-      if (status === 0) {
+      // D-045: `sync` exits 3 with its full document when the remote
+      // rejected some ops; that is a result to show, not a failure.
+      if (status === 0 || (status === EXIT_REJECTED && args[0] === 'sync')) {
         const doc = parseDoc(stdout);
         if (!doc || doc.schema !== SCHEMA) {
           reject(new CliError('bad-json', `unexpected output from barocss-hub ${args.join(' ')} (schema ${doc?.schema ?? 'none'})`, args));
@@ -116,6 +118,9 @@ export function run<T = Record<string, unknown>>(bin: string, cwd: string, args:
 }
 
 /** Bytes of a stored blob, via `cat-blob <id> --json` (base64 content). */
+/** `sync` finished but the remote rejected some ops (D-045). */
+export const EXIT_REJECTED = 3;
+
 export async function blobBytes(bin: string, cwd: string, blob: string): Promise<Buffer> {
   const doc = await run<{ encoding: string; content: string }>(bin, cwd, ['cat-blob', blob]);
   if (doc.encoding !== 'base64') { throw new CliError('bad-json', `unknown encoding ${doc.encoding}`); }

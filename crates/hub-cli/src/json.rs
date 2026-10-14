@@ -17,7 +17,10 @@
 //!   (a [`crate::Code`], chosen where the error is constructed, never
 //!   derived from the text); `message` is the human text (not stable).
 //! - Exit status: 0 success, [`EXIT_ERROR`] (1) any command error,
-//!   [`EXIT_NO_CWD`] (2) the current directory cannot be read.
+//!   [`EXIT_NO_CWD`] (2) the current directory cannot be read,
+//!   [`EXIT_REJECTED`] (3) `sync` completed but the remote rejected some
+//!   of this repository's ops (D-045; the full document is still written
+//!   on stdout, with `rejected` non-empty).
 //! - Ids: node and op ids as `"<counter>.<32 hex replica>"`, version ids
 //!   as `{"id": <64 hex>, "short": <display prefix>}`, blob ids as 64 hex.
 //!   Paths are root-relative with `/` separators; the root is `""`.
@@ -44,6 +47,9 @@ pub const SCHEMA: u64 = 1;
 pub const EXIT_ERROR: u8 = 1;
 /// Exit status when the current directory cannot be read.
 pub const EXIT_NO_CWD: u8 = 2;
+/// Exit status of a `sync` that completed while the remote rejected some
+/// of the client's ops (D-045). Output is the normal success output.
+pub const EXIT_REJECTED: u8 = 3;
 
 /// Commands with a structured `--json` document. Every other command's
 /// document is `{"schema","command","output":[<its human lines>],"warnings"}`.

@@ -25,7 +25,10 @@ fn tmp(tag: &str) -> PathBuf {
 
 fn hub_bin(bin: &Path, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut c = Command::new(bin);
-    c.env("XDG_CONFIG_HOME", xdg());
+    c.env("XDG_CONFIG_HOME", xdg()).env(
+        "BAROCSS_HUB_CONFIG_DIR",
+        std::path::Path::new(&xdg()).join("barocss-hub"),
+    );
     c.args(args)
         .current_dir(dir)
         .stdin(std::process::Stdio::null());

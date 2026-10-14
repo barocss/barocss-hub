@@ -1180,3 +1180,93 @@ fn committed_rejection_lines_are_strict() {
     a.send(&f).unwrap();
     assert_eq!(b.recv(T).unwrap(), f);
 }
+
+/// Not a test on its own: with `HUB45_SCRIPTED_SERVER` set it is the
+/// remote end of a fake ssh (stdin, and fd 3 for the protocol output, since
+/// the test harness writes to stdout) and runs [`scripted_server`],
+/// rejecting op `2.<HUB45_SCRIPTED_SERVER>` when the value is not `-`.
+#[test]
+fn zz_helper_scripted_server_over_stdio() {
+    let Some(v) = std::env::var_os("HUB45_SCRIPTED_SERVER") else {
+        return;
+    };
+    let v = v.into_string().unwrap();
+    let out = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/fd/3")
+        .unwrap();
+    let y = Conn::from_io(std::io::stdin(), out);
+    let (feature, rej) = if v == "-" {
+        (false, vec![])
+    } else {
+        let r = u128::from_str_radix(&v, 16).unwrap();
+        (true, vec![(NodeId::new(2, r), "equivocation".to_string())])
+    };
+    scripted_server(y, feature, rej).unwrap();
+}
+
+/// D-045: `sync` exits [`hub_cli::json::EXIT_REJECTED`] (3) when the
+/// remote rejected some of its ops, with the normal report (human and
+/// `--json`); a sync without rejections exits 0.
+#[test]
+fn sync_exits_3_when_the_remote_rejects_ops() {
+    assert_eq!(hub_cli::json::EXIT_REJECTED, 3);
+    let t = tmp("rej3");
+    let d = t.join("c");
+    fs::create_dir_all(&d).unwrap();
+    ok(&d, &["init"]);
+    fs::write(d.join("f.txt"), "x\n").unwrap();
+    ok(&d, &["record"]);
+    let mine = format!("{:x}", replica_of(&d).0);
+    let ssh = t.join("fake-ssh");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nexec '{}' --exact zz_helper_scripted_server_over_stdio --nocapture --test-threads=1 3>&1 1>&2\n",
+            std::env::current_exe().unwrap().display()
+        ),
+    )
+    .unwrap();
+    Command::new("chmod").arg("+x").arg(&ssh).status().unwrap();
+    let run = |args: &[&str], rej: &str| {
+        Command::new(BIN)
+            .args(args)
+            .current_dir(&d)
+            .env("HUB_SSH_COMMAND", &ssh)
+            .env("HUB45_SCRIPTED_SERVER", rej)
+            .env("BAROCSS_HUB_CONFIG_DIR", t.join("cfg"))
+            .env_remove("BAROCSS_HUB_SERVE_ROOT")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let o = run(&["remote", "add", "origin", "ssh://localhost/srv"], "-");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = run(&["sync"], &mine);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(3), "{err}");
+    assert!(
+        err.contains("warning: the remote rejected your op 2."),
+        "{err}"
+    );
+    assert!(String::from_utf8_lossy(&o.stdout).contains("head "));
+    let o = run(&["sync", "--json"], &mine);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(
+        o.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let j = String::from_utf8(o.stdout).unwrap();
+    assert!(j.contains("\"rejected\":[{\"op\":\"2."), "{j}");
+    assert!(j.contains("\"rejected_reported\":true"), "{j}");
+    // An old server (no rejected-ops feature): nothing reported, exit 0.
+    let o = run(&["sync", "--json"], "-");
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(String::from_utf8_lossy(&o.stdout).contains("\"rejected_reported\":false"));
+}

@@ -8,9 +8,14 @@
 //! `--yes`, or refuses with `untrusted-remote`; `watch` skips it with an
 //! event.
 //!
-//! The store is per user, outside every repository:
-//! `$XDG_CONFIG_HOME/barocss-hub/trusted-remotes` (when `XDG_CONFIG_HOME`
-//! is an absolute path), else `$HOME/.config/barocss-hub/trusted-remotes`.
+//! The store is per user, outside every repository (D-046):
+//! `~/Library/Application Support/barocss-hub/trusted-remotes` on macOS;
+//! elsewhere `$XDG_CONFIG_HOME/barocss-hub/trusted-remotes` (when
+//! `XDG_CONFIG_HOME` is an absolute path), else
+//! `$HOME/.config/barocss-hub/trusted-remotes`. `BAROCSS_HUB_CONFIG_DIR`
+//! (absolute) overrides the directory everywhere. On macOS an existing
+//! pre-D-046 `~/.config/barocss-hub/trusted-remotes` is read too and moved
+//! into the new store on the next write.
 //! Header `barocss-hub/trusted-remotes/v1`, then `T <local> <url> <exec>`
 //! per entry (escaped like `.hub/remotes`). The key is the canonical local
 //! `.hub/`, the normalized URL (`ssh://[user@]host[:port]/path`, or
@@ -21,7 +26,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{store, Code, Error};
 
@@ -49,26 +54,81 @@ impl TrustKey {
     }
 }
 
-/// The store file, or an error when neither variable names a place.
+/// Environment override for the store directory (D-046): an absolute path
+/// to the directory holding `trusted-remotes`. Meant for tests and unusual
+/// setups; a relative value is ignored.
+pub const ENV_DIR: &str = "BAROCSS_HUB_CONFIG_DIR";
+
+fn abs_env(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// The XDG location: `$XDG_CONFIG_HOME/barocss-hub` (when absolute), else
+/// `$HOME/.config/barocss-hub`. The store on Linux and other Unixes, and
+/// the pre-D-046 location on macOS (read for migration).
+fn xdg_dir() -> Option<PathBuf> {
+    abs_env("XDG_CONFIG_HOME")
+        .or_else(|| abs_env("HOME").map(|h| h.join(".config")))
+        .map(|b| b.join("barocss-hub"))
+}
+
+/// The store directory (D-046): [`ENV_DIR`] if set; on macOS
+/// `$HOME/Library/Application Support/barocss-hub` (`XDG_CONFIG_HOME` is
+/// not consulted there, as for other macOS applications); elsewhere
+/// [`xdg_dir`].
+fn store_dir() -> Option<PathBuf> {
+    if let Some(d) = abs_env(ENV_DIR) {
+        return Some(d);
+    }
+    if cfg!(target_os = "macos") {
+        abs_env("HOME").map(|h| h.join("Library/Application Support/barocss-hub"))
+    } else {
+        xdg_dir()
+    }
+}
+
+/// The pre-D-046 store on macOS (`~/.config/barocss-hub/trusted-remotes`,
+/// or under `XDG_CONFIG_HOME`), when it differs from the current one. Its
+/// entries are read as well; the next write merges them into the current
+/// store and removes the old file (a move). Not used with [`ENV_DIR`].
+fn legacy_path() -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") || abs_env(ENV_DIR).is_some() {
+        return None;
+    }
+    let p = xdg_dir()?.join("trusted-remotes");
+    (Some(p.clone()) != store_dir().map(|d| d.join("trusted-remotes"))).then_some(p)
+}
+
+/// The store file, or an error when no variable names a place.
 pub fn store_path() -> Result<PathBuf, Error> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
-        Some(x) if x.is_absolute() => x,
-        _ => match std::env::var_os("HOME").map(PathBuf::from) {
-            Some(h) if h.is_absolute() => h.join(".config"),
-            _ => {
-                return Err(Error::new(
-                    Code::UntrustedRemote,
-                    "cannot locate the trusted-remotes store: neither XDG_CONFIG_HOME nor HOME is an absolute path",
-                ))
-            }
-        },
-    };
-    Ok(base.join("barocss-hub").join("trusted-remotes"))
+    match store_dir() {
+        Some(d) => Ok(d.join("trusted-remotes")),
+        None => Err(Error::new(
+            Code::UntrustedRemote,
+            format!(
+                "cannot locate the trusted-remotes store: HOME is not an absolute path (nor {ENV_DIR}{})",
+                if cfg!(target_os = "macos") { "" } else { ", XDG_CONFIG_HOME" }
+            ),
+        )),
+    }
 }
 
 fn read_all() -> Result<Vec<TrustKey>, Error> {
-    let p = store_path()?;
-    let text = match fs::read_to_string(&p) {
+    let mut all = read_file(&store_path()?)?;
+    if let Some(l) = legacy_path() {
+        for k in read_file(&l)? {
+            if !all.contains(&k) {
+                all.push(k);
+            }
+        }
+    }
+    Ok(all)
+}
+
+fn read_file(p: &Path) -> Result<Vec<TrustKey>, Error> {
+    let text = match fs::read_to_string(p) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
@@ -109,10 +169,13 @@ pub fn add(k: &TrustKey) -> Result<(), Error> {
     fs::create_dir_all(dir)?;
     let _lock = store::RepoLock::acquire(dir, store::LockMode::Exclusive)?;
     let mut all = read_all()?;
-    if all.contains(k) {
+    let legacy = legacy_path().filter(|l| l.exists());
+    if all.contains(k) && legacy.is_none() {
         return Ok(());
     }
-    all.push(k.clone());
+    if !all.contains(k) {
+        all.push(k.clone());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -134,5 +197,9 @@ pub fn add(k: &TrustKey) -> Result<(), Error> {
         f.sync_all()?;
     }
     fs::rename(&tmp, &p)?;
+    if let Some(l) = legacy {
+        // Merged above: the old macOS file has moved.
+        let _ = fs::remove_file(l);
+    }
     Ok(())
 }
