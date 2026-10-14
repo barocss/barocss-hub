@@ -51,6 +51,8 @@ pub const COMMITTED: u8 = 0x0D;
 pub const ERROR: u8 = 0x0E;
 pub const PROGRESS: u8 = 0x0F;
 pub const BYE: u8 = 0x10;
+/// Issue #46: per-author-replica digest of the answerer's known set.
+pub const SUMS: u8 = 0x11;
 
 /// Floors and hard caps of the announced limits (§5.2.3, R4).
 pub const FRAME_FLOOR: u32 = 256 * 1024 + 64;
@@ -65,7 +67,16 @@ pub const MAX_BLOB_SIZE: u64 = 2 << 30;
 /// Longest checkpoint message or note in bytes (§5.2.5, R4).
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
-pub const FEATURES: &[&str] = &["blobs-chunked", "checkpoints", "resume", F_REJECTED_OPS];
+pub const FEATURES: &[&str] = &[
+    "blobs-chunked",
+    "checkpoints",
+    "resume",
+    F_REJECTED_OPS,
+    F_DIGEST,
+];
+/// Issue #46 (Remote-Sync 5.2.8): the answerer sends `Sums` after `Have`.
+/// Only when both Hellos carry it; a pre-#46 peer never sees frame 0x11.
+pub const F_DIGEST: &str = "digest";
 /// Issue #45: the receiver of a push lists the ops it rejected (equivocation,
 /// Lamport violation) in its `Committed` frame, as extra `R <id> <reason>`
 /// lines. Sent only when both Hellos carry it; a pre-#45 peer never sees
@@ -195,6 +206,12 @@ pub enum Frame {
         total: Option<u64>,
     },
     Bye,
+    /// `resolved` (`None` = every frontier id resolved) and the per-author
+    /// `(replica, count, sum)` digest of the known set (#46).
+    Sums {
+        resolved: Option<Vec<OpId>>,
+        sums: Vec<(ReplicaId, u64, [u8; 32])>,
+    },
 }
 
 impl Frame {
@@ -215,6 +232,7 @@ impl Frame {
             Frame::Error { .. } => ERROR,
             Frame::Progress { .. } => PROGRESS,
             Frame::Bye => BYE,
+            Frame::Sums { .. } => SUMS,
         }
     }
     pub fn name(&self) -> &'static str {
@@ -234,6 +252,7 @@ impl Frame {
             Frame::Error { .. } => "Error",
             Frame::Progress { .. } => "Progress",
             Frame::Bye => "Bye",
+            Frame::Sums { .. } => "Sums",
         }
     }
     /// A chunk frame for `data` (trailer computed).
@@ -241,6 +260,10 @@ impl Frame {
         let sha: [u8; 32] = Sha256::digest(&data).into();
         Frame::Chunk { data, sha }
     }
+}
+
+fn hex32(d: &[u8; 32]) -> String {
+    d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn perr(m: impl Into<String>) -> Error {
@@ -376,6 +399,16 @@ pub fn encode(f: &Frame) -> Vec<u8> {
             total.map(|t| t.to_string()).unwrap_or_else(|| "-".into())
         )),
         Frame::Bye => Vec::new(),
+        Frame::Sums { resolved, sums } => {
+            let mut s = match resolved {
+                None => "*".to_string(),
+                Some(ids) => fmt_ids(ids),
+            };
+            for (r, n, d) in sums {
+                s.push_str(&format!("\n{:032x} {n} {}", r.0, hex32(d)));
+            }
+            text(s)
+        }
     };
     let mut out = Vec::with_capacity(payload.len() + 1);
     out.push(f.ty());
@@ -586,6 +619,45 @@ pub fn decode(ty: u8, p: &[u8], ours: &Limits) -> Result<Frame, Error> {
                 return Err(perr("Bye with a payload"));
             }
             Frame::Bye
+        }
+        SUMS => {
+            let mut lines = s.split('\n');
+            let first = lines.next().unwrap_or("");
+            let resolved = if first == "*" {
+                None
+            } else {
+                Some(parse_ids(first)?)
+            };
+            let mut sums = Vec::new();
+            for l in lines {
+                if sums.len() >= MAX_LIST {
+                    return Err(lerr(format!("more than {MAX_LIST} digest lines")));
+                }
+                let t: Vec<&str> = l.split(' ').collect();
+                let [r, n, d] = t.as_slice() else {
+                    return Err(perr("malformed Sums line"));
+                };
+                let bad = |x: &str, len: usize| {
+                    x.len() != len
+                        || !x
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                };
+                if bad(r, 32) || bad(d, 64) {
+                    return Err(perr("malformed Sums line"));
+                }
+                let rid = u128::from_str_radix(r, 16).map_err(|_| perr("bad replica id"))?;
+                let mut out = [0u8; 32];
+                for (i, o) in out.iter_mut().enumerate() {
+                    *o = u8::from_str_radix(&d[2 * i..2 * i + 2], 16)
+                        .map_err(|_| perr("bad digest"))?;
+                }
+                sums.push((ReplicaId(rid), num(n)?, out));
+            }
+            if sums.windows(2).any(|w| w[0].0 >= w[1].0) {
+                return Err(perr("Sums lines not sorted by replica"));
+            }
+            Frame::Sums { resolved, sums }
         }
         REF_MOVES => {
             return Err(Error::new(
@@ -922,6 +994,14 @@ mod tests {
         rt(Frame::Hello(Hello::new(ReplicaId(7), true)));
         rt(Frame::Have { frontier: vec![id] });
         rt(Frame::Have { frontier: vec![] });
+        rt(Frame::Sums {
+            resolved: None,
+            sums: vec![(ReplicaId(3), 2, [7u8; 32]), (ReplicaId(9), 1, [0xab; 32])],
+        });
+        rt(Frame::Sums {
+            resolved: Some(vec![id]),
+            sums: vec![],
+        });
         rt(Frame::Ops {
             frontier: vec![id],
             done: true,

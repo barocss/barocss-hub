@@ -148,8 +148,17 @@ fn hello_with(c: &mut Conn, h: Hello) -> Result<Hello, Error> {
     }
 }
 
+/// The scripted peers of these tests speak the pre-#46 protocol (no
+/// `digest` feature, so no `Sums` frame): they double as the old-peer
+/// compatibility check for Issue #46.
+fn old_hello(me: ReplicaId, ro: bool) -> Hello {
+    let mut h = Hello::new(me, ro);
+    h.features.retain(|f| f != wire::F_DIGEST);
+    h
+}
+
 fn hello(c: &mut Conn, me: ReplicaId) -> Result<Hello, Error> {
-    hello_with(c, Hello::new(me, false))
+    hello_with(c, old_hello(me, false))
 }
 
 /// The pull half, receiving (and ignoring) everything.
@@ -360,23 +369,23 @@ fn p8_p18_p20_hello_checks_persist_nothing() {
         h.features.clear();
         r.unwrap_err()
     };
-    let mut h = Hello::new(ReplicaId(X), false);
+    let mut h = old_hello(ReplicaId(X), false);
     h.limits.frame = 1;
     assert_eq!(bad(h).code(), Code::Protocol);
-    let mut h = Hello::new(ReplicaId(X), false);
+    let mut h = old_hello(ReplicaId(X), false);
     h.limits.chunk = 0;
     assert_eq!(bad(h).code(), Code::Protocol);
-    let mut h = Hello::new(ReplicaId(X), false);
+    let mut h = old_hello(ReplicaId(X), false);
     h.limits.ops = 0;
     assert_eq!(bad(h).code(), Code::Protocol);
-    let mut h = Hello::new(ReplicaId(X), false);
+    let mut h = old_hello(ReplicaId(X), false);
     h.proto_min = 2;
     h.proto_max = 2;
     let e = bad(h);
     assert_eq!(e.code(), Code::VersionMismatch);
     assert!(e.0.contains("1..1") && e.0.contains("2..2"), "{e}");
     // P20: a client announcing the server's own replica id.
-    let e = bad(Hello::new(srv, false));
+    let e = bad(old_hello(srv, false));
     assert_eq!(e.code(), Code::DuplicateReplica);
     assert_eq!(
         files(&d.join(".hub")),
@@ -576,12 +585,14 @@ fn p14_malicious_ops_are_validated_exactly_like_local_sync() {
     let srv = repo.replica_id;
     drop(repo);
     let a = create(20, X, &[], "a");
+    // Equivocation: an existing id with another payload (here authored
+    // under the server's own id: since #46 also a DuplicateReplica, which
+    // ends the session; checked separately below).
+    let equiv = Op {
+        payload: Payload::Delete { node: ROOT },
+        ..existing.clone()
+    };
     let evil = vec![
-        // Equivocation: an existing id with another payload.
-        Op {
-            payload: Payload::Delete { node: ROOT },
-            ..existing.clone()
-        },
         a.clone(),
         // Lamport violation: a dep not < the op.
         create(21, X, &[NodeId::new(30, X)], "lam"),
@@ -615,13 +626,30 @@ fn p14_malicious_ops_are_validated_exactly_like_local_sync() {
     done(ch);
     let got = hub_cli::sync::read_warnings(&d.join(".hub")).unwrap();
     assert_eq!(key(&got), key(&local.warnings()));
-    assert_eq!(key(&got).len(), 2);
+    assert_eq!(key(&got).len(), 1);
     let r = Repo::open_dir_with(d.join(".hub"), LockMode::Shared).unwrap();
     let mine: BTreeSet<NodeId> = r.store.keys().copied().collect();
     let theirs: BTreeSet<NodeId> = local.store().keys().copied().collect();
     assert_eq!(mine, theirs);
     assert_eq!(r.conflicts(), local.conflicts());
     assert!(format!("{:?}", r.conflicts()).contains("Invalid"));
+    drop(r);
+    // Issue #46: the equivocating op under the server's id, validated as
+    // the in-memory replica does: equivocation + duplicate-replica, the
+    // session ends with `duplicate-replica`, no op is appended.
+    local.receive(ReplicaId(X), equiv.clone());
+    let log0 = fs::read(d.join(".hub/ops.log")).unwrap();
+    let (ch, mut c) = serve(&d, false);
+    hello(&mut c, ReplicaId(X)).unwrap();
+    pull(&mut c).unwrap();
+    let e = push(&mut c, vec![equiv.clone()], &mut no_blobs).unwrap_err();
+    done(ch);
+    assert_eq!(e.code(), Code::DuplicateReplica, "{e:?}");
+    let got = hub_cli::sync::read_warnings(&d.join(".hub")).unwrap();
+    assert_eq!(key(&got), key(&local.warnings()));
+    assert!(key(&got).contains(&("Equivocation".into(), Some(equiv.id))));
+    assert!(key(&got).contains(&("DuplicateReplica".into(), Some(equiv.id))));
+    assert_eq!(fs::read(d.join(".hub/ops.log")).unwrap(), log0);
 }
 
 // ------------------------------------------------------------ P16
@@ -711,7 +739,7 @@ fn p19_record_sizes() {
     repo.append_op(huge.clone()).unwrap();
     drop(repo);
     let (ch, mut c) = serve(&d, false);
-    let mut h = Hello::new(ReplicaId(X), false);
+    let mut h = old_hello(ReplicaId(X), false);
     h.limits = Limits {
         frame: wire::FRAME_FLOOR,
         chunk: wire::CHUNK_FLOOR,
@@ -986,7 +1014,7 @@ fn max_blob_size_is_non_fatal_for_that_blob() {
 // ------------------------------------------------------------ Issue #45
 
 fn hello_features(me: ReplicaId, rejected_ops: bool) -> Hello {
-    let mut h = Hello::new(me, false);
+    let mut h = old_hello(me, false);
     if !rejected_ops {
         h.features.retain(|f| f != wire::F_REJECTED_OPS);
     }

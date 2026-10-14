@@ -541,6 +541,17 @@ impl SyncReplica {
                     RejectReason::Equivocation,
                     detail,
                 );
+                // Issue #46: our own id with another payload is evidence
+                // that the id is in use elsewhere (a copied `.hub/`).
+                if op.id.replica == self.id {
+                    self.warn(
+                        peer,
+                        Some(op.id.replica),
+                        Some(op.id),
+                        RejectReason::DuplicateReplica,
+                        "an op under our replica id with content we did not author".into(),
+                    );
+                }
             }
             return;
         }

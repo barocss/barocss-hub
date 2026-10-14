@@ -585,3 +585,79 @@ fn new_error_code_goldens() {
         &[(&t, "<t>")],
     );
 }
+
+/// Issue #46 Review repro: two copies of one `.hub/` (same replica id)
+/// record different content of `f` and meet only through a server. Before
+/// #46 both ended at the same head with different content and no warning.
+/// Now the copy's sync is refused with `duplicate-replica`, an equivocation
+/// and a DuplicateReplica warning naming the server are persisted, and the
+/// copy's log is unchanged. `via` = "ssh" or "file".
+fn diverge_repro(via: &str) {
+    let e = Env::new(&format!("div46-{via}"));
+    let srv = e.bare("srv.hub");
+    let a = e.repo("a");
+    let url = match via {
+        "ssh" => format!("ssh://localhost{}", srv.display()),
+        _ => format!("file://{}", srv.display()),
+    };
+    ok(&a, &["remote", "add", "--exec", BIN, "origin", &url]);
+    fs::write(a.join("f"), "base\n").unwrap();
+    ok(&a, &["record"]);
+    e.sync(&a, "origin");
+    // The copy: same .hub/, same replica id, same remote.
+    let c = e.t.join("c");
+    let st = Command::new("cp")
+        .args(["-R", a.to_str().unwrap(), c.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    // A copied folder is a new place for the trust store (#45).
+    ok(&c, &["remote", "trust", "origin"]);
+    fs::write(a.join("f"), "A").unwrap();
+    ok(&a, &["record"]);
+    fs::write(c.join("f"), "BB").unwrap();
+    ok(&c, &["record"]);
+    e.sync(&a, "origin");
+    let log0 = fs::read(c.join(".hub/ops.log")).unwrap();
+    let o = hub_env(&c, &["sync", "--json"], &e.env());
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(!o.status.success(), "copy sync must fail: {out} {err}");
+    assert!(err.contains("duplicate-replica"), "{err}");
+    assert!(err.contains("reid"), "{err}");
+    assert_eq!(fs::read(c.join(".hub/ops.log")).unwrap(), log0);
+    let w = ok(&c, &["warnings"]);
+    assert!(w.contains("equivocation"), "{w}");
+    assert!(w.contains("duplicate-replica"), "{w}");
+    // Later syncs stay refused until reid (D-022), so nothing merges.
+    let again = fail_env(&c, &["sync"], &e.env());
+    assert!(again.contains("duplicate-replica"), "{again}");
+    // The server and the original are untouched by the copy.
+    assert_eq!(head(&a), head(&srv));
+    // After reid (D-024: the diverged op stays), the divergence is a known,
+    // listed warning: sync works and the warning is still shown.
+    ok(&c, &["reid"]);
+    // The push half then lets the server find the same divergence on its
+    // own (op-level evidence from the copy's answer): it records it and
+    // stops that session once; the next session goes through.
+    let srv_w = fail_env(&c, &["sync"], &e.env());
+    assert!(srv_w.contains("remote: sync aborted"), "{srv_w}");
+    assert!(ok(&srv, &["warnings"]).contains("equivocation"));
+    // From then on the session completes; the server keeps rejecting the
+    // copy's diverged op, so `sync` exits 3 (D-045) and says so: visible,
+    // never silent.
+    let o = hub_env(&c, &["sync"], &e.env());
+    assert_eq!(o.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("(equivocation)"));
+    assert!(ok(&c, &["warnings"]).contains("equivocation"));
+}
+
+#[test]
+fn diverged_copy_detected_over_ssh() {
+    diverge_repro("ssh");
+}
+
+#[test]
+fn diverged_copy_detected_over_file() {
+    diverge_repro("file");
+}

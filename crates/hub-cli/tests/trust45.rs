@@ -621,3 +621,46 @@ fn watch_no_sync_contacts_nothing() {
     let _ = w.wait();
     assert_eq!(e.contacts(), 0);
 }
+
+/// Issue #46: a crash between the trust-store rename and the legacy macOS
+/// unlink (stage `trust-moved`, after the directory fsync) loses no entry:
+/// the new store already holds the legacy entries plus the new one, the
+/// legacy file is still there, and a rerun finishes the move.
+#[test]
+fn trust_move_crash_after_rename_loses_no_entry() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let e = Env::new("tmove");
+    let (a, _, _) = planted(&e);
+    let home = e.t.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mac = home.join("Library/Application Support/barocss-hub/trusted-remotes");
+    let dotcfg = home.join(".config/barocss-hub/trusted-remotes");
+    fs::create_dir_all(dotcfg.parent().unwrap()).unwrap();
+    let legacy =
+        "barocss-hub/trusted-remotes/v1\nT s/old/one sssh://h/x s\nT s/old/two sfile:///y s\n";
+    fs::write(&dotcfg, legacy).unwrap();
+    let run = |crash: bool| {
+        let mut c = e.cmd(&a, &["remote", "trust", "origin"]);
+        c.env_remove("BAROCSS_HUB_CONFIG_DIR")
+            .env_remove("XDG_CONFIG_HOME")
+            .env("HOME", &home);
+        if crash {
+            c.env("HUB_TEST_CRASH_STAGE", "trust-moved");
+        }
+        c.output().unwrap()
+    };
+    let o = run(true);
+    assert!(!o.status.success(), "the crash hook did not fire");
+    let new = fs::read_to_string(&mac).unwrap();
+    for l in legacy.lines().skip(1) {
+        assert!(new.contains(l), "lost {l}: {new}");
+    }
+    assert_eq!(new.lines().count(), 4, "{new}");
+    assert!(dotcfg.is_file(), "legacy removed before the crash point");
+    let o = run(false);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!dotcfg.exists());
+    assert_eq!(fs::read_to_string(&mac).unwrap(), new);
+}

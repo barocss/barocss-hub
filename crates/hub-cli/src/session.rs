@@ -37,6 +37,7 @@ use hub_core::tree::{BlobId, Op, OpId, ReplicaId};
 use hub_core::version::Version;
 use sha2::{Digest, Sha256};
 
+use crate::digest::Sums;
 use crate::store::{self, LockMode};
 use crate::sync::{self, Counts, Interrupt};
 use crate::wire::{self, groups, Conn, Frame, Hello};
@@ -81,6 +82,12 @@ pub struct Side {
     /// Ops received in the last persisted half that were rejected
     /// (equivocation, Lamport violation), with the reason (Issue #45).
     pub rejected_last: Vec<(OpId, String)>,
+    /// Feature `digest` negotiated (Issue #46).
+    pub digest: bool,
+    /// This half's digest localization found an op the peer holds with
+    /// another payload (Issue #46): persist stops the session if its
+    /// equivocation warning is new.
+    diverged: bool,
 }
 
 /// What a finished client session reports.
@@ -155,6 +162,16 @@ pub fn sweep_wire_files(bdir: &Path) {
     }
 }
 
+/// Ids per localization `Need` round (Issue #46).
+const LOCALIZE_ROUND: usize = 1024;
+
+fn equivocations(s: &SyncReplica) -> usize {
+    s.warnings()
+        .iter()
+        .filter(|w| w.reason == RejectReason::Equivocation)
+        .count()
+}
+
 fn dups(s: &SyncReplica) -> usize {
     s.warnings()
         .iter()
@@ -201,6 +218,8 @@ impl Side {
             blobs_sent: 0,
             got: Counts::default(),
             rejected_last: Vec::new(),
+            digest: false,
+            diverged: false,
         })
     }
 
@@ -242,6 +261,7 @@ impl Side {
         };
         let mut s = sync::load(repo)?;
         let d0 = dups(&s);
+        let e0 = equivocations(&s);
         let mut files: HashMap<BlobId, PathBuf> = HashMap::new();
         let mut ckpts: Vec<Checkpoint> = Vec::new();
         let mut received: Vec<Op> = Vec::new();
@@ -298,6 +318,15 @@ impl Side {
                 "received ops authored under our own replica id that we never authored",
             ));
         }
+        if std::mem::take(&mut self.diverged) && equivocations(&s) > e0 {
+            // Issue #46: new op-level evidence of divergence under one id.
+            sync::persist_warnings(repo, &s)?;
+            cleanup(&files);
+            return Err(dup_error(
+                "the remote holds an op with our op's id but different content (two \
+                 repositories share a replica id); nothing of this half was applied",
+            ));
+        }
         self.rejected_last = rejections(&s, &received);
         let mut n = self.appended.load(Ordering::SeqCst);
         let r = sync::persist_with(repo, &s, &files, &mut n, self.stop);
@@ -319,10 +348,41 @@ impl Side {
         let d = delta(
             self.sr.store(),
             &Have {
-                frontier,
+                frontier: frontier.clone(),
                 vv_hint: None,
             },
         );
+        if self.digest {
+            // Issue #46: the digest of K = downclose(F_A ∩ V_B) = V_B \ Δ.
+            let st = self.sr.store();
+            let resolved: Vec<OpId> = frontier
+                .iter()
+                .copied()
+                .filter(|f| st.contains_key(f))
+                .collect();
+            // Δ is a `<`-ordered subsequence of the store: a merge walk.
+            let k = if d.len() == st.len() {
+                Sums::default()
+            } else {
+                let mut di = d.iter().peekable();
+                let ops: Vec<&Op> = st
+                    .values()
+                    .filter(|o| {
+                        if di.peek().is_some_and(|x| x.id == o.id) {
+                            di.next();
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .collect();
+                Sums::par_of(&ops)
+            };
+            conn.send(&Frame::Sums {
+                resolved: (resolved.len() != frontier.len()).then_some(resolved),
+                sums: k.to_wire(),
+            })?;
+        }
         self.send_ops(conn, d)?;
         loop {
             match conn.recv(wire::step_timeout())? {
@@ -483,9 +543,15 @@ impl Side {
         let mut requested: BTreeSet<BlobId> = BTreeSet::new();
         let mut outstanding: BTreeMap<BlobId, u64> = BTreeMap::new();
         let mut retried: BTreeSet<BlobId> = BTreeSet::new();
+        let mine = self.sr.frontier();
         conn.send(&Frame::Have {
-            frontier: self.sr.frontier(),
+            frontier: mine.clone(),
         })?;
+        let suspects = if self.digest {
+            self.compare_sums(conn, &mine)?
+        } else {
+            Vec::new()
+        };
         let last = self.recv_ops(
             conn,
             peer,
@@ -514,8 +580,102 @@ impl Side {
             }
             self.recv_blobs(conn, peer, &mut log, &mut outstanding, &mut retried)?;
         }
+        if !suspects.is_empty() {
+            self.localize(
+                conn,
+                peer,
+                resume,
+                &mut log,
+                suspects,
+                &mut requested,
+                &mut outstanding,
+                &mut retried,
+            )?;
+        }
         conn.send(&Frame::Done("ops".into()))?;
         Ok(log)
+    }
+
+    /// Issue #46: read the answerer's `Sums` and compare with ours over
+    /// `downclose(resolved)`. Returns our ops of every mismatching author,
+    /// newest first (the localization candidates).
+    fn compare_sums(&self, conn: &mut Conn, mine: &[OpId]) -> Result<Vec<OpId>, Error> {
+        let (resolved, theirs) = loop {
+            match conn.recv(wire::step_timeout())? {
+                Frame::Sums { resolved, sums } => break (resolved, sums),
+                f => self.other(f)?,
+            }
+        };
+        let st = self.sr.store();
+        let known: Option<Version> = match resolved {
+            None => None,
+            Some(r) => {
+                if r.iter().any(|i| !mine.contains(i)) {
+                    return Err(perr("Sums names ids outside our frontier"));
+                }
+                Some(
+                    Version::downclose(st, r.iter().copied())
+                        .map_err(|_| perr("Sums names unresolvable ids"))?,
+                )
+            }
+        };
+        let inside = |id: &OpId| known.as_ref().is_none_or(|v| v.contains(*id));
+        let ops: Vec<&Op> = match &known {
+            None => st.values().collect(),
+            Some(v) if v.is_empty() => Vec::new(),
+            Some(_) => st.values().filter(|o| inside(&o.id)).collect(),
+        };
+        let ours = Sums::par_of(&ops);
+        let bad = ours.mismatch(&Sums::from_wire(&theirs));
+        if bad.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut c: Vec<OpId> = st
+            .keys()
+            .filter(|i| bad.contains(&i.replica) && inside(i))
+            .copied()
+            .collect();
+        c.reverse();
+        Ok(c)
+    }
+
+    /// Issue #46: ask for our suspect ids (newest first, in rounds) until
+    /// the peer sends one of them with another payload: op-level evidence
+    /// (R5) that the `Ops` replay turns into an equivocation warning.
+    #[allow(clippy::too_many_arguments)]
+    fn localize(
+        &mut self,
+        conn: &mut Conn,
+        peer: ReplicaId,
+        resume: bool,
+        log: &mut Vec<Recv>,
+        suspects: Vec<OpId>,
+        requested: &mut BTreeSet<BlobId>,
+        outstanding: &mut BTreeMap<BlobId, u64>,
+        retried: &mut BTreeSet<BlobId>,
+    ) -> Result<(), Error> {
+        let ours: BTreeMap<OpId, Op> = suspects
+            .iter()
+            .filter_map(|i| self.sr.store().get(i).map(|o| (*i, o.clone())))
+            .collect();
+        for g in suspects.chunks(LOCALIZE_ROUND) {
+            conn.send(&Frame::Need(g.to_vec()))?;
+            let n0 = log.len();
+            self.recv_ops(conn, peer, resume, log, requested, outstanding)?;
+            self.recv_blobs(conn, peer, log, outstanding, retried)?;
+            let hit = log[n0..].iter().any(|x| match x {
+                Recv::Ops(v) => v.iter().any(|o| ours.get(&o.id).is_some_and(|m| m != o)),
+                _ => false,
+            });
+            if hit {
+                self.diverged = true;
+                return Ok(());
+            }
+        }
+        Err(perr(
+            "the remote's digest differs from ours, but it sent no op that differs (buggy or \
+             lying peer); nothing was saved",
+        ))
     }
 
     /// Read `Ops` frames up to `done`; after each, request the blobs we lack.
@@ -872,6 +1032,13 @@ pub fn handshake(conn: &mut Conn, side: &Side) -> Result<Hello, Error> {
     Ok(h)
 }
 
+/// `handshake` plus the negotiated #46 digest feature.
+fn hello(conn: &mut Conn, side: &mut Side) -> Result<Hello, Error> {
+    let h = handshake(conn, side)?;
+    side.digest = h.has(wire::F_DIGEST);
+    Ok(h)
+}
+
 /// Send our error to the peer (unless it came from the peer) and return it.
 fn fail<T>(conn: &mut Conn, r: Result<T, Error>) -> Result<T, Error> {
     if let Err(e) = &r {
@@ -895,7 +1062,7 @@ pub fn client(conn: &mut Conn, side: &mut Side) -> Result<Report, Error> {
 }
 
 fn client_inner(conn: &mut Conn, side: &mut Side) -> Result<Report, Error> {
-    let h = handshake(conn, side)?;
+    let h = hello(conn, side)?;
     let peer = h.replica;
     let ro = h.has(wire::F_READ_ONLY);
     let resume = h.has("resume");
@@ -960,7 +1127,7 @@ pub fn server(conn: &mut Conn, side: &mut Side) -> Result<(), Error> {
 }
 
 fn server_inner(conn: &mut Conn, side: &mut Side) -> Result<(), Error> {
-    let h = handshake(conn, side)?;
+    let h = hello(conn, side)?;
     let peer = h.replica;
     let resume = h.has("resume");
     // Pull half: we answer.
@@ -1003,4 +1170,198 @@ pub fn pending_len(side: &Side) -> usize {
 fn _assert_send() {
     fn is_send<T: Send>() {}
     is_send::<Side>();
+}
+
+/// Issue #46 (Repository-Semantics 4.12 #27): random repositories, random
+/// copies of a `.hub/` (same replica id), random authoring (honest or
+/// violating the own chain), random `file://` syncs, some interrupted.
+/// After every completed sync, no OpId is held by both sides with two
+/// payloads unless one side has a warning naming it (never silent); with
+/// no copies, no sync fails and no warning exists (no false positive).
+#[cfg(test)]
+mod diverge46_tests {
+    use crate::sync::{self, Interrupt, INTERRUPTED};
+    use crate::{Code, Repo};
+    use hub_core::sync::RejectReason;
+    use hub_core::tree::{Kind, Payload, ROOT};
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn copy_dir(from: &Path, to: &Path) {
+        let _ = fs::remove_dir_all(to);
+        fs::create_dir_all(to).unwrap();
+        for e in fs::read_dir(from).unwrap().flatten() {
+            let t = to.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_dir(&e.path(), &t);
+            } else {
+                fs::copy(e.path(), &t).unwrap();
+            }
+        }
+    }
+
+    fn run(seed: u64, nsteps: usize, copies: bool) -> Result<usize, TestCaseError> {
+        let mut seen = 0;
+        let mut s = seed | 1;
+        let mut rnd = move |n: usize| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s % n.max(1) as u64) as usize
+        };
+        let base = std::env::temp_dir().join(format!(
+            "hub-d46-{}-{seed:x}-{nsteps}-{copies}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let roots: Vec<PathBuf> = (0..4).map(|i| base.join(format!("r{i}"))).collect();
+        for r in &roots {
+            fs::create_dir_all(r).unwrap();
+            Repo::init(r).unwrap();
+        }
+        let mut copied = false;
+        for step in 0..nsteps {
+            match rnd(if copies { 4 } else { 3 }) {
+                0 => {
+                    let i = rnd(4);
+                    let mut repo = Repo::discover(&roots[i]).unwrap();
+                    let p = Payload::Create {
+                        kind: Kind::File,
+                        parent: ROOT,
+                        name: format!("f{}", rnd(1000)),
+                    };
+                    let op = if rnd(4) == 0 {
+                        repo.prepare_on(BTreeSet::new(), p) // own-chain violation
+                    } else {
+                        repo.prepare(p)
+                    };
+                    repo.append_op(op).unwrap();
+                }
+                3 => {
+                    let (src, dst) = (rnd(3), 3);
+                    copy_dir(&roots[src], &roots[dst]);
+                    copied = true;
+                }
+                _ => {
+                    let a = rnd(4);
+                    let b = (a + 1 + rnd(3)) % 4;
+                    let stop = (rnd(4) == 0).then(|| Interrupt::Return(rnd(4)));
+                    let r = sync::sync_local(&roots[a], &roots[b], stop, &mut std::io::sink());
+                    if matches!(&r, Err(e) if e.0 == INTERRUPTED) {
+                        continue;
+                    }
+                    let (x, y) = (
+                        Repo::discover(&roots[a]).unwrap(),
+                        Repo::discover(&roots[b]).unwrap(),
+                    );
+                    let mut w = sync::read_warnings(&x.dir).unwrap();
+                    w.extend(sync::read_warnings(&y.dir).unwrap());
+                    if !copied {
+                        prop_assert!(
+                            r.is_ok(),
+                            "step {step}: honest sync failed: {:?}",
+                            r.err().map(|e| e.0)
+                        );
+                        prop_assert!(w.is_empty(), "step {step}: false positive {w:?}");
+                    }
+                    let split = x
+                        .store
+                        .iter()
+                        .filter(|(id, o)| y.store.get(id).is_some_and(|p| p != *o))
+                        .count();
+                    seen += split;
+                    match r {
+                        Ok(_) => {
+                            for (id, o) in &x.store {
+                                if let Some(p) = y.store.get(id) {
+                                    if p != o {
+                                        prop_assert!(
+                                            w.iter().any(|w| w.rejected == Some(*id)
+                                                && w.reason == RejectReason::Equivocation),
+                                            "step {step}: silent divergence at {id:?}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            prop_assert_eq!(
+                                e.code(),
+                                Code::DuplicateReplica,
+                                "step {}: {}",
+                                step,
+                                e.0
+                            );
+                            prop_assert!(
+                                x.replica_id == y.replica_id || !w.is_empty(),
+                                "step {step}: refused without a warning"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&base);
+        Ok(seen)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: crate::test_cases(48), ..ProptestConfig::default() })]
+
+        #[test]
+        fn same_id_copies_never_diverge_silently(seed in any::<u64>(), nsteps in 1usize..11) {
+            run(seed, nsteps, true)?;
+        }
+
+        #[test]
+        fn honest_histories_never_report_divergence(seed in any::<u64>(), nsteps in 1usize..11) {
+            run(seed, nsteps, false)?;
+        }
+    }
+
+    /// The property has teeth: random schedules do produce ids held with
+    /// two payloads by both sides of a completed sync (each then checked
+    /// as warned), and the fixed copy-then-server scenario is detected on
+    /// every seed.
+    #[test]
+    fn schedules_include_detected_divergence() {
+        let seen: usize = (0..40u64)
+            .map(|s| run(s * 7919 + 1, 13, true).unwrap())
+            .sum();
+        assert!(seen > 0, "no generated schedule diverged");
+        for seed in 0..4 {
+            assert!(detected(seed), "seed {seed}");
+        }
+    }
+
+    fn detected(seed: u64) -> bool {
+        // A deterministic scenario per seed: copy r0 to r1, author on both,
+        // sync both with r2 (the server), in a seed-chosen order.
+        let base = std::env::temp_dir().join(format!("hub-d46d-{}-{seed:x}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let r: Vec<PathBuf> = (0..3).map(|i| base.join(format!("r{i}"))).collect();
+        for d in &r {
+            fs::create_dir_all(d).unwrap();
+            Repo::init(d).unwrap();
+        }
+        copy_dir(&r[0], &r[1]);
+        for (i, d) in r.iter().take(2).enumerate() {
+            let mut repo = Repo::discover(d).unwrap();
+            repo.mint(Payload::Create {
+                kind: Kind::File,
+                parent: ROOT,
+                name: format!("x{i}{seed}"),
+            })
+            .unwrap();
+        }
+        let (p, q) = if seed % 2 == 0 { (0, 1) } else { (1, 0) };
+        sync::sync_local(&r[p], &r[2], None, &mut std::io::sink()).unwrap();
+        let second = sync::sync_local(&r[q], &r[2], None, &mut std::io::sink());
+        let w = sync::read_warnings(&Repo::discover(&r[q]).unwrap().dir).unwrap();
+        let _ = fs::remove_dir_all(&base);
+        matches!(second, Err(e) if e.code() == Code::DuplicateReplica)
+            && w.iter().any(|w| w.reason == RejectReason::Equivocation)
+    }
 }

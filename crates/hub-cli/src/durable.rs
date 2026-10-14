@@ -61,6 +61,10 @@ pub const FILES_BARRIERED: &str = "files-barriered";
 /// barriered, index not saved.
 pub const FILES_RENAMED: &str = "files-renamed";
 
+/// Trust store (#46): merged store renamed into place and its directory
+/// synced, the legacy macOS file not yet removed.
+pub const TRUST_MOVED: &str = "trust-moved";
+
 /// Abort if [`CRASH_STAGE_ENV`] names `stage` and this is its k-th hit.
 pub fn crash_point(stage: &str) {
     static HITS: AtomicUsize = AtomicUsize::new(0);
