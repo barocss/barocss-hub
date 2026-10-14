@@ -2,7 +2,7 @@
 
 import * as vscode from 'vscode';
 import { CliError, Checkpoint, WatchEvent } from './cli';
-import { explain, Action } from './errors';
+import { explain, watchNotice, Action, Explained } from './errors';
 import { RepoController } from './repo';
 import { BLOB_SCHEME, BlobProvider, ConflictItem, ConflictsProvider, HistoryProvider, conflictDiff, blobUri } from './views';
 
@@ -22,6 +22,12 @@ export interface Api {
   setGuardPrompt: (p: Prompt | undefined) => void;
   guardNotices: GuardNotice[];
   stopAll: () => Promise<void>;
+  /** Overrides vscode.workspace.isTrusted (tests); undefined restores it. */
+  setTrustOverride: (t: boolean | undefined) => void;
+  /** Notifications shown for watch events and Restricted Mode (Issue #45). */
+  notices: Explained[];
+  /** The `watch` arguments used for a repository right now. */
+  watchArgs: () => string[];
 }
 
 let controllers: RepoController[] = [];
@@ -45,6 +51,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
   );
 
   let guardPrompt: Prompt | undefined;
+  // Workspace Trust (Issue #45): a folder's remote configuration may come
+  // from anyone; auto-sync only in a trusted workspace.
+  let trustOverride: boolean | undefined;
+  const trusted = () => trustOverride ?? vscode.workspace.isTrusted;
+  const notices: Explained[] = [];
+  let restrictedSaid = false;
+  function notify(x: Explained) {
+    notices.push(x);
+    log.appendLine(x.message);
+    const show = x.severity === 'error' ? vscode.window.showErrorMessage : x.severity === 'warning' ? vscode.window.showWarningMessage : vscode.window.showInformationMessage;
+    void Promise.resolve(show(x.message, ...x.actions)).then(async (pick) => {
+      if (pick === 'Show Log') { log.show(); }
+      if (pick === 'Manage Workspace Trust') { await vscode.commands.executeCommand('workbench.trust.manage'); }
+    });
+  }
+  const watchArgs = () => [...(cfg().get<string[]>('watchArgs') ?? []), ...(trusted() ? [] : ['--no-sync'])];
   const guardNotices: GuardNotice[] = [];
   /** Saved text of each open document (what the editor believes is on disk). */
   const baseline = new Map<string, string>();
@@ -116,7 +138,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
   }
 
   async function startWatch(r: RepoController) {
-    try { await r.startWatch(cfg().get<string[]>('watchArgs') ?? []); } catch (e) { await showError(e, r); }
+    if (!trusted() && !restrictedSaid) {
+      restrictedSaid = true;
+      notify({ message: 'barocss-hub: Restricted Mode: the watcher records and applies changes locally but does not sync with remotes. Trust this workspace to enable sync.', actions: ['Manage Workspace Trust'], severity: 'info' });
+    }
+    try { await r.startWatch(watchArgs()); } catch (e) { await showError(e, r); }
   }
 
   // ---- unsaved-edit guard ------------------------------------------------------
@@ -160,7 +186,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
   // ---- controllers per workspace folder -----------------------------------------
   function wire(c: RepoController) {
     c.onDidChange(() => { render(); conflicts.fire(); history.fire(); });
-    c.onWatchEvent((ev) => { void guard(c, ev); if (ev.event === 'error') { log.appendLine(`watch error (${String(ev.stage)}): ${String(ev.message)}`); } });
+    c.onWatchEvent((ev) => {
+      void guard(c, ev);
+      if (ev.event === 'error') { log.appendLine(`watch error (${String(ev.stage)}): ${String(ev.message)}`); }
+      const n = watchNotice(ev);
+      if (n) { notify(n); }
+    });
   }
   async function syncFolders() {
     const folders = vscode.workspace.workspaceFolders ?? [];
@@ -182,6 +213,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
   let saveTimer: NodeJS.Timeout | undefined;
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(() => void syncFolders()),
+    // Trust granted: restart running watchers so they sync.
+    vscode.workspace.onDidGrantWorkspaceTrust(async () => {
+      restrictedSaid = false;
+      for (const c of controllers.filter((x) => x.watching)) { await c.stopWatch(); await startWatch(c); }
+    }),
     vscode.workspace.onDidOpenTextDocument(noteBaseline),
     vscode.workspace.onDidSaveTextDocument((d) => {
       noteBaseline(d);
@@ -268,6 +304,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
     setGuardPrompt: (p) => { guardPrompt = p; },
     guardNotices,
     stopAll,
+    setTrustOverride: (t) => { trustOverride = t; restrictedSaid = false; },
+    notices,
+    watchArgs,
   };
 }
 

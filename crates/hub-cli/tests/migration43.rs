@@ -27,6 +27,10 @@ fn tmp(tag: &str) -> PathBuf {
 
 fn run(bin: &str, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut c = Command::new(bin);
+    c.env("XDG_CONFIG_HOME", xdg()).env(
+        "BAROCSS_HUB_CONFIG_DIR",
+        std::path::Path::new(&xdg()).join("barocss-hub"),
+    );
     c.args(args).current_dir(dir);
     for (k, v) in env {
         c.env(k, v);
@@ -129,7 +133,10 @@ fn p23_crash_at_every_migration_step_then_rerun_is_exact_and_idempotent() {
         ok(&d, &["record"]);
         ok(&d, &["remote", "list"]);
         assert_eq!(hub_files(&d).get("remotes"), once.get("remotes"));
-        // The migrated file:// remotes work.
+        // The migrated file:// remotes work once confirmed (#45 repair:
+        // the migration grants no trust).
+        assert!(!run(BIN, &d, &["sync", "p1"], &[]).status.success());
+        ok(&d, &["sync", "--yes", "p1"]);
         ok(&d, &["sync", "p1"]);
     }
 }
@@ -239,4 +246,15 @@ fn peers_written_after_migration_are_merged_not_lost() {
         l.contains(&format!("local-3\tfile://{}", clash.display())),
         "{l}"
     );
+}
+
+/// Issue #45: a private trusted-remotes store per test process.
+fn xdg() -> String {
+    static D: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    D.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("hub45-xdg-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_string_lossy().into_owned()
+    })
+    .clone()
 }

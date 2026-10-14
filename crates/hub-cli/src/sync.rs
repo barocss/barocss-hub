@@ -104,7 +104,7 @@ pub fn read_pending(dir: &Path) -> Result<Vec<(Op, PeerId)>, Error> {
         .collect()
 }
 
-fn reason_str(r: &RejectReason) -> &'static str {
+pub fn reason_str(r: &RejectReason) -> &'static str {
     match r {
         RejectReason::Equivocation => "equivocation",
         RejectReason::LamportViolation => "lamport-violation",
@@ -238,20 +238,66 @@ fn pending_support(
         .collect()
 }
 
-pub fn render_warning(w: &RejectWarning) -> String {
-    let mut s = format!(
-        "{} from peer {}",
-        reason_str(&w.reason),
-        &format!("{:032x}", w.peer.0)[..8]
-    );
-    if let Some(r) = w.rejected {
-        s.push_str(&format!(" op {}", store::fmt_id(r)));
+fn short_rid(r: hub_core::tree::ReplicaId) -> String {
+    format!("{:032x}", r.0)[..8].to_string()
+}
+
+/// The two sides of an equivocation (`kept`, `received`), from a detail
+/// written by #45 or later (`None` for older, `Debug`-formatted details).
+pub fn equivocation_sides(w: &RejectWarning) -> Option<(&str, &str)> {
+    if w.reason != RejectReason::Equivocation {
+        return None;
     }
-    s.push_str(&format!(": {}", w.detail));
+    let (k, r) = w.detail.split_once('\n')?;
+    Some((k.strip_prefix("kept: ")?, r.strip_prefix("received: ")?))
+}
+
+/// What the user should do about a warning (Issue #45).
+pub fn warning_action(w: &RejectWarning) -> &'static str {
+    match w.reason {
+        RejectReason::Equivocation => {
+            "two repositories share a replica id (a copied .hub/): run `barocss-hub reid` in the copy, then redo the dropped change there"
+        }
+        RejectReason::LamportViolation => {
+            "the op was not made by a correct barocss-hub; ask the author to upgrade, and redo the change"
+        }
+        RejectReason::CorruptBlob => "sync again; the blob is fetched again from a peer with a good copy",
+        RejectReason::DuplicateReplica => "run `barocss-hub reid` in one of the two repositories",
+    }
+}
+
+/// One warning as a human sentence (who, which op, what differs, what to
+/// do). Issue #45: no Rust `Debug` text.
+pub fn render_warning(w: &RejectWarning) -> String {
+    let peer = short_rid(w.peer);
+    let author = w.author.map(short_rid);
+    let op = w.rejected.map(store::fmt_id);
+    let mut s = match (&w.reason, equivocation_sides(w)) {
+        (RejectReason::Equivocation, Some((k, r))) => format!(
+            "equivocation: replica {} used op id {} for two different changes (received from peer {peer}); this repository kept: {k}; it dropped: {r}",
+            author.as_deref().unwrap_or("?"),
+            op.as_deref().unwrap_or("?"),
+        ),
+        (RejectReason::LamportViolation, _) => format!(
+            "lamport-violation: op {} by replica {} (received from peer {peer}) was rejected: {}",
+            op.as_deref().unwrap_or("?"),
+            author.as_deref().unwrap_or("?"),
+            w.detail
+        ),
+        _ => {
+            let mut s = format!("{} from peer {peer}", reason_str(&w.reason));
+            if let Some(r) = &op {
+                s.push_str(&format!(" op {r}"));
+            }
+            s.push_str(&format!(": {}", w.detail.replace('\n', "; ")));
+            s
+        }
+    };
     if !w.stuck.is_empty() {
         let v: Vec<String> = w.stuck.iter().map(|o| store::fmt_id(*o)).collect();
         s.push_str(&format!("; stuck: {}", v.join(", ")));
     }
+    s.push_str(&format!(". What to do: {}", warning_action(w)));
     s
 }
 
@@ -442,7 +488,7 @@ pub fn sync_cmd(
     out: &mut dyn Write,
     warn: &mut dyn Write,
 ) -> Result<(), Error> {
-    crate::remote::sync_cmd(cwd, Some(peer_arg), out, warn)
+    crate::remote::sync_cmd(cwd, Some(peer_arg), false, out, warn)
 }
 
 /// The test crash hook from the environment ([`CRASH_ENV`]).
@@ -479,6 +525,28 @@ pub struct Synced {
     pub behind_note: bool,
 }
 
+/// What a rejection reason means for the author, and what to do.
+pub fn rejected_message(reason: &str) -> &'static str {
+    match reason {
+        "equivocation" => "the remote already has a different op with this id (another repository shares this replica id, probably a copied .hub/); run `barocss-hub reid` here, then redo the change",
+        "lamport-violation" => "its deps are not older than the op (not made by a correct barocss-hub); redo the change with an up-to-date barocss-hub",
+        _ => "rejected by the remote",
+    }
+}
+
+/// One human line per op the remote rejected (Issue #45).
+pub fn rejected_lines(rej: &[(hub_core::tree::OpId, String)]) -> Vec<String> {
+    rej.iter()
+        .map(|(id, why)| {
+            format!(
+                "the remote rejected your op {} ({why}): {}",
+                store::fmt_id(*id),
+                rejected_message(why)
+            )
+        })
+        .collect()
+}
+
 /// Print a [`Synced`] the way `hub sync` always has.
 pub fn print_report(r: &Synced, out: &mut dyn Write, warn: &mut dyn Write) -> Result<(), Error> {
     let (got, sent) = (r.report.received, r.report.sent);
@@ -510,6 +578,12 @@ pub fn print_report(r: &Synced, out: &mut dyn Write, warn: &mut dyn Write) -> Re
                 "warning: {name}: {n} op(s) pending (missing deps); retried on the next sync, see `barocss-hub warnings`"
             )?;
         }
+    }
+    if !r.report.rejected.is_empty() {
+        crate::note_rejected();
+    }
+    for l in rejected_lines(&r.report.rejected) {
+        writeln!(warn, "warning: {l}")?;
     }
     if r.warnings > 0 {
         writeln!(

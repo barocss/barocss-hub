@@ -13,6 +13,7 @@ pub mod session;
 pub mod snapshot;
 pub mod store;
 pub mod sync;
+pub mod trust;
 pub mod watch;
 pub mod wd;
 pub mod wire;
@@ -98,6 +99,10 @@ pub enum Code {
     Forbidden,
     /// The command needs a working directory; this is a bare repository.
     Bare,
+    /// First contact with an ssh remote this user never added or confirmed
+    /// on this machine, without a terminal to ask and without `--yes`
+    /// (Issue #45).
+    UntrustedRemote,
     /// Anything else.
     Error,
 }
@@ -132,6 +137,7 @@ impl Code {
         Code::Unsupported,
         Code::Forbidden,
         Code::Bare,
+        Code::UntrustedRemote,
         Code::Error,
     ];
     pub fn as_str(self) -> &'static str {
@@ -164,6 +170,7 @@ impl Code {
             Code::Unsupported => "unsupported",
             Code::Forbidden => "forbidden",
             Code::Bare => "bare",
+            Code::UntrustedRemote => "untrusted-remote",
             Code::Error => "error",
         }
     }
@@ -1675,20 +1682,27 @@ Commands:
   show [-l] <short-id> print the tree of a version (hex prefix, >= 4 digits)
   cat <short-id> <path>  write a file's bytes in that version to stdout
   cat-blob <blob-id>   write a stored blob's bytes (64 hex digits) to stdout
-  sync [<remote|url>]  exchange ops, blobs and published checkpoints with a remote
+  sync [--yes] [<remote|url>]  exchange ops, blobs and published checkpoints with a remote
                        (name from `remote list`, ssh://host/path, host:path,
                        file:///path or a local path; default: the default remote);
-                       log only: run `barocss-hub checkout` afterwards
-  remote add [--default] [--exec <path>] [<name>] <url> | list | rm <name> | set-url <name> <url>
-                       manage remotes (.hub/remotes, local config, not replicated)
+                       log only: run `barocss-hub checkout` afterwards. A configured
+                       remote you never added or trusted from this repo asks first
+                       (--yes: trust it; no terminal: refused, untrusted-remote)
+  remote add [--default] [--exec <path>] [<name>] <url> | list | rm <name> | set-url <name> <url> | trust <name>
+                       manage remotes (.hub/remotes, local config, not replicated);
+                       --exec: one word of [A-Za-z0-9._/~+-]; trust: mark a
+                       remote as used from this repository on this machine
+                       (macOS: ~/Library/Application Support/barocss-hub;
+                       else $XDG_CONFIG_HOME or ~/.config/barocss-hub)
   serve --stdio [--read-only] [--root <dir>] <path>
                        speak the sync protocol on stdin/stdout for one repository
                        (the remote end of ssh; see --from-ssh-original-command)
   publish <short-id|message>  mark a local checkpoint published (sync sends it)
   peer                 removed: use `barocss-hub remote add <name> file:///path`
-  watch [--poll <ms>] [--debounce <ms>] [--sync <ms>]
+  watch [--poll <ms>] [--debounce <ms>] [--sync <ms>] [--no-sync]
                        foreground: auto-record working-directory changes,
                        sync with every remote, apply incoming ops; Ctrl-C stops
+                       (untrusted remotes are skipped; --no-sync: local only)
   warnings             list sync warnings (D-008) and pending ops
   reid                 give this repo a fresh replica id (after copying a .hub/;
                        run it BEFORE recording in the copy); clears saved
@@ -1697,7 +1711,8 @@ Commands:
   --version, -V        print the version
 
 --json (any command): one JSON document on stdout (schema 1; `watch --json`:
-JSON Lines events); errors as JSON on stderr, exit status 1.
+JSON Lines events); errors as JSON on stderr, exit status 1. Exit status 3: `sync` finished but
+the remote rejected some of this repository's ops (see the warnings).
 ";
 
 /// Every dispatchable command name. `run` rejects any other first word, and
@@ -1822,16 +1837,23 @@ pub fn run(
         return watch::watch_cmd(cwd, opts, out, warn);
     }
     if a[0] == "sync" {
-        let arg = match a.as_slice() {
-            ["sync"] => None,
-            ["sync", p] => Some(*p),
+        let yes = a.iter().any(|x| matches!(*x, "--yes" | "-y"));
+        let rest: Vec<&str> = a[1..]
+            .iter()
+            .copied()
+            .filter(|x| !matches!(*x, "--yes" | "-y"))
+            .collect();
+        let arg = match rest.as_slice() {
+            [] => None,
+            [p] => Some(*p),
             _ => return Err(usage("sync")),
         };
         if json {
-            let r = remote::sync(cwd, arg, true, warn)?;
+            let mode = remote::cli_trust_mode(yes, true);
+            let r = remote::sync(cwd, arg, true, mode, warn)?;
             return json::emit(out, json::sync_doc(&r, warn)?);
         }
-        return remote::sync_cmd(cwd, arg, out, warn);
+        return remote::sync_cmd(cwd, arg, yes, out, warn);
     }
     // Mutating commands hold an exclusive lock from replay to append (and,
     // for record/checkout, across the working-directory update and index
@@ -2292,6 +2314,18 @@ pub fn run(
 /// `--json` error documents.
 pub const PROGRAM: &str = "barocss-hub";
 
+thread_local! {
+    /// Set when a `sync` report lists ops the remote rejected (D-045);
+    /// read and cleared by [`main_with`].
+    static REJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A `sync` report carried rejected ops: the process exits
+/// [`json::EXIT_REJECTED`] instead of 0 (D-045). `watch` never calls this.
+pub(crate) fn note_rejected() {
+    REJECTED.with(|c| c.set(true));
+}
+
 /// The whole process behaviour of `barocss-hub` (Issue #37): run `args`,
 /// print errors, return the exit status (see [`json`] for the exit codes).
 ///
@@ -2301,9 +2335,17 @@ pub const PROGRAM: &str = "barocss-hub";
 /// nothing on `out` and one JSON error document on `err`. `watch --json`
 /// streams events on `out` as it runs.
 pub fn main_with(args: &[String], cwd: &Path, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    REJECTED.with(|c| c.set(false));
+    let ok = || {
+        if REJECTED.with(|c| c.replace(false)) {
+            json::EXIT_REJECTED
+        } else {
+            0
+        }
+    };
     if !args.iter().any(|x| x == json::FLAG) {
         return match run(args, cwd, out, err) {
-            Ok(()) => 0,
+            Ok(()) => ok(),
             Err(e) if e.is_broken_pipe() => 0,
             Err(e) => {
                 let _ = writeln!(err, "{PROGRAM}: {e}");
@@ -2324,7 +2366,7 @@ pub fn main_with(args: &[String], cwd: &Path, out: &mut dyn Write, err: &mut dyn
             if !streaming {
                 let _ = out.write_all(&json::with_warnings(&doc, &warnings));
             }
-            0
+            ok()
         }
         Err(e) if e.is_broken_pipe() => 0,
         Err(e) => {

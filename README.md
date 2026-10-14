@@ -40,6 +40,37 @@ branches exist, the way out is:
 
 The refusal message prints the same steps.
 
+## Exit status (D-045, Issue #45)
+
+| Status | Meaning |
+|---|---|
+| 0 | success |
+| 1 | any command error (`--json`: one error document on stderr) |
+| 2 | the current directory cannot be read |
+| 3 | `sync` finished, but the remote rejected some of this repository's ops |
+
+On status 3 the normal report is still printed (human: one `warning: the
+remote rejected your op ...` line per op; `--json`: the full `sync` document
+with a non-empty `rejected` array). Scripts should treat it as "synced,
+action needed". `watch` and the VS Code extension never exit on it: they
+emit a `rejected` event or notification and keep running, without backoff.
+Full contract: Wiki page CLI-JSON.
+
+## Trusted remotes store (D-046, Issue #45)
+
+First contact with a remote that came with a folder's `.hub/remotes`
+(ssh or `file://`) needs confirmation; confirmations are kept per user, per
+local repository:
+
+- macOS: `~/Library/Application Support/barocss-hub/trusted-remotes`
+  (`XDG_CONFIG_HOME` is not consulted). An existing pre-D-046
+  `~/.config/barocss-hub/trusted-remotes` (or under `$XDG_CONFIG_HOME`) is
+  still read and is moved into the new store on the next write.
+- Linux and other Unixes: `$XDG_CONFIG_HOME/barocss-hub/trusted-remotes`
+  when `XDG_CONFIG_HOME` is absolute, else `~/.config/barocss-hub/trusted-remotes`.
+- `BAROCSS_HUB_CONFIG_DIR` (absolute) overrides the directory on every
+  platform (used by the tests).
+
 ## Property-test seeds
 
 `crates/hub-cli/tests/sync_prop.rs` runs with a pinned deterministic seed by

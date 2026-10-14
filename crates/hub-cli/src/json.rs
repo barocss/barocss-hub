@@ -17,7 +17,10 @@
 //!   (a [`crate::Code`], chosen where the error is constructed, never
 //!   derived from the text); `message` is the human text (not stable).
 //! - Exit status: 0 success, [`EXIT_ERROR`] (1) any command error,
-//!   [`EXIT_NO_CWD`] (2) the current directory cannot be read.
+//!   [`EXIT_NO_CWD`] (2) the current directory cannot be read,
+//!   [`EXIT_REJECTED`] (3) `sync` completed but the remote rejected some
+//!   of this repository's ops (D-045; the full document is still written
+//!   on stdout, with `rejected` non-empty).
 //! - Ids: node and op ids as `"<counter>.<32 hex replica>"`, version ids
 //!   as `{"id": <64 hex>, "short": <display prefix>}`, blob ids as 64 hex.
 //!   Paths are root-relative with `/` separators; the root is `""`.
@@ -44,6 +47,9 @@ pub const SCHEMA: u64 = 1;
 pub const EXIT_ERROR: u8 = 1;
 /// Exit status when the current directory cannot be read.
 pub const EXIT_NO_CWD: u8 = 2;
+/// Exit status of a `sync` that completed while the remote rejected some
+/// of the client's ops (D-045). Output is the normal success output.
+pub const EXIT_REJECTED: u8 = 3;
 
 /// Commands with a structured `--json` document. Every other command's
 /// document is `{"schema","command","output":[<its human lines>],"warnings"}`.
@@ -480,12 +486,16 @@ fn sync_warnings(sw: &[hub_core::sync::RejectWarning]) -> J {
         sw.iter()
             .map(|w| {
                 let r = sync::render_warning(w);
+                let sides = sync::equivocation_sides(w);
                 J::obj(vec![
-                    ("reason", J::s(r.split(' ').next().unwrap_or(""))),
+                    ("reason", J::s(sync::reason_str(&w.reason))),
                     ("peer", rid(w.peer.0)),
                     ("author", J::opt(w.author.map(|a| rid(a.0)))),
                     ("op", J::opt(w.rejected.map(id))),
                     ("detail", J::s(&w.detail)),
+                    ("kept", J::opt(sides.map(|(k, _)| J::s(k)))),
+                    ("received", J::opt(sides.map(|(_, r)| J::s(r)))),
+                    ("action", J::s(sync::warning_action(w))),
                     ("stuck", J::Arr(w.stuck.iter().map(|o| id(*o)).collect())),
                     ("first_seen", J::n(w.first_seen)),
                     ("text", J::s(r)),
@@ -854,6 +864,21 @@ pub fn counts_j(c: &crate::sync::Counts) -> J {
     ])
 }
 
+/// Rejected ops as `[{"op","reason","message"}]` (Issue #45).
+pub fn rejected_j(rej: &[(hub_core::tree::OpId, String)]) -> J {
+    J::Arr(
+        rej.iter()
+            .map(|(o, why)| {
+                J::obj(vec![
+                    ("op", id(*o)),
+                    ("reason", J::s(why)),
+                    ("message", J::s(crate::sync::rejected_message(why))),
+                ])
+            })
+            .collect(),
+    )
+}
+
 /// `sync --json` (Issue #43): counts, `read_only`, head, and the human
 /// lines as `output`.
 pub fn sync_doc(r: &crate::sync::Synced, warn: &mut dyn Write) -> Result<J, Error> {
@@ -875,6 +900,8 @@ pub fn sync_doc(r: &crate::sync::Synced, warn: &mut dyn Write) -> Result<J, Erro
                 ]),
             ),
             ("pending_ops", J::n(r.pending)),
+            ("rejected", rejected_j(&r.report.rejected)),
+            ("rejected_reported", J::Bool(r.report.rejected_reported)),
             ("output", J::strs(text.lines().collect::<Vec<_>>())),
         ],
     ))

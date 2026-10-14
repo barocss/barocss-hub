@@ -490,7 +490,8 @@ fn pending_ops_persist_and_retry_warnings_name_peer_and_stuck() {
     sync(b, a);
     let w = ok(b, &["warnings"]);
     assert!(
-        w.contains(&format!("lamport-violation from peer {}", &peer[..8]))
+        w.contains("lamport-violation: op ")
+            && w.contains(&format!("(received from peer {})", &peer[..8]))
             && w.contains(&format!("stuck: 9.{peer}")),
         "{w}"
     );
