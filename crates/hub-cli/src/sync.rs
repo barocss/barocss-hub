@@ -715,7 +715,13 @@ pub fn sync_local(
     if interrupted(&rs) {
         return Err(rs.unwrap_err());
     }
-    let report = rc?;
+    // Review R1 (#46): when the far end stopped first with a real error
+    // (e.g. `duplicate-replica`), the near end may only have seen the
+    // closed pipe; the far end's error is the cause.
+    let report = match (rc, rs) {
+        (Err(e), Err(s)) if e.code() == Code::Io && s.code() != Code::Io => return Err(s),
+        (rc, _) => rc?,
+    };
     if let Some(p) = std::env::var_os(STATS_LOG_ENV) {
         let mut f = fs::OpenOptions::new().create(true).append(true).open(p)?;
         for (name, s) in [("this", &ca), ("peer", &cb)] {

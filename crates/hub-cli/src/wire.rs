@@ -739,6 +739,8 @@ pub struct Conn {
     pub bytes_in: Arc<AtomicUsize>,
     /// Session wall-time end (server, §5.2.5): reads never wait past it.
     pub deadline: Option<Instant>,
+    /// The peer's preamble was read (#46 R1: reading a late `Error`).
+    pub magic_seen: bool,
 }
 
 /// In-memory duplex pair (tests). The shared [`Cut`] can end both
@@ -777,6 +779,7 @@ impl Conn {
             theirs: Limits::default(),
             bytes_in: Arc::new(AtomicUsize::new(0)),
             deadline: None,
+            magic_seen: false,
         }
     }
 
@@ -870,6 +873,7 @@ impl Conn {
                  (not barocss-hub, or a login banner on stdout)",
             ));
         }
+        self.magic_seen = true;
         Ok(())
     }
 
