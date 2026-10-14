@@ -309,6 +309,21 @@ pub(crate) fn test_cases(default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+/// [`test_cases`] capped at `max` (Issue #50 gate-time proposal, for
+/// Review): the #46 divergence properties cost ~0.45 s per case, so at
+/// `PROPTEST_CASES=512` they add ~460 s of work to the merge gate. The
+/// cap keeps the gate at `max` cases; `HUB_TEST_FULL_PROPTEST=1` lifts it
+/// for a separate deep job.
+#[cfg(test)]
+pub(crate) fn test_cases_capped(default: u32, max: u32) -> u32 {
+    let n = test_cases(default);
+    if std::env::var_os("HUB_TEST_FULL_PROPTEST").is_some() {
+        n
+    } else {
+        n.min(max)
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test-only switch (Issue #32): run every command on the pre-#32 paths
