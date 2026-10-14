@@ -56,6 +56,17 @@ action needed". `watch` and the VS Code extension never exit on it: they
 emit a `rejected` event or notification and keep running, without backoff.
 Full contract: Wiki page CLI-JSON.
 
+Each rejection is reported once per remote (D-050, Issue #50): this
+repository remembers, in its local `.hub/reported-rejections`, every
+rejection it has shown (remote, op, payload hash, reason). A later sync
+whose rejections are all already reported exits 0 with no warning (`--json`
+still lists them in `rejected` with `"already_reported": true`); any new
+one exits 3 again, and `watch` emits events only for new ones.
+`duplicate-replica` is never suppressed, and the D-008 equivocation and
+duplicate-replica warnings are unaffected. `barocss-hub warnings` lists the
+remembered rejections; `barocss-hub warnings --clear-reported [<remote>]`
+forgets them (all, or one remote's) so they are reported again.
+
 ## Trusted remotes store (D-046, Issue #45)
 
 First contact with a remote that came with a folder's `.hub/remotes`

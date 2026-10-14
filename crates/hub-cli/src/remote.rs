@@ -711,7 +711,36 @@ pub fn trust_key(r: &Remote, hub: &Path) -> Result<crate::trust::TrustKey, Error
 
 /// `file://` targets are keyed by their canonical path (symlinks resolved;
 /// a missing target keeps the literal path, and sync fails on it anyway).
-fn key_of(url: &Url, exec: Option<&str>, hub: &Path) -> crate::trust::TrustKey {
+/// `warnings --clear-reported [<remote>]` (Issue #50): forget the
+/// remembered rejections of every remote, or of one remote (a configured
+/// name, or a URL/path as `sync` takes it).
+pub fn clear_reported(cwd: &Path, remote: Option<&str>) -> Result<usize, Error> {
+    let hub = fs::canonicalize(find_hub(cwd)?)?;
+    let key = match remote {
+        None => None,
+        Some(r) => {
+            let res = resolve(cwd, Some(r))?;
+            Some(match &res.url {
+                Url::File(p) => match fs::canonicalize(p).ok().and_then(|p| find_hub(&p).ok()) {
+                    Some(h) => file_key(&fs::canonicalize(h)?, &hub),
+                    None => key_of(&res.url, None, &hub),
+                },
+                Url::Ssh { .. } => key_of(&res.url, res.exec.as_deref(), &hub),
+            })
+        }
+    };
+    crate::reported::forget(&hub, false, |e| key.as_ref().is_none_or(|k| e.key == *k))
+}
+
+/// The trust key of a `file://` remote whose canonical `.hub/` is
+/// `theirs`, used from canonical `.hub/` `mine` (the #50 memory key).
+pub(crate) fn file_key(theirs: &Path, mine: &Path) -> crate::trust::TrustKey {
+    let root = theirs.parent().unwrap_or(theirs);
+    key_of(&Url::File(root.to_path_buf()), None, mine)
+}
+
+/// The trust key of `url`/`exec` used from `.hub/` `hub` (#45).
+pub(crate) fn key_of(url: &Url, exec: Option<&str>, hub: &Path) -> crate::trust::TrustKey {
     let local = fs::canonicalize(hub)
         .unwrap_or_else(|_| hub.to_path_buf())
         .to_string_lossy()
@@ -822,7 +851,8 @@ pub fn sync_cmd(
     warn: &mut dyn Write,
 ) -> Result<(), Error> {
     let r = sync(cwd, arg, !stdin_is_tty(), cli_trust_mode(yes, false), warn)?;
-    sync::print_report(&r, out, warn)
+    sync::print_report(&r, out, warn)?;
+    r.remember(warn)
 }
 
 fn is_tty(fd: i32) -> bool {
@@ -939,7 +969,9 @@ fn sync_ssh(
             return Err(Error::new(code, m));
         }
     };
-    sync::summarize(url_text(url), &side, report, None)
+    let hub = fs::canonicalize(find_hub(cwd)?)?;
+    let key = key_of(url, exec, &hub);
+    sync::summarize(url_text(url), &side, report, None, Some(key))
 }
 
 // ------------------------------------------------------------ serve
