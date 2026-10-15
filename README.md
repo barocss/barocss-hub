@@ -85,8 +85,19 @@ both copies changed keeps the copy's content at head and the server's in
 history. Every changed file is first backed up to
 `.hub/rescue/<timestamp>/files/`. Rescue is crash-safe (rerun it to finish;
 other commands refuse until then) and a rerun after success does nothing.
-With a default remote it then runs one sync to confirm (`--offline` skips
-it). The working directory must be at head (`barocss-hub checkout` first).
+Checkpoints (`record -m`, `commit -m`) that named the removed ops are kept
+in the rescue manifest and re-created as private checkpoints on the rescued
+version (same message and author); published ones are listed so you can
+re-publish them (nothing is published automatically). While a rescue is
+unfinished the repository's replica header is marked, so older barocss-hub
+binaries refuse it ("unsupported repository format") instead of touching
+it. With a default remote it then runs one sync to confirm (`--offline`
+skips it) and checks out the result if the working tree is unchanged since
+the rescue recorded it. The working directory must be at head
+(`barocss-hub checkout` first). Known limit: a third repository that built
+on the copy's rejected ops keeps those ops; after the rescue it can show a
+name collision (`g` / `g~…`) and stays diverged on the shared id (a
+follow-up Issue tracks it).
 In VS Code, the duplicate-replica error offers "Rescue…", which shows the
 plan and asks before running it.
 

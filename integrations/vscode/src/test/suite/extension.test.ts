@@ -261,6 +261,41 @@ describe('barocss-hub extension (real CLI, temp repos)', function () {
     fs.rmSync(t, { recursive: true, force: true });
   });
 
+  it('Rescue… works while watch runs: stop, plan, confirm, rescue, restart (#49 R2)', async () => {
+    const repo = api.repos()[0];
+    if (repo.watching) { await vscode.commands.executeCommand('barocssHub.stopWatch'); }
+    try { hub(WS, 'checkout'); } catch { /* already at head */ }
+    const t = fs.mkdtempSync(path.join(os.tmpdir(), 'hub49-vscw-'));
+    hub(t, 'init', '--bare', 'srv');
+    const url = `file://${fs.realpathSync(path.join(t, 'srv'))}`;
+    hub(WS, 'remote', 'add', '--default', 'rsrv', url);
+    try {
+      write(WS, 'resc.txt', 'base\n'); hub(WS, 'record'); hub(WS, 'sync', 'rsrv');
+      const o = path.join(t, 'o');
+      fs.cpSync(WS, o, { recursive: true });
+      hub(o, 'remote', 'trust', 'rsrv');
+      write(o, 'resc.txt', 'O'); hub(o, 'record'); hub(o, 'sync', 'rsrv');
+      write(WS, 'resc.txt', 'W'); hub(WS, 'record');
+      assert.notStrictEqual(spawnSync(BIN, ['sync', 'rsrv'], { cwd: WS }).status, 0);
+      await vscode.commands.executeCommand('barocssHub.startWatch');
+      await waitFor('watching', () => repo.watching);
+      let planned = false;
+      const res = (await api.rescue(WS, async (p) => { planned = !repo.watching && p.rescue.length > 0; return true; }))!;
+      assert.ok(planned, 'the plan was shown with the watcher stopped');
+      assert.strictEqual(res.noop, false);
+      await waitFor('watch restarted', () => repo.watching);
+      assert.strictEqual(spawnSync(BIN, ['sync', 'rsrv'], { cwd: WS }).status, 0);
+      assert.strictEqual(hub(WS, 'cat', hub(WS, 'status').split('\n')[0].split(' ')[1], 'resc.txt'), 'W');
+      // Cancel also restarts the watcher (nothing to rescue now: no-op).
+      await api.rescue(WS, async () => false);
+      await waitFor('watch still running', () => repo.watching);
+    } finally {
+      await vscode.commands.executeCommand('barocssHub.stopWatch');
+      hub(WS, 'remote', 'rm', 'rsrv');
+      fs.rmSync(t, { recursive: true, force: true });
+    }
+  });
+
   it('deactivate-style stop leaves no watch process', async () => {
     await vscode.commands.executeCommand('barocssHub.startWatch');
     const pid = api.repos()[0].watch!.pid!;

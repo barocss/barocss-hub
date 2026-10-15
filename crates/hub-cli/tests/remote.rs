@@ -963,11 +963,22 @@ fn rescue_crash_at_every_stage_then_rerun() {
         let (e, srv, _a, c) = diverged(&format!("res49-crash-{stage}"), "file", |c| {
             fs::rename(c.join("h"), c.join("h2")).unwrap();
         });
+        ok(&c, &["commit", "-m", "kept msg"]);
         let mut env = e.env();
         env.push(("HUB_TEST_CRASH_STAGE", stage));
         let o = hub_env(&c, &["reid", "--rescue", "--offline"], &env);
         assert!(!o.status.success(), "{stage}: no crash");
         if c.join(".hub/rescue/current").exists() {
+            // R3: the replica-header marker is set whenever a rescue is
+            // in progress.
+            // (After `rescue-unmark` every change is done; only `current`
+            // is left.)
+            if *stage != "rescue-unmark" {
+                assert!(
+                    hub_cli::rescue::marked(&c.join(".hub")),
+                    "{stage}: no marker"
+                );
+            }
             let err = fail_env(&c, &["record"], &e.env());
             assert!(err.contains("reid --rescue"), "{stage}: {err}");
             let err = fail_env(&c, &["sync"], &e.env());
@@ -977,6 +988,12 @@ fn rescue_crash_at_every_stage_then_rerun() {
         let out = ok_env(&c, &["reid", "--rescue", "--offline"], &e.env());
         assert!(!out.contains("nothing to rescue"), "{stage}: {out}");
         assert!(!c.join(".hub/rescue/current").exists());
+        assert!(
+            !hub_cli::rescue::marked(&c.join(".hub")),
+            "{stage}: marker left"
+        );
+        // R1: the checkpoint naming a rescued op is re-created.
+        assert!(ok(&c, &["log"]).contains("kept msg"), "{stage}");
         let o = hub_env(&c, &["sync"], &e.env());
         assert_eq!(
             o.status.code(),
@@ -990,4 +1007,200 @@ fn rescue_crash_at_every_stage_then_rerun() {
         assert!(!t.contains_key("h"), "{stage}");
         let _ = fs::remove_dir_all(&e.t);
     }
+}
+
+/// R1 repair: checkpoints (private and published) that name rescued ops are
+/// listed in the plan, kept in the manifest, and re-created as private
+/// checkpoints on the rescued head.
+#[test]
+fn rescue_keeps_checkpoint_messages() {
+    let (e, _srv, _a, c) = diverged("res49-ck", "file", |_| {});
+    ok(&c, &["commit", "-m", "private checkpoint msg"]);
+    fs::write(c.join("f"), "BBB").unwrap();
+    ok(&c, &["record", "-m", "my important message"]);
+    ok(&c, &["publish", "my important message"]);
+    let dry = ok_env(&c, &["reid", "--rescue", "--dry-run"], &e.env());
+    assert!(dry.contains("checkpoint 'private checkpoint msg'"), "{dry}");
+    assert!(
+        dry.contains("checkpoint 'my important message' (published)"),
+        "{dry}"
+    );
+    let j = ok_env(&c, &["reid", "--rescue", "--dry-run", "--json"], &e.env());
+    assert!(
+        j.contains("\"checkpoints\":[{\"message\":\"private checkpoint msg\""),
+        "{j}"
+    );
+    let out = ok_env(&c, &["reid", "--rescue", "--offline"], &e.env());
+    assert!(out.contains("re-created checkpoint"), "{out}");
+    assert!(out.contains("re-publish"), "{out}");
+    let log = ok(&c, &["log"]);
+    assert!(log.contains("private checkpoint msg"), "{log}");
+    assert!(log.contains("my important message"), "{log}");
+    let b = backups(&c);
+    let man = String::from_utf8_lossy(&fs::read(b[0].join("manifest")).unwrap()).into_owned();
+    assert!(
+        man.contains("ckpt private") && man.contains("ckpt published"),
+        "{man}"
+    );
+    assert_eq!(fs::read(c.join("f")).unwrap(), b"BBB");
+    let o = hub_env(&c, &["sync"], &e.env());
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+/// Open #2 (decided): an online rescue checks out head when the working
+/// tree is unchanged since the rescue recorded it, and leaves it otherwise.
+#[test]
+fn rescue_online_checks_out_only_an_unchanged_tree() {
+    let (e, _srv, _a, c) = diverged("res49-co", "file", |_| {});
+    let out = ok_env(&c, &["reid", "--rescue"], &e.env());
+    assert!(out.contains("checked out head"), "{out}");
+    let st = ok_env(&c, &["status", "--json"], &e.env());
+    assert!(st.contains("\"state\":\"at-head\""), "{st}");
+    let (e, _srv, _a, c) = diverged("res49-co2", "file", |_| {});
+    let mut env = e.env();
+    env.push(("HUB_TEST_RESCUE_EDIT_AFTER_SYNC", "late"));
+    let j = ok_env(&c, &["reid", "--rescue", "--json"], &env);
+    assert!(j.contains("\"checkout\":{\"done\":false"), "{j}");
+    assert_eq!(
+        fs::read(c.join("late")).unwrap(),
+        b"edited after the rescue\n"
+    );
+    let out = String::from_utf8_lossy(&hub_env(&c, &["status"], &e.env()).stdout).into_owned();
+    assert!(out.contains("late"), "{out}");
+}
+
+/// R3 repair: with a pre-#49 binary (`HUB_TEST_OLD_BIN`, e.g. a develop
+/// 714faf0 release build), every command it has refuses a repository mid-
+/// rescue and leaves it byte-identical; after the rescue it works again.
+/// Skipped when the variable is unset.
+#[test]
+fn rescue_marker_stops_old_binaries() {
+    let Some(old) = std::env::var_os("HUB_TEST_OLD_BIN") else {
+        eprintln!("HUB_TEST_OLD_BIN unset: skipping");
+        return;
+    };
+    let old = PathBuf::from(old);
+    let (e, _srv, _a, c) = diverged("res49-old", "file", |_| {});
+    let mut env = e.env();
+    env.push(("HUB_TEST_CRASH_STAGE", "rescue-ops"));
+    assert!(!hub_env(&c, &["reid", "--rescue", "--offline"], &env)
+        .status
+        .success());
+    let before = all_bytes(&c);
+    let run_old = |a: &[&str]| {
+        Command::new(&old)
+            .args(a)
+            .current_dir(&c)
+            .env("XDG_CONFIG_HOME", cfg_home())
+            .env(
+                "BAROCSS_HUB_CONFIG_DIR",
+                Path::new(cfg_home()).join("barocss-hub"),
+            )
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    };
+    // Every command that opens the repository is refused, `.hub/` and the
+    // working tree byte-identical.
+    let cmds: &[&[&str]] = &[
+        &["status"],
+        &["ls"],
+        &["log"],
+        &["show", "head"],
+        &["warnings"],
+        &["record"],
+        &["record", "-m", "x"],
+        &["checkout"],
+        &["checkout", "--force"],
+        &["commit", "-m", "x"],
+        &["publish", "x"],
+        &["mkdir", "d"],
+        &["touch", "t"],
+        &["mv", "f", "f2"],
+        &["rm", "f"],
+        &["cat", "head", "f"],
+        &["sync"],
+        &["reid"],
+        &["init"],
+        &["serve", "--stdio", "."],
+    ];
+    for a in cmds {
+        let o = run_old(a);
+        assert!(
+            !o.status.success(),
+            "old {a:?} succeeded mid-rescue: {}",
+            String::from_utf8_lossy(&o.stdout)
+        );
+        assert_eq!(all_bytes(&c), before, "old {a:?} changed the repository");
+    }
+    // Config-only commands of 714faf0 never open the repository, so no
+    // marker can stop them (reported to Review): they touch only
+    // `.hub/remotes`, the reported-rejections memory and the user's trust
+    // store, none of which a rescue in progress reads. Everything else
+    // stays byte-identical.
+    let cfg_only: &[&[&str]] = &[
+        &["remote", "list"],
+        &["warnings", "--clear-reported"],
+        &["remote", "add", "o2", "file:///nowhere"],
+        &["remote", "set-url", "o2", "file:///x"],
+        &["remote", "rm", "o2"],
+        &["remote", "trust", "origin"],
+    ];
+    let core = |m: BTreeMap<PathBuf, Vec<u8>>| -> BTreeMap<PathBuf, Vec<u8>> {
+        m.into_iter()
+            .filter(|(p, _)| {
+                let n = p.file_name().unwrap().to_string_lossy();
+                !(n == "remotes" || n.starts_with(".remotes") || n.contains("reported-rejections"))
+            })
+            .collect()
+    };
+    let before_core = core(before.clone());
+    // 714faf0's `watch` keeps running but every step is refused ("auto-
+    // record: unsupported repository format"); stopped after 3 s, it has
+    // changed nothing but its own `watch.pid`.
+    let o = Command::new("timeout")
+        .args(["-s", "INT", "3"])
+        .arg(&old)
+        .args(["watch", "--no-sync"])
+        .current_dir(&c)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&o.stderr).contains("unsupported repository format"));
+    let nopid = |m: BTreeMap<PathBuf, Vec<u8>>| -> BTreeMap<PathBuf, Vec<u8>> {
+        m.into_iter()
+            .filter(|(p, _)| !p.ends_with("watch.pid"))
+            .collect()
+    };
+    assert_eq!(
+        nopid(all_bytes(&c)),
+        nopid(before.clone()),
+        "old watch changed the repository"
+    );
+    for a in cfg_only {
+        let _ = run_old(a);
+        assert_eq!(
+            core(all_bytes(&c)),
+            before_core,
+            "old {a:?} changed rescue state"
+        );
+    }
+    ok_env(&c, &["reid", "--rescue", "--offline"], &e.env());
+    let o = Command::new(&old)
+        .args(["status"])
+        .current_dir(&c)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = Command::new(&old)
+        .args(["record"])
+        .current_dir(&c)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 }

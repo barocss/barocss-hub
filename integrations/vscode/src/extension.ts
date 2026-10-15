@@ -3,7 +3,7 @@
 import * as vscode from 'vscode';
 import { CliError, Checkpoint, WatchEvent, run } from './cli';
 import { explain, watchNotice, rescueSummary, Action, Explained, RescuePlan } from './errors';
-import { RepoController } from './repo';
+import { RepoController, realpath } from './repo';
 import { BLOB_SCHEME, BlobProvider, ConflictItem, ConflictsProvider, HistoryProvider, conflictDiff, blobUri } from './views';
 
 type Prompt = (message: string, ...items: string[]) => Thenable<string | undefined>;
@@ -119,7 +119,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
       case 'Open Settings': await vscode.commands.executeCommand('workbench.action.openSettings', 'barocssHub.binaryPath'); break;
       case 'Stop Watch': if (r) { await r.stopWatch(); } break;
       case 'Show Log': log.show(); break;
-      case 'Rescue…': if (r) { await doRescue(r.cwd); await r.refresh(); } break;
+      case 'Rescue…': if (r) { await doRescue(r.cwd); } break;
       case 'Copy reid Command': await vscode.env.clipboard.writeText(`cd "${r?.status?.root ?? r?.cwd ?? ''}" && barocss-hub reid`); break;
     }
   }
@@ -132,12 +132,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
     return p?.r;
   }
 
-  /** CLI only (D-034): the plan comes from `reid --rescue --dry-run --json`. */
+  /**
+   * CLI only (D-034): the plan comes from `reid --rescue --dry-run --json`.
+   * Issue #49 R2: the folder's watcher is stopped first (the CLI refuses a
+   * rescue while watch runs) and restarted afterwards, also on cancel or
+   * error.
+   */
   async function doRescue(cwd: string, confirm?: (p: RescuePlan) => Promise<boolean>): Promise<Record<string, unknown> | undefined> {
+    const r = controllers.find((c) => realpath(c.cwd) === realpath(cwd));
+    const wasWatching = !!r?.watching;
     try {
+      if (wasWatching) { await r!.stopWatch(); }
       log.appendLine(`barocss-hub reid --rescue --dry-run --json (${cwd})`);
       const plan = await run<RescuePlan>(bin(), cwd, ['reid', '--rescue', '--dry-run']);
-      if (plan.noop) { vscode.window.showInformationMessage(`barocss-hub: ${rescueSummary(plan)}`); return undefined; }
+      if (plan.noop) { void vscode.window.showInformationMessage(`barocss-hub: ${rescueSummary(plan)}`); return undefined; }
       const ok = confirm
         ? await confirm(plan)
         : (await vscode.window.showWarningMessage('barocss-hub: rescue this copied repository?', { modal: true, detail: rescueSummary(plan) }, 'Rescue')) === 'Rescue';
@@ -146,7 +154,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
       const res = await run<Record<string, unknown>>(bin(), cwd, ['reid', '--rescue']);
       vscode.window.setStatusBarMessage(`barocss-hub: rescued; ${String(res.next ?? '')}`, 8000);
       return res;
-    } catch (e) { await showError(e); return undefined; }
+    } catch (e) { await showError(e, r); return undefined; } finally {
+      if (wasWatching && r && !r.watching) { await startWatch(r); }
+      if (r) { await r.refresh(); }
+    }
   }
 
   async function doCheckout(r: RepoController, force: boolean) {

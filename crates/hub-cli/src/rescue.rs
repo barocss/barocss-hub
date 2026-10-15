@@ -50,9 +50,24 @@ pub const C_INDEX: &str = "rescue-index";
 pub const C_RECORD: &str = "rescue-record";
 pub const C_WARNINGS: &str = "rescue-warnings";
 pub const C_DONE: &str = "rescue-done";
+pub const C_MARKED: &str = "rescue-marked";
+pub const C_CKPTS_RESTORED: &str = "rescue-ckpts-restored";
+pub const C_UNMARK: &str = "rescue-unmark";
 pub const STAGES: &[&str] = &[
-    C_BACKUP, C_MANIFEST, C_CKPTS, C_SNAPSHOT, C_OPS_TMP, C_OPS, C_REID, C_INDEX, C_RECORD,
-    C_WARNINGS, C_DONE,
+    C_BACKUP,
+    C_MANIFEST,
+    C_MARKED,
+    C_CKPTS,
+    C_SNAPSHOT,
+    C_OPS_TMP,
+    C_OPS,
+    C_REID,
+    C_INDEX,
+    C_RECORD,
+    C_CKPTS_RESTORED,
+    C_WARNINGS,
+    C_DONE,
+    C_UNMARK,
 ];
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -71,6 +86,9 @@ struct Manifest {
     ops: Vec<Op>,
     /// (change, path): working-tree files that differ from store minus R.
     files: Vec<(String, String)>,
+    /// Checkpoint records removed in stage 1 (R1 repair): (published, raw
+    /// `K` body), re-created as private checkpoints on the rescued head.
+    ckpts: Vec<(bool, String)>,
 }
 
 /// Whether a rescue is in progress in `.hub/` `hub`.
@@ -134,6 +152,10 @@ fn encode_manifest(m: &Manifest) -> String {
     for (c, p) in &m.files {
         s.push_str(&store::frame(&format!("file {c} {}", store::esc(p))));
     }
+    for (publ, b) in &m.ckpts {
+        let k = if *publ { "published" } else { "private" };
+        s.push_str(&store::frame(&format!("ckpt {k} {b}")));
+    }
     s
 }
 
@@ -152,6 +174,7 @@ fn read_manifest(path: &Path) -> Result<Manifest, Error> {
     let (mut old, mut new, mut floor) = (None, None, None);
     let mut ops = Vec::new();
     let mut files = Vec::new();
+    let mut ckpts = Vec::new();
     for b in &l.records {
         let (k, v) = b.split_once(' ').ok_or_else(|| bad("bad record".into()))?;
         match k {
@@ -163,6 +186,11 @@ fn read_manifest(path: &Path) -> Result<Manifest, Error> {
                 let (c, p) = v.split_once(' ').ok_or_else(|| bad("bad file".into()))?;
                 files.push((c.to_string(), store::unesc(p).map_err(bad)?));
             }
+            "ckpt" => {
+                let (k, body) = v.split_once(' ').ok_or_else(|| bad("bad ckpt".into()))?;
+                store::split_ckpt(body).map_err(bad)?;
+                ckpts.push((k == "published", body.to_string()));
+            }
             _ => return Err(bad(format!("unknown record '{k}'"))),
         }
     }
@@ -173,6 +201,7 @@ fn read_manifest(path: &Path) -> Result<Manifest, Error> {
             floor,
             ops,
             files,
+            ckpts,
         }),
         _ => Err(bad("incomplete manifest".into())),
     }
@@ -346,6 +375,42 @@ fn filter_ckpt_log(path: &Path, header: &str, r: &BTreeSet<OpId>) -> Result<usiz
     Ok(n)
 }
 
+/// The checkpoint records of `path` that name an op of `r`.
+fn ckpts_naming(path: &Path, header: &str, r: &BTreeSet<OpId>) -> Result<Vec<String>, Error> {
+    if !path.exists() || r.is_empty() {
+        return Ok(Vec::new());
+    }
+    let l = store::read_log(path, header)?;
+    Ok(l.records
+        .into_iter()
+        .filter(
+            |b| matches!(store::split_ckpt(b), Ok((ids, ..)) if ids.iter().any(|i| r.contains(i))),
+        )
+        .collect())
+}
+
+/// The replica header while a rescue is in progress (R3 repair, the #33
+/// technique): pre-#49 binaries refuse it ("unsupported repository
+/// format") before reading or writing anything else.
+fn set_replica(hub: &Path, rid: ReplicaId, rescuing: bool) -> Result<(), Error> {
+    let h = if rescuing {
+        store::REPLICA_HEADER_RESCUE
+    } else {
+        store::REPLICA_HEADER
+    };
+    let want = format!("{h}\n{}\n", rid_hex(rid));
+    if fs::read_to_string(hub.join("replica")).ok().as_deref() != Some(want.as_str()) {
+        write_durable(&hub.join("replica"), &want, None)?;
+    }
+    Ok(())
+}
+
+/// Whether the replica header carries the rescue marker.
+pub fn marked(hub: &Path) -> bool {
+    fs::read_to_string(hub.join("replica"))
+        .is_ok_and(|t| t.lines().next() == Some(store::REPLICA_HEADER_RESCUE))
+}
+
 /// Stages 1-4 on the raw files, under the exclusive lock.
 fn rewrite_stages(hub: &Path, m: &Manifest) -> Result<(), Error> {
     let _lock = RepoLock::acquire(hub, LockMode::Exclusive)
@@ -394,20 +459,15 @@ fn rewrite_stages(hub: &Path, m: &Manifest) -> Result<(), Error> {
     }
     durable::crash_point(C_OPS);
     // 4. The fresh replica id.
-    let (_, cur) = crate::migrate::read_replica(hub)?;
-    if cur != m.new.0 {
-        write_durable(
-            &hub.join("replica"),
-            &format!("{}\n{}\n", store::REPLICA_HEADER, rid_hex(m.new)),
-            None,
-        )?;
-    }
+    set_replica(hub, m.new, true)?;
     durable::crash_point(C_REID);
     Ok(())
 }
 
 struct Outcome {
     recorded: Vec<crate::ChangeInfo>,
+    /// Re-created checkpoints: (message, was published, short id).
+    restored: Vec<(String, bool, String)>,
     record_lines: Vec<String>,
 }
 
@@ -439,6 +499,34 @@ fn record_stages(
     let mut buf: Vec<u8> = Vec::new();
     let rec = crate::record(&mut repo, None, false, &mut buf, warn)?;
     durable::crash_point(C_RECORD);
+    // 5b. Re-create the removed checkpoints, private, on the rescued head
+    // (R1 repair). Idempotent: an identical checkpoint is not added twice.
+    let mut restored = Vec::new();
+    let mut seen: Vec<(String, ReplicaId, Option<String>)> = Vec::new();
+    for (publ, body) in &m.ckpts {
+        let (_, msg, author, note) =
+            store::split_ckpt(body).map_err(|w| Error::new(Code::Corrupt, w))?;
+        let note = Some(match note {
+            Some(n) => format!("{n}; rescued from replica {}", &rid_hex(m.old)[..8]),
+            None => format!("rescued from replica {}", &rid_hex(m.old)[..8]),
+        });
+        if seen.contains(&(msg.clone(), author, note.clone())) {
+            continue;
+        }
+        seen.push((msg.clone(), author, note.clone()));
+        let c = hub_core::checkpoint::Checkpoint::from_canonical(
+            repo.head_frontier(),
+            msg.clone(),
+            author,
+            note,
+        );
+        if !repo.checkpoints.iter().any(|x| *x == c) {
+            store::append_record(&repo.dir.join("checkpoints.log"), &store::encode_ckpt(&c))?;
+            repo.checkpoints.add(c.clone());
+        }
+        restored.push((msg, *publ, repo.index().short(&c.id())));
+    }
+    durable::crash_point(C_CKPTS_RESTORED);
     // 6. Clear the block and the resolved memory, then mark done.
     let r: BTreeSet<OpId> = m.ops.iter().map(|o| o.id).collect();
     sync::drop_warnings(&repo.dir, |w| {
@@ -450,10 +538,14 @@ fn record_stages(
     durable::crash_point(C_WARNINGS);
     write_durable(&dir.join(DONE), "done\n", None)?;
     durable::crash_point(C_DONE);
+    // The marker goes before `current`: a crash in between resumes.
+    set_replica(hub, m.new, false)?;
+    durable::crash_point(C_UNMARK);
     fs::remove_file(hub.join(DIR).join(CURRENT))?;
     dsync(&hub.join(DIR))?;
     Ok(Outcome {
         recorded: rec.map(|r| r.changes).unwrap_or_default(),
+        restored,
         record_lines: String::from_utf8_lossy(&buf)
             .lines()
             .map(str::to_string)
@@ -486,14 +578,32 @@ fn plan_j(m: &Manifest, dry: bool, backup: Option<&Path>) -> Vec<(&'static str, 
             "backup",
             J::opt(backup.map(|p| J::s(p.display().to_string()))),
         ),
+        ("checkpoints", ckpts_j(m)),
     ]
+}
+
+fn ckpts_j(m: &Manifest) -> J {
+    J::Arr(
+        m.ckpts
+            .iter()
+            .filter_map(|(publ, b)| {
+                let (_, msg, author, _) = store::split_ckpt(b).ok()?;
+                Some(J::obj(vec![
+                    ("message", J::s(msg)),
+                    ("author", J::s(rid_hex(author))),
+                    ("published", J::Bool(*publ)),
+                ]))
+            })
+            .collect(),
+    )
 }
 
 /// `barocss-hub reid --rescue [--dry-run] [--offline]`.
 pub fn cmd(cwd: &Path, opts: Opts, out: &mut dyn Write, warn: &mut dyn Write) -> Result<(), Error> {
     let hub = std::fs::canonicalize(sync::find_hub(cwd)?)?;
     remote::refuse_bare(&hub, "reid --rescue")?;
-    if let Some(pid) = watch::active_watch(&hub)? {
+    // A dry run is read-only under a shared lock: allowed while watch runs.
+    if let Some(pid) = watch::active_watch(&hub)?.filter(|_| !opts.dry_run) {
         return errc(
             Code::Blocked,
             format!("refusing to rescue while `barocss-hub watch` runs (pid {pid}); stop it first"),
@@ -516,6 +626,11 @@ pub fn cmd(cwd: &Path, opts: Opts, out: &mut dyn Write, warn: &mut dyn Write) ->
             (m, ts)
         }
         None => {
+            // A crash between setting the marker and writing `current`
+            // left only the marker (nothing else changed): clear it.
+            if !opts.dry_run && marked(&hub) {
+                set_replica(&hub, repo.replica_id, false)?;
+            }
             let r = rescue_set(&repo)?;
             let dup = has_dup_block(&repo)?;
             if r.is_empty() && !dup {
@@ -546,6 +661,18 @@ pub fn cmd(cwd: &Path, opts: Opts, out: &mut dyn Write, warn: &mut dyn Write) ->
             } else {
                 differing(&repo, &r)?
             };
+            let opsr: BTreeSet<OpId> = r.clone();
+            let private = ckpts_naming(&hub.join("checkpoints.log"), store::CKPT_HEADER, &opsr)?;
+            let publ = ckpts_naming(&hub.join("published.log"), sync::PUBLISHED_HEADER, &opsr)?;
+            let mut ckpts: Vec<(bool, String)> = private
+                .iter()
+                .map(|b| (publ.contains(b), b.clone()))
+                .collect();
+            for b in &publ {
+                if !private.contains(b) {
+                    ckpts.push((true, b.clone()));
+                }
+            }
             let mut new = core::new_replica_id();
             while new == repo.replica_id {
                 new = core::new_replica_id();
@@ -561,6 +688,7 @@ pub fn cmd(cwd: &Path, opts: Opts, out: &mut dyn Write, warn: &mut dyn Write) ->
                     .cloned()
                     .collect(),
                 files,
+                ckpts,
             };
             (m, now_ts())
         }
@@ -594,6 +722,12 @@ pub fn cmd(cwd: &Path, opts: Opts, out: &mut dyn Write, warn: &mut dyn Write) ->
         durable::crash_point(C_BACKUP);
         write_durable(&rdir.join(MANIFEST), &encode_manifest(&m), None)?;
         durable::crash_point(C_MANIFEST);
+    }
+    // The marker before `current` (and again on a resume): from here on a
+    // pre-#49 binary refuses the repository.
+    set_replica(&hub, repo.replica_id, true)?;
+    durable::crash_point(C_MARKED);
+    if !resumed {
         write_durable(&hub.join(DIR).join(CURRENT), &format!("{ts}\n"), None)?;
     }
     drop(repo);
@@ -606,6 +740,17 @@ pub fn cmd(cwd: &Path, opts: Opts, out: &mut dyn Write, warn: &mut dyn Write) ->
         for l in &o.record_lines {
             writeln!(out, "{l}")?;
         }
+        for (msg, publ, short) in &o.restored {
+            writeln!(
+                out,
+                "re-created checkpoint [{short}] {msg}{}",
+                if *publ {
+                    " (was published: re-publish it with `barocss-hub publish` if wanted)"
+                } else {
+                    ""
+                }
+            )?;
+        }
         writeln!(
             out,
             "rescued: replica id {} -> {}; the duplicate-replica block is cleared",
@@ -615,6 +760,7 @@ pub fn cmd(cwd: &Path, opts: Opts, out: &mut dyn Write, warn: &mut dyn Write) ->
     }
     // Online confirmation (Wiki 4.13 step 1).
     let mut sync_j = J::Null;
+    let mut checkout_j = J::Null;
     let mut next = "run `barocss-hub sync` to send the rescued edits".to_string();
     if !opts.offline && remote::resolve(cwd, None).is_ok() {
         let mut sbuf: Vec<u8> = Vec::new();
@@ -638,6 +784,7 @@ pub fn cmd(cwd: &Path, opts: Opts, out: &mut dyn Write, warn: &mut dyn Write) ->
                 if !opts.json {
                     out.write_all(&sbuf)?;
                 }
+                checkout_j = auto_checkout(&hub, out, warn, opts.json)?;
                 sync_j = J::obj(vec![
                     ("ok", J::Bool(true)),
                     (
@@ -674,11 +821,76 @@ pub fn cmd(cwd: &Path, opts: Opts, out: &mut dyn Write, warn: &mut dyn Write) ->
         f.push(("resumed", J::Bool(resumed)));
         f.push(("noop", J::Bool(false)));
         f.push(("sync", sync_j));
+        f.push(("checkout", checkout_j));
+        f.push((
+            "restored_checkpoints",
+            J::Arr(
+                o.restored
+                    .iter()
+                    .map(|(msg, publ, short)| {
+                        J::obj(vec![
+                            ("message", J::s(msg)),
+                            ("short", J::s(short)),
+                            ("was_published", J::Bool(*publ)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ));
         f.push(("next", J::s(&next)));
         return json::emit(out, json::doc("reid", f));
     }
     writeln!(out, "next: {next}")?;
     Ok(())
+}
+
+/// After an online rescue (Open #2, decided): check out head, but only if
+/// the working tree is still exactly what the rescue recorded.
+fn auto_checkout(
+    hub: &Path,
+    out: &mut dyn Write,
+    warn: &mut dyn Write,
+    json: bool,
+) -> Result<J, Error> {
+    #[cfg(debug_assertions)]
+    if let Some(p) = std::env::var_os("HUB_TEST_RESCUE_EDIT_AFTER_SYNC") {
+        fs::write(hub.parent().unwrap().join(p), b"edited after the rescue\n")?;
+    }
+    let mut repo = Repo::open_dir_with(hub.to_path_buf(), LockMode::Exclusive)?;
+    let idx = wd::Index::load(&repo.dir)?;
+    if idx.base == repo.head_frontier() {
+        return Ok(J::obj(vec![
+            ("done", J::Bool(false)),
+            ("reason", J::s("already at head")),
+        ]));
+    }
+    let mut ws = Vec::new();
+    let w = wd::scan(&repo.root(), &idx, &mut ws)?;
+    if !wd::diff(&idx, &w).is_empty() {
+        let why = "the working directory changed since the rescue recorded it; run `barocss-hub checkout` when ready";
+        if !json {
+            writeln!(out, "note: not checked out: {why}")?;
+        }
+        return Ok(J::obj(vec![
+            ("done", J::Bool(false)),
+            ("reason", J::s(why)),
+        ]));
+    }
+    let mut buf = Vec::new();
+    let c = crate::checkout(&mut repo, None, false, &mut buf, warn)?;
+    if !json {
+        writeln!(
+            out,
+            "checked out head {} (the working directory was unchanged since the rescue)",
+            c.short
+        )?;
+    }
+    Ok(J::obj(vec![
+        ("done", J::Bool(true)),
+        ("version", J::s(&c.short)),
+        ("written", J::n(c.written)),
+        ("removed", J::n(c.removed)),
+    ]))
 }
 
 fn print_plan(m: &Manifest, resumed: bool, bdir: &Path, out: &mut dyn Write) -> Result<(), Error> {
@@ -702,6 +914,15 @@ fn print_plan(m: &Manifest, resumed: bool, bdir: &Path, out: &mut dyn Write) -> 
     }
     for (c, p) in &m.files {
         writeln!(out, "  {c}: {p}")?;
+    }
+    for (publ, b) in &m.ckpts {
+        if let Ok((_, msg, ..)) = store::split_ckpt(b) {
+            writeln!(
+                out,
+                "  checkpoint '{msg}'{}: removed with the ops, re-created (private) on the rescued head",
+                if *publ { " (published)" } else { "" }
+            )?;
+        }
     }
     if m.files.iter().any(|(c, _)| c != "deleted") {
         writeln!(
