@@ -136,7 +136,7 @@ Two are honored only in debug/test builds; a release binary ignores them
 
 - `HUB_TEST_NO_REJECTION_DEDUP`, `HUB_TEST_RESCUE_EDIT_AFTER_SYNC`
 
-These eleven are still read by release builds (known; moving all hooks
+These twelve are still read by release builds (known; moving all hooks
 behind a test-only cargo feature is tracked separately):
 
 - crash points: `HUB_TEST_CRASH_STAGE`, `HUB_TEST_CRASH_IN_SYNC`,
@@ -145,6 +145,7 @@ behind a test-only cargo feature is tracked separately):
 - limits and timing: `HUB_TEST_MAX_BLOB_SIZE`, `HUB_TEST_SESSION_MS`,
   `HUB_TEST_WIRE_TIMEOUT_MS`
 - platform: `HUB_TEST_FORCE_CASE_INSENSITIVE`
+- protocol: `HUB_TEST_NO_TEXT_FEATURE` (hello without the text feature, #54)
 
 `HUB_TEST_FULL_PROPTEST` and `HUB_TEST_OLD_BIN` are read only by the tests.
 `cargo test --workspace --release` is expected to pass.
