@@ -75,6 +75,9 @@ pub fn op_hash(o: &Op) -> [u8; 32] {
             id(&mut h, *node);
             h.update(blob.0);
         }
+        // Issue #53 (T1): core only; `h(o)` tag 4 lands with T2. Nothing
+        // authors or decodes a TextEdit before then.
+        Payload::TextEdit(_) => unreachable!("TextEdit has no h(o) before T2"),
     }
     h.finalize().into()
 }

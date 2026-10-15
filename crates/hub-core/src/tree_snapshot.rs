@@ -114,6 +114,7 @@ impl W {
                 self.id(*node);
                 self.blob(blob);
             }
+            Payload::TextEdit(_) => unreachable!("encode_snapshot refuses text ops"),
         }
     }
 }
@@ -252,7 +253,14 @@ impl Replica {
     /// Encode this replica (Issue #33). `None` if ops are pending (a
     /// snapshot only covers a closed, fully applied op set).
     pub fn encode_snapshot(&self) -> Option<Vec<u8>> {
-        if !self.pending.is_empty() {
+        // Issue #53: no v1 snapshot encoding for text ops (snapshot v2 is
+        // T2); the caller keeps replaying the log.
+        if !self.pending.is_empty()
+            || self
+                .log
+                .iter()
+                .any(|(o, _, _)| matches!(o.payload, Payload::TextEdit(_)))
+        {
             return None;
         }
         let mut w = W {

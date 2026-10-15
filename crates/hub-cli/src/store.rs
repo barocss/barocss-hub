@@ -193,6 +193,9 @@ pub fn encode_op(op: &Op) -> String {
         ),
         Payload::Delete { node } => format!("D {}", fmt_id(*node)),
         Payload::SetContent { node, blob } => format!("S {} {}", fmt_id(*node), blob.hex()),
+        // Issue #53 (T1): the `T` record lands with T2; nothing authors
+        // or decodes a TextEdit before then.
+        Payload::TextEdit(_) => unreachable!("TextEdit has no v1 log record before T2"),
     };
     format!(
         "O {} {} {p}",

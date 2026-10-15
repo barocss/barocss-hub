@@ -157,6 +157,9 @@ pub enum Payload {
         node: NodeId,
         blob: BlobId,
     },
+    /// Edit of one text epoch of a File (Text-CRDT 7.4.1, Issue #53).
+    /// Core only in T1: no log record, wire or snapshot encoding yet.
+    TextEdit(crate::text::TextEdit),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,7 +174,7 @@ impl Op {
     pub fn moved_node(&self) -> Option<NodeId> {
         match &self.payload {
             Payload::Move { node, .. } | Payload::Delete { node } => Some(*node),
-            Payload::Create { .. } | Payload::SetContent { .. } => None,
+            Payload::Create { .. } | Payload::SetContent { .. } | Payload::TextEdit(_) => None,
         }
     }
 
@@ -370,6 +373,14 @@ impl Work {
                 }
                 _ => (Outcome::Invalid, Undo::None),
             },
+            // Structural part only; the text pass (`text::text_pass`)
+            // decides 7.4.1/7.4.2 validity and never changes the tree.
+            Payload::TextEdit(t) => match self.state.get(&t.node) {
+                Some(rec) if rec.kind == Kind::File && !t.node.is_reserved() => {
+                    (Outcome::Applied, Undo::None)
+                }
+                _ => (Outcome::Invalid, Undo::None),
+            },
             Payload::Move { .. } | Payload::Delete { .. } => {
                 let (node, new_parent, new_name) = match &op.payload {
                     Payload::Move {
@@ -381,7 +392,9 @@ impl Work {
                         Some(n) => (*node, TRASH, n.name.clone()),
                         None => return (Outcome::Invalid, Undo::None),
                     },
-                    Payload::Create { .. } | Payload::SetContent { .. } => unreachable!(),
+                    Payload::Create { .. } | Payload::SetContent { .. } | Payload::TextEdit(_) => {
+                        unreachable!()
+                    }
                 };
                 if node.is_reserved()
                     || !self.state.contains_key(&node)
@@ -452,6 +465,9 @@ pub struct Evaluation {
     pub state: State,
     pub conflicts: BTreeSet<Conflict>,
     pub outcomes: BTreeMap<OpId, Outcome>,
+    /// Text content, notices and derived blobs (Issue #53); empty when
+    /// the op set has no `TextEdit`.
+    pub text: crate::text::TextEval,
 }
 
 /// `deps*` closure: for each op, the set of all its causal predecessors.
@@ -681,7 +697,36 @@ impl Causality {
 /// (the pre-delete parent is read during the fold; the `Revived` ancestry
 /// check runs in a second fold only for concurrent delete/move pairs).
 pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
+    evaluate_with(ops, &crate::text::NoBlobs)
+}
+
+/// [`evaluate`] with epoch blob bytes for text ops (Text-CRDT 7.4.2): a
+/// `TextEdit` whose epoch blob is unavailable is accepted with the
+/// deferred checks and has no head bytes.
+pub fn evaluate_with<'a>(
+    ops: impl IntoIterator<Item = &'a Op>,
+    blobs: &dyn crate::text::BlobSource,
+) -> Evaluation {
     let ops: BTreeMap<OpId, Op> = ops.into_iter().map(|o| (o.id, o.clone())).collect();
+    evaluate_map(ops, blobs, None)
+}
+
+/// [`evaluate_with`], integrating text ops in `order` (a causal order of
+/// the op ids) instead of `<`: same result (Text-CRDT 7.12 #1, tests).
+pub fn evaluate_in_order(
+    ops: &[Op],
+    blobs: &dyn crate::text::BlobSource,
+    order: &[OpId],
+) -> Evaluation {
+    let ops: BTreeMap<OpId, Op> = ops.iter().map(|o| (o.id, o.clone())).collect();
+    evaluate_map(ops, blobs, Some(order))
+}
+
+fn evaluate_map(
+    ops: BTreeMap<OpId, Op>,
+    blobs: &dyn crate::text::BlobSource,
+    order: Option<&[OpId]>,
+) -> Evaluation {
     let causal = Causality::new(&ops);
 
     let mut w = Work::new();
@@ -709,6 +754,27 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
         }
         outcomes.insert(*id, out);
     }
+    // Text ops (Issue #53): 7.4.1/7.4.2 validity, then per-epoch docs.
+    let mut text = crate::text::TextEval::default();
+    let has_text = ops
+        .values()
+        .any(|o| matches!(o.payload, Payload::TextEdit(_)));
+    if has_text {
+        let (tv, invalid) = crate::text::text_pass(&ops, &outcomes, &causal, blobs, order);
+        for id in invalid {
+            outcomes.insert(id, Outcome::Invalid);
+            conflicts.insert(Conflict::InvalidOp { op: id });
+        }
+        text = tv;
+    }
+    let text_nodes: BTreeSet<NodeId> = text
+        .valid
+        .iter()
+        .map(|v| match &ops[v].payload {
+            Payload::TextEdit(t) => t.node,
+            _ => unreachable!(),
+        })
+        .collect();
 
     // Applied (non-skipped, valid) Move/Delete ops per node, ascending.
     let mut applied: BTreeMap<NodeId, Vec<OpId>> = BTreeMap::new();
@@ -742,6 +808,9 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
         }
     }
     for (n, es) in &sets {
+        if text_nodes.contains(n) {
+            continue;
+        }
         let (winner, winner_blob) = *es.last().unwrap();
         let ids: Vec<OpId> = es.iter().map(|&(e, _)| e).collect();
         let over = causal.overwritten(&ids);
@@ -757,11 +826,27 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
             }
         }
     }
-    // Edit revives (D-014, Issue #20): post-fold, order-independent.
+    // Text-CRDT 7.4.3: content and conflicts of nodes with text ops.
+    if !text_nodes.is_empty() {
+        conflicts.extend(crate::text::derive(
+            &ops, &outcomes, &causal, blobs, &mut text,
+        ));
+        for (n, nt) in &text.content {
+            if let Some(rec) = w.state.get_mut(n) {
+                rec.content = Some(nt.blob);
+            }
+        }
+    }
+    // Edit revives (D-014, Issue #20): post-fold, order-independent. A
+    // valid TextEdit is an edit (Text-CRDT 7.4.4).
     let mut edits: Vec<(OpId, NodeId)> = sets
         .iter()
         .flat_map(|(n, es)| es.iter().map(move |&(e, _)| (e, *n)))
         .collect();
+    edits.extend(text.valid.iter().map(|v| match &ops[v].payload {
+        Payload::TextEdit(t) => (*v, t.node),
+        _ => unreachable!(),
+    }));
     edits.sort();
     let mut pre = BTreeMap::new();
     for (id, parent) in &parent_before {
@@ -842,6 +927,7 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
         state: w.state,
         conflicts,
         outcomes,
+        text,
     }
 }
 
@@ -1049,6 +1135,15 @@ impl Replica {
     /// keys differ from the applied set (the caller then uses [`evaluate`]).
     pub fn conflicts(&self, ops: &BTreeMap<OpId, Op>) -> Option<BTreeSet<Conflict>> {
         if ops.len() != self.log.len() || !ops.keys().eq(self.log.iter().map(|(o, _, _)| &o.id)) {
+            return None;
+        }
+        // Issue #53: the incremental replica is text-unaware in T1; text
+        // op sets go through `evaluate_with`.
+        if self
+            .log
+            .iter()
+            .any(|(o, _, _)| matches!(o.payload, Payload::TextEdit(_)))
+        {
             return None;
         }
         let state = self.state();
