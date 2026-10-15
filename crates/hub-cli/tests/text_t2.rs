@@ -857,3 +857,49 @@ fn v2_fixture_opens() {
     let n = node_of(&d, "notes.md");
     assert_eq!(text(&d, n), "# Plan\n- a\n- a2\n- b\n");
 }
+
+/// Issue #54 (chained saves): a 2 MiB save split by `split_text_edit`
+/// into records within TEXT_OP_MAX, appended as one batch, round-trips the
+/// store and syncs over `file://` and SSH.
+#[test]
+fn chained_save_round_trips_and_syncs() {
+    let t = tmp("chain");
+    let ssh = fake_ssh(&t);
+    let env = [("HUB_SSH_COMMAND", ssh.as_str())];
+    ok(&t, &["init", "--bare", "srv.hub"], &[]);
+    let url = format!("ssh://localhost{}", t.join("srv.hub").display());
+    let (a, b, c) = (repo(&t, "a"), repo(&t, "b"), repo(&t, "c"));
+    let n = record_file(&a, SEED);
+    let big = format!(
+        "{SEED}{}{}",
+        "x한🙂".repeat(200_000),
+        "\nline\n".repeat(50_000)
+    );
+    {
+        let mut r = Repo::open_dir_with(a.join(".hub"), LockMode::Exclusive).unwrap();
+        let blobs = blobs_of(&r);
+        let ev = evaluate_with(r.store.values(), &blobs);
+        let te = author_text_edit(&r.store, &ev, &blobs, n, big.as_bytes()).unwrap();
+        let first = r.prepare(Payload::TextEdit(te.clone()));
+        let size = |o: &Op| hub_cli::store::encode_op(o).len();
+        let chain = hub_core::text::split_text_edit(
+            first.id,
+            first.deps.clone(),
+            te,
+            &size,
+            hub_cli::store::TEXT_OP_MAX,
+        )
+        .unwrap();
+        assert!(chain.len() > 5, "{}", chain.len());
+        assert!(chain.iter().all(|o| size(o) <= hub_cli::store::TEXT_OP_MAX));
+        r.append_ops(chain).unwrap();
+    }
+    assert_eq!(text(&a, n), big);
+    ok(&b, &["sync", a.to_str().unwrap()], &[]);
+    assert_eq!(text(&b, n), big);
+    ok(&b, &["remote", "add", "--exec", BIN, "origin", &url], &[]);
+    ok(&c, &["remote", "add", "--exec", BIN, "origin", &url], &[]);
+    ok(&b, &["sync"], &env);
+    ok(&c, &["sync"], &env);
+    assert_eq!(text(&c, n), big);
+}

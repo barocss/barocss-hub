@@ -13,12 +13,18 @@
 //! * B3: 20 editors × 500 line edits on one 10k-line file in 20 sync
 //!   rounds; three random causal delivery orders into fresh docs.
 //!   Target: convergence, p99 integrate ≤ 1 ms per op.
+//! * B2 + B5 (Issue #54): 1M `TextEdit`s over 10k files of 2–200 KiB
+//!   (uniform), through the incremental `Replica`: full replay (open
+//!   without a snapshot), snapshot v2 encode, size (B5), file read +
+//!   decode (open with a snapshot, B2 target ≤ 1 s) and one more edit
+//!   on the reopened replica (the record step's core cost, ≤ 1 s).
+//!   `-- b2 [files] [edits]`.
 
 use std::collections::BTreeSet;
 use std::time::Instant;
 
 use hub_core::text::{diff_line, ElemId, Ins, TextDoc, TextEdit};
-use hub_core::tree::{evaluate_with, BlobId, Kind, NodeId, Op, OpId, Payload, ROOT};
+use hub_core::tree::{evaluate_with, BlobId, Kind, NodeId, Op, OpId, Payload, Replica, ROOT};
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -452,6 +458,154 @@ fn case_b3(editors: usize, edits: usize, lines: usize, rounds: usize) -> bool {
     ok
 }
 
+fn case_b2(nfiles: usize, nedits: usize) -> bool {
+    let mut rng = Rng::new(54);
+    let mut ops: Vec<Op> = Vec::with_capacity(2 * nfiles + nedits);
+    let mut blobs: std::collections::HashMap<BlobId, Vec<u8>> = std::collections::HashMap::new();
+    let mut counter = 10u64;
+    let mut next = |r: u128| {
+        counter += 1;
+        NodeId::new(counter, r)
+    };
+    // Per file: (node, last op, epoch, seed len, last insert (op, len)).
+    let mut files: Vec<(NodeId, OpId, OpId, u32, Option<(OpId, u32)>)> = Vec::new();
+    let mut seed_bytes = 0usize;
+    for i in 0..nfiles {
+        let n = next(1);
+        ops.push(Op {
+            id: n,
+            deps: BTreeSet::new(),
+            payload: Payload::Create {
+                kind: Kind::File,
+                parent: ROOT,
+                name: format!("f{i}.txt"),
+            },
+        });
+        let size = 2048 + rng.below(198 * 1024) as usize;
+        let mut seed = Vec::with_capacity(size + 64);
+        while seed.len() < size {
+            for _ in 0..8 {
+                seed.extend_from_slice(WORDS[rng.below(8) as usize].as_bytes());
+            }
+            seed.push(b'\n');
+        }
+        seed_bytes += seed.len();
+        let b = BlobId::of(&seed);
+        let s = next(1);
+        ops.push(Op {
+            id: s,
+            deps: [n].into(),
+            payload: Payload::SetContent { node: n, blob: b },
+        });
+        files.push((n, s, s, seed.len() as u32, None));
+        blobs.insert(b, seed);
+    }
+    for k in 0..nedits {
+        let f = rng.below(nfiles as u64) as usize;
+        let (n, last, epoch, slen, prev) = files[f];
+        let r = 2 + (k % 20) as u128;
+        let id = next(r);
+        let line = format!("edit {k} by {r}\n").into_bytes();
+        let off = rng.below(slen as u64) as u32;
+        let mut del = Vec::new();
+        if k % 5 == 4 {
+            if let Some((p, l)) = prev {
+                del.push((ElemId { op: p, off: 0 }, l));
+            }
+        }
+        let len = line.len() as u32;
+        ops.push(Op {
+            id,
+            deps: [last].into(),
+            payload: Payload::TextEdit(TextEdit {
+                node: n,
+                epoch,
+                seen: [last].into(),
+                del,
+                ins: vec![Ins {
+                    left: Some(ElemId { op: epoch, off }),
+                    right: None,
+                    bytes: line,
+                }],
+            }),
+        });
+        files[f] = (n, id, epoch, slen, Some((id, len)));
+    }
+    println!(
+        "B2/B5: {nfiles} files, {} MiB of seeds, {nedits} TextEdits, {} ops",
+        seed_bytes >> 20,
+        ops.len()
+    );
+    let t = Instant::now();
+    let mut r = Replica::new();
+    r.receive_all_with(ops.clone(), &blobs);
+    let replay = t.elapsed().as_secs_f64();
+    let valid = r.text_valid().len();
+    println!("  full replay (open without snapshot): {replay:.2} s, valid edits {valid}");
+    let t = Instant::now();
+    let snap = r.encode_snapshot().expect("closed");
+    let enc = t.elapsed().as_secs_f64();
+    let path = std::env::temp_dir().join(format!("hub54-b2-{}.snap", std::process::id()));
+    std::fs::write(&path, &snap).unwrap();
+    drop(r);
+    let size = snap.len();
+    drop(snap);
+    alloc_peak_reset();
+    let t = Instant::now();
+    let bytes = std::fs::read(&path).unwrap();
+    let read = t.elapsed().as_secs_f64();
+    let back = Replica::decode_snapshot(&bytes).expect("decodes");
+    let open = t.elapsed().as_secs_f64();
+    drop(bytes);
+    let peak = alloc_peak();
+    let _ = std::fs::remove_file(&path);
+    let runs: usize = files
+        .iter()
+        .filter_map(|(n, _, e, _, _)| back.text_doc(*n, *e).map(|d| d.runs()))
+        .sum();
+    println!(
+        "  B5 snapshot: {:.1} MiB ({:.1} MiB over the seeds; {runs} runs, {:.0} B/run over seeds), encode {enc:.2} s",
+        size as f64 / 1048576.0,
+        (size - seed_bytes) as f64 / 1048576.0,
+        (size - seed_bytes) as f64 / runs.max(1) as f64
+    );
+    println!(
+        "  B2 open with snapshot: read {read:.2} s + decode {:.2} s = {open:.2} s (target 1 s), peak {} MiB",
+        open - read,
+        peak >> 20
+    );
+    // One more edit on the reopened replica (record's core step).
+    let (n, last, epoch, _, _) = files[0];
+    let mut back = back;
+    let one = Op {
+        id: next(99),
+        deps: [last].into(),
+        payload: Payload::TextEdit(TextEdit {
+            node: n,
+            epoch,
+            seen: [last].into(),
+            del: vec![],
+            ins: vec![Ins {
+                left: None,
+                right: None,
+                bytes: b"one more\n".to_vec(),
+            }],
+        }),
+    };
+    let t = Instant::now();
+    back.receive_all_with(vec![one], &blobs);
+    let rec = t.elapsed().as_secs_f64();
+    println!(
+        "  one more TextEdit on the reopened replica: {:.0} ms (target 1 s)",
+        rec * 1e3
+    );
+    let ok = valid == nedits && open <= 1.0 && rec <= 1.0;
+    if !ok {
+        println!("  B2: MISSED");
+    }
+    ok
+}
+
 fn main() {
     let args: Vec<String> = std::env::args()
         .skip(1)
@@ -465,6 +619,14 @@ fn main() {
     }
     if which == "all" || which == "b3" {
         ok &= case_b3(20, 500, 10_000, 20);
+    }
+    if which == "all" || which == "b2" || which == "b5" {
+        let f = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(10_000);
+        let e = args
+            .get(2)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000);
+        ok &= case_b2(f, e);
     }
     if !ok {
         eprintln!("text bench: a target was missed or a check failed (see above)");

@@ -835,6 +835,27 @@ impl Repo {
         }
         let mut done = Vec::new();
         let mut res = Ok(());
+        // Issue #54 guard: an op authored here whose record exceeds
+        // TEXT_OP_MAX could not travel in the smallest legal frame and
+        // would wedge every later sync: refuse the whole batch, nothing
+        // written. (Received ops are bounded by the wire frame limit.)
+        if let Some(o) = ops.iter().find(|o| {
+            o.id.replica == self.replica_id && store::encode_op(o).len() > store::TEXT_OP_MAX
+        }) {
+            return (
+                0,
+                Err(Error::new(
+                    Code::Limit,
+                    format!(
+                        "op {} encodes to {} bytes, over the {}-byte record limit (TEXT_OP_MAX); \
+                         split the edit (split_text_edit)",
+                        store::fmt_id(o.id),
+                        store::encode_op(o).len(),
+                        store::TEXT_OP_MAX
+                    ),
+                )),
+            );
+        }
         let mut log = match store::LogAppender::open(&self.dir.join("ops.log")) {
             Ok(l) => l,
             Err(e) => return (0, Err(e.into())),

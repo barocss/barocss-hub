@@ -132,3 +132,37 @@ fn reported_hash_is_the_text_record_hash() {
     }
     assert_ne!(crate::reported::payload_hash(&other), want);
 }
+
+/// Issue #54 guard: an authored record over `TEXT_OP_MAX` is refused with
+/// `limit`, nothing written; the same edit split into a chain appends in
+/// one batch and reopens to the same text.
+#[test]
+fn oversized_record_is_refused_and_a_chain_fits() {
+    let root = tmp("limit");
+    let mut repo = Repo::init(&root).unwrap();
+    let (create, mut te) = text_ops(&repo);
+    repo.append_op(create.clone()).unwrap();
+    let big: Vec<u8> = "한 line\n".repeat(store::TEXT_OP_MAX / 4).into_bytes();
+    if let Payload::TextEdit(t) = &mut te.payload {
+        t.ins[0].bytes = big.clone();
+    }
+    let log0 = fs::read(repo.dir.join("ops.log")).unwrap();
+    let e = repo.append_op(te.clone()).unwrap_err();
+    assert_eq!(e.code(), crate::Code::Limit);
+    assert_eq!(fs::read(repo.dir.join("ops.log")).unwrap(), log0);
+    assert!(!repo.store.contains_key(&te.id));
+    let Payload::TextEdit(t) = te.payload.clone() else {
+        unreachable!()
+    };
+    let size = |o: &Op| store::encode_op(o).len();
+    let chain =
+        hub_core::text::split_text_edit(te.id, te.deps.clone(), t, &size, store::TEXT_OP_MAX)
+            .unwrap();
+    assert!(chain.len() > 1);
+    repo.append_ops(chain.clone()).unwrap();
+    let dir = repo.dir.clone();
+    drop(repo);
+    let r = Repo::open_dir_with(dir, LockMode::Shared).unwrap();
+    assert_eq!(r.state()[&create.id].content, Some(BlobId::of(&big)));
+    let _ = fs::remove_dir_all(&root);
+}

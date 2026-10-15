@@ -373,6 +373,14 @@ fn decode_text(node: &str, epoch: &str, s: &str, d: &str, i: &str) -> Result<Tex
     })
 }
 
+/// Longest encoded op record a replica authors (Issue #54, Text-CRDT
+/// 7.4.1 "chained saves"): 192 KiB. It fits the smallest frame a peer may
+/// announce (`FRAME_FLOOR` = 256 KiB + 64, Remote-Sync 5.2.3) with 64 KiB
+/// left for the `Ops` header (sender frontier), so every authored record
+/// can be sent to every conforming peer. A save whose `TextEdit` is larger
+/// becomes a chain ([`hub_core::text::split_text_edit`]).
+pub const TEXT_OP_MAX: usize = 192 * 1024;
+
 /// One op record (`O <id> <deps> <payload>`). Every writer (ops.log,
 /// pending.log, the rescue manifest, the wire `Ops` body, the reported-
 /// rejections hash) uses this one encoding, `TextEdit`s as `T` records

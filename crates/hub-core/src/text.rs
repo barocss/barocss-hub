@@ -72,6 +72,166 @@ impl TextEdit {
 /// `del` and `ins` of a diffed save.
 pub type DiffEdit = (Vec<(ElemId, u32)>, Vec<Ins>);
 
+/// Split one save's `TextEdit` into a chain of ops whose records each
+/// satisfy `size(op) <= limit` (Issue #54, Text-CRDT 7.4.1 "chained
+/// saves"). `first` is the id of op 1 (later ops take `counter + 1, +2,
+/// ...` of the same replica), `deps` its deps. Op `k+1` has `deps =
+/// {k}` (so `deps*(k+1) = deps*(k) ∪ {k}`) and `seen = {k}` (op 1 keeps
+/// `edit.seen`).
+///
+/// Split points: whole `del` entries and `ins` runs first (in payload
+/// order); a run too long for one op is cut at a UTF-8 character
+/// boundary, preferring the end of a line; its continuation's `left` is
+/// the last element of the previous piece (its successor at the new deps
+/// is the run's original `right`, so anchor adjacency, 7.12 #17, holds
+/// within the chain). The edit's anchors must be elements of its base
+/// (as `diff_line` produces). `size` is the caller's encoded record
+/// length; returns `None` if a single smallest piece cannot fit.
+pub fn split_text_edit(
+    first: OpId,
+    deps: BTreeSet<OpId>,
+    edit: TextEdit,
+    size: &dyn Fn(&Op) -> usize,
+    limit: usize,
+) -> Option<Vec<Op>> {
+    let mk = |id: OpId,
+              deps: &BTreeSet<OpId>,
+              seen: &BTreeSet<OpId>,
+              del: Vec<(ElemId, u32)>,
+              ins: Vec<Ins>| Op {
+        id,
+        deps: deps.clone(),
+        payload: Payload::TextEdit(TextEdit {
+            node: edit.node,
+            epoch: edit.epoch,
+            seen: seen.clone(),
+            del,
+            ins,
+        }),
+    };
+    let whole = mk(first, &deps, &edit.seen, edit.del.clone(), edit.ins.clone());
+    if size(&whole) <= limit {
+        return Some(vec![whole]);
+    }
+    let mut out: Vec<Op> = Vec::new();
+    let mut id = first;
+    let mut deps = deps;
+    let mut seen = edit.seen.clone();
+    let mut del: Vec<(ElemId, u32)> = Vec::new();
+    let mut ins: Vec<Ins> = Vec::new();
+    let fits =
+        |id: OpId,
+         deps: &BTreeSet<OpId>,
+         seen: &BTreeSet<OpId>,
+         del: &[(ElemId, u32)],
+         ins: &[Ins]| { size(&mk(id, deps, seen, del.to_vec(), ins.to_vec())) <= limit };
+    // Close the current op and start the next one of the chain.
+    let flush = |out: &mut Vec<Op>,
+                 id: &mut OpId,
+                 deps: &mut BTreeSet<OpId>,
+                 seen: &mut BTreeSet<OpId>,
+                 del: &mut Vec<(ElemId, u32)>,
+                 ins: &mut Vec<Ins>| {
+        out.push(mk(
+            *id,
+            deps,
+            seen,
+            std::mem::take(del),
+            std::mem::take(ins),
+        ));
+        // deps* = deps*(k) ∪ {k}: `{k}` alone names the same causal past
+        // (k's own deps are in it) and keeps each record small.
+        *deps = [*id].into();
+        *seen = [*id].into();
+        *id = NodeId::new(id.counter + 1, id.replica.0);
+    };
+    for d in edit.del.iter().copied() {
+        let mut t = del.clone();
+        t.push(d);
+        if !fits(id, &deps, &seen, &t, &ins) {
+            if del.is_empty() && ins.is_empty() {
+                return None;
+            }
+            flush(&mut out, &mut id, &mut deps, &mut seen, &mut del, &mut ins);
+            if !fits(id, &deps, &seen, &[d], &[]) {
+                return None;
+            }
+        }
+        del.push(d);
+    }
+    for run in edit.ins.iter().cloned() {
+        let mut run = run;
+        loop {
+            let mut t = ins.clone();
+            t.push(run.clone());
+            if fits(id, &deps, &seen, &del, &t) {
+                ins.push(run);
+                break;
+            }
+            // Longest prefix that fits (at a char boundary), then prefer
+            // the last line end inside it.
+            let bounds: Vec<usize> = (1..=run.bytes.len())
+                .filter(|&i| i == run.bytes.len() || !is_cont(run.bytes[i]))
+                .collect();
+            let ok = |m: usize| {
+                let mut t = ins.clone();
+                t.push(Ins {
+                    left: run.left,
+                    right: run.right,
+                    bytes: run.bytes[..m].to_vec(),
+                });
+                fits(id, &deps, &seen, &del, &t)
+            };
+            let (mut lo, mut hi) = (0usize, bounds.len());
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                if ok(bounds[mid - 1]) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            if lo == 0 {
+                if del.is_empty() && ins.is_empty() {
+                    return None;
+                }
+                flush(&mut out, &mut id, &mut deps, &mut seen, &mut del, &mut ins);
+                continue;
+            }
+            let mut m = bounds[lo - 1];
+            if let Some(nl) = run.bytes[..m].iter().rposition(|&b| b == b'\n') {
+                if nl + 1 >= m / 2 {
+                    m = nl + 1;
+                }
+            }
+            let start: u32 = ins.iter().map(|i| i.bytes.len() as u32).sum();
+            let mut last = m - 1;
+            while is_cont(run.bytes[last]) {
+                last -= 1;
+            }
+            ins.push(Ins {
+                left: run.left,
+                right: run.right,
+                bytes: run.bytes[..m].to_vec(),
+            });
+            let left = Some(ElemId {
+                op: id,
+                off: start + last as u32,
+            });
+            flush(&mut out, &mut id, &mut deps, &mut seen, &mut del, &mut ins);
+            run = Ins {
+                left,
+                right: run.right,
+                bytes: run.bytes[m..].to_vec(),
+            };
+        }
+    }
+    if !del.is_empty() || !ins.is_empty() {
+        out.push(mk(id, &deps, &seen, del, ins));
+    }
+    Some(out)
+}
+
 /// Name of the line diff (7.5.2), reported by a server that diffs.
 pub const DIFF_NAME: &str = "hub-diff-line/1";
 /// 7.5.2 cost bound: above this many edited lines, delete all, insert all.
