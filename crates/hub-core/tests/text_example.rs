@@ -405,24 +405,47 @@ fn diff_line_cost_fallback() {
     assert_eq!(ins_[0].left, Some(e(s, a.len() as u32 - 1)));
 }
 
-/// Issue #53 T1 boundary (T2 carry-overs): the v1 snapshot and the
-/// incremental `Replica` are text-unaware. With a text op in the set,
-/// `encode_snapshot` returns `None` and `Replica::conflicts` returns `None`,
-/// so callers fall back to the log and to `evaluate_with`.
+/// Issue #54 (T2 carry-overs (b), (c), inverted from the T1 boundary
+/// test): the incremental `Replica` and its snapshot are text-aware. With
+/// the 7.13 example's text ops, `Replica::conflicts` and the state equal
+/// `evaluate_with` (no fallback), and the snapshot round-trips to the same
+/// replica (state, conflicts, notices, content, docs).
 #[test]
-fn snapshot_and_replica_conflicts_fall_back_for_text_ops() {
-    let (mut ops, n, s, _) = base();
-    let mut r = Replica::new();
-    r.receive_all(ops.clone());
-    let map: BTreeMap<OpId, Op> = ops.iter().map(|o| (o.id, o.clone())).collect();
-    assert!(r.encode_snapshot().is_some());
-    assert!(r.conflicts(&map).is_some());
+fn replica_and_snapshot_are_text_aware() {
+    let (mut ops, n, s, blobs) = base();
     ops.extend(example_ops(n, s));
-    let mut r = Replica::new();
-    r.receive_all(ops.clone());
     let map: BTreeMap<OpId, Op> = ops.iter().map(|o| (o.id, o.clone())).collect();
-    assert!(r.encode_snapshot().is_none());
-    assert!(r.conflicts(&map).is_none());
+    let ev = evaluate_with(ops.iter(), &blobs);
+    let mut r = Replica::new();
+    r.receive_all_with(ops.clone(), &blobs);
+    assert_eq!(r.conflicts(&map).as_ref(), Some(&ev.conflicts));
+    assert_eq!(r.state(), &ev.state);
+    assert_eq!(r.text_notices(), ev.text.notices);
+    assert_eq!(r.text_valid(), &ev.text.valid);
+    let snap = r.encode_snapshot().expect("text-aware snapshot");
+    assert!(snap.starts_with(b"RSNAP2"));
+    let mut back = Replica::decode_snapshot(&snap).unwrap();
+    // The seed is referenced by blob id, not copied (#54 B5): nothing
+    // to load for a Create epoch, the SetContent epoch's doc is lazy.
+    assert!(!snap.windows(SEED.len()).any(|w| w == SEED));
+    assert_eq!(
+        back.text_lazy_seeds(),
+        vec![(BlobId::of(SEED), SEED.len() as u32)]
+    );
+    assert!(back.text_doc(n, s).is_none());
+    assert_eq!(
+        back.load_text_docs(&BTreeMap::<BlobId, Vec<u8>>::new()),
+        Err(BlobId::of(SEED))
+    );
+    back.load_text_docs(&blobs).unwrap();
+    assert_eq!(back.encode_snapshot().unwrap(), snap);
+    assert_eq!(back.conflicts(&map).as_ref(), Some(&ev.conflicts));
+    assert_eq!(back.state(), &ev.state);
+    assert_eq!(back.text_notices(), ev.text.notices);
+    assert_eq!(
+        back.text_doc(n, s).unwrap().materialize_head(),
+        ev.text.doc(n, s).unwrap().materialize_head()
+    );
 }
 
 /// A true Myers tie: the forward step's tie goes to the deletion, which
@@ -532,4 +555,55 @@ fn seen_rule_deps_past_the_diff_base() {
         })
         .collect();
     assert_eq!(losers, vec![s2]);
+}
+
+/// Issue #54: an undo/redo below applied text ops that changes their fold
+/// outcome rebuilds the replica's text part. `F` creates a file under a
+/// folder `D` it does not depend on; until `D` (a smaller id) arrives, `F`
+/// and the `TextEdit` on it are structurally invalid, after it both apply.
+#[test]
+fn replica_rebuilds_text_when_a_redo_changes_outcomes() {
+    let d = id(5, 1);
+    let f = id(6, 2);
+    let mk = |oid: OpId, dep: &[OpId], payload: Payload| Op {
+        id: oid,
+        deps: deps(dep),
+        payload,
+    };
+    let dir = mk(
+        d,
+        &[],
+        Payload::Create {
+            kind: Kind::Directory,
+            parent: ROOT,
+            name: "d".into(),
+        },
+    );
+    let file = mk(
+        f,
+        &[],
+        Payload::Create {
+            kind: Kind::File,
+            parent: d,
+            name: "f".into(),
+        },
+    );
+    let t = te(id(7, 2), f, f, vec![], vec![ins(None, None, "hello\n")]);
+    let t2 = te(id(8, 3), f, f, vec![], vec![ins(None, None, "world\n")]);
+    let all = vec![dir.clone(), file.clone(), t.clone(), t2.clone()];
+    let blobs: BTreeMap<BlobId, Vec<u8>> = BTreeMap::new();
+    let mut r = Replica::new();
+    r.receive_all_with(vec![file.clone(), t.clone()], &blobs);
+    let part = [file.clone(), t.clone()];
+    let ev = evaluate_with(part.iter(), &blobs);
+    assert!(ev.text.valid.is_empty());
+    assert_eq!(r.text_valid(), &ev.text.valid);
+    r.receive_all_with(vec![dir, t2], &blobs);
+    let ev = evaluate_with(all.iter(), &blobs);
+    let map: BTreeMap<OpId, Op> = all.iter().map(|o| (o.id, o.clone())).collect();
+    assert_eq!(ev.text.valid.len(), 2);
+    assert_eq!(r.text_valid(), &ev.text.valid);
+    assert_eq!(r.state(), &ev.state);
+    assert_eq!(r.conflicts(&map).as_ref(), Some(&ev.conflicts));
+    assert_eq!(r.text_notices(), ev.text.notices);
 }

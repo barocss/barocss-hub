@@ -53,6 +53,14 @@ pub const MIG_LOG_RENAMED: &str = "mig-log-renamed";
 pub const MIG_PEERS: &str = "mig-peers";
 /// Migration: `watch.lock` and `format` in place (before the snapshot).
 pub const MIG_FORMAT: &str = "mig-format";
+/// Format v2 upgrade (Issue #54, Text-CRDT 7.9): `.replica.tmp` (v2)
+/// written and flushed, not renamed.
+pub const V2_REPLICA_TMP: &str = "v2-replica-tmp";
+/// Format v2 upgrade: replica switched to v2 and `.hub/` synced (commit
+/// point); `format` still says v1.
+pub const V2_SWITCHED: &str = "v2-switched";
+/// Format v2 upgrade: `format` says v2.
+pub const V2_FORMAT: &str = "v2-format";
 /// Checkout: working-file temps written and flushed, no barrier yet.
 pub const FILES_WRITTEN: &str = "files-written";
 /// Checkout: barrier over the temps done, none renamed yet.

@@ -88,6 +88,12 @@ fn hex_rid(t: &str) -> Result<ReplicaId, String> {
         .map_err(|_| "bad replica id".into())
 }
 
+/// One `pending.log` record: `P <peer 32 hex> <op record>` (a `TextEdit`
+/// as its `T` record, Issue #54).
+pub fn encode_pending(o: &Op, peer: PeerId) -> String {
+    format!("P {:032x} {}", peer.0, store::encode_op(o))
+}
+
 pub fn read_pending(dir: &Path) -> Result<Vec<(Op, PeerId)>, Error> {
     let p = dir.join("pending.log");
     read_opt(&p, PENDING_HEADER)?
@@ -409,6 +415,15 @@ pub(crate) fn persist_with(
         .cloned()
         .collect();
     let pending = s.pending_ops();
+    // Issue #54: format v2 before a received TextEdit reaches ops.log or
+    // pending.log.
+    if new_ops
+        .iter()
+        .chain(pending.iter().map(|(o, _)| o))
+        .any(|o| matches!(o.payload, hub_core::tree::Payload::TextEdit(_)))
+    {
+        repo.ensure_text_format()?;
+    }
     // 1. Blobs first: an op on disk never names a missing blob.
     // Issue #34: only loaded bytes can be new (received, or a pending op's
     // blob read from this disk, which `add` skips); held blobs are on disk.
@@ -440,10 +455,7 @@ pub(crate) fn persist_with(
     *appended += n;
     res?;
     // 3. Pending buffer and warnings.
-    let ps: Vec<String> = pending
-        .iter()
-        .map(|(o, p)| format!("P {:032x} {}", p.0, store::encode_op(o)))
-        .collect();
+    let ps: Vec<String> = pending.iter().map(|(o, p)| encode_pending(o, *p)).collect();
     rewrite(&repo.dir.join("pending.log"), PENDING_HEADER, &ps)?;
     persist_warnings(repo, s)?;
     // 4. Published checkpoints.
@@ -780,7 +792,12 @@ pub fn reid(repo: &mut Repo, out: &mut dyn Write) -> Result<(), Error> {
     }
     store::write_atomic(
         &repo.dir.join("replica"),
-        format!("{}\n{:032x}\n", store::REPLICA_HEADER, new.0).as_bytes(),
+        format!(
+            "{}\n{:032x}\n",
+            store::replica_header(repo.is_v2(), false),
+            new.0
+        )
+        .as_bytes(),
     )?;
     repo.replica_id = new;
     writeln!(out, "replica id {:032x} -> {:032x}", old.0, new.0)?;
@@ -855,7 +872,7 @@ mod warnings_view_tests {
                 pend.push(Op { id, deps, payload });
             }
             let peer = ReplicaId(0xbeef);
-            let ps: Vec<String> = pend.iter().map(|o| format!("P {:032x} {}", peer.0, store::encode_op(o))).collect();
+            let ps: Vec<String> = pend.iter().map(|o| encode_pending(o, peer)).collect();
             rewrite(&repo.dir.join("pending.log"), PENDING_HEADER, &ps).unwrap();
             let mut ws = Vec::new();
             for (k, reason) in ["lamport-violation", "corrupt-blob", "equivocation"].iter().enumerate() {

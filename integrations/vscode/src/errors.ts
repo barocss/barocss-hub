@@ -36,6 +36,8 @@ export function explain(code: string, raw: string): Explained {
       return { message: `barocss-hub: not found. ${raw}`, actions: [], severity: 'warning' };
     case 'untrusted-remote':
       return { message: `barocss-hub: a remote configured in this folder was never used from this machine, so it was not contacted. Check it, then run \`barocss-hub remote trust <name>\` in a terminal. ${raw}`, actions: ['Show Log'], severity: 'warning' };
+    case 'upgrade-required':
+      return { message: `barocss-hub: sync stopped because one side's barocss-hub is too old for this repository's text edits. Upgrade barocss-hub on that side, then sync again. ${raw}`, actions: ['Show Log'], severity: 'warning' };
     case 'io':
       return { message: `barocss-hub: file system error. ${raw}`, actions: ['Show Log'], severity: 'error' };
     default:

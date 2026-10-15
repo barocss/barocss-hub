@@ -26,6 +26,7 @@
 //! child of `left`. For conforming authors this is the 7.3.2 rule; for any
 //! op it is a pure function of the op set.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::tree::{
@@ -72,32 +73,193 @@ impl TextEdit {
 /// `del` and `ins` of a diffed save.
 pub type DiffEdit = (Vec<(ElemId, u32)>, Vec<Ins>);
 
+/// Split one save's `TextEdit` into a chain of ops whose records each
+/// satisfy `size(op) <= limit` (Issue #54, Text-CRDT 7.4.1 "chained
+/// saves"). `first` is the id of op 1 (later ops take `counter + 1, +2,
+/// ...` of the same replica), `deps` its deps. Op `k+1` has `deps =
+/// {k}` (so `deps*(k+1) = deps*(k) ∪ {k}`) and `seen = {k}` (op 1 keeps
+/// `edit.seen`).
+///
+/// Split points: whole `del` entries and `ins` runs first (in payload
+/// order); a run too long for one op is cut at a UTF-8 character
+/// boundary, preferring the end of a line; its continuation's `left` is
+/// the last element of the previous piece (its successor at the new deps
+/// is the run's original `right`, so anchor adjacency, 7.12 #17, holds
+/// within the chain). The edit's anchors must be elements of its base
+/// (as `diff_line` produces). `size` is the caller's encoded record
+/// length; returns `None` if a single smallest piece cannot fit.
+pub fn split_text_edit(
+    first: OpId,
+    deps: BTreeSet<OpId>,
+    edit: TextEdit,
+    size: &dyn Fn(&Op) -> usize,
+    limit: usize,
+) -> Option<Vec<Op>> {
+    let mk = |id: OpId,
+              deps: &BTreeSet<OpId>,
+              seen: &BTreeSet<OpId>,
+              del: Vec<(ElemId, u32)>,
+              ins: Vec<Ins>| Op {
+        id,
+        deps: deps.clone(),
+        payload: Payload::TextEdit(TextEdit {
+            node: edit.node,
+            epoch: edit.epoch,
+            seen: seen.clone(),
+            del,
+            ins,
+        }),
+    };
+    let whole = mk(first, &deps, &edit.seen, edit.del.clone(), edit.ins.clone());
+    if size(&whole) <= limit {
+        return Some(vec![whole]);
+    }
+    let mut out: Vec<Op> = Vec::new();
+    let mut id = first;
+    let mut deps = deps;
+    let mut seen = edit.seen.clone();
+    let mut del: Vec<(ElemId, u32)> = Vec::new();
+    let mut ins: Vec<Ins> = Vec::new();
+    let fits =
+        |id: OpId,
+         deps: &BTreeSet<OpId>,
+         seen: &BTreeSet<OpId>,
+         del: &[(ElemId, u32)],
+         ins: &[Ins]| { size(&mk(id, deps, seen, del.to_vec(), ins.to_vec())) <= limit };
+    // Close the current op and start the next one of the chain.
+    let flush = |out: &mut Vec<Op>,
+                 id: &mut OpId,
+                 deps: &mut BTreeSet<OpId>,
+                 seen: &mut BTreeSet<OpId>,
+                 del: &mut Vec<(ElemId, u32)>,
+                 ins: &mut Vec<Ins>| {
+        out.push(mk(
+            *id,
+            deps,
+            seen,
+            std::mem::take(del),
+            std::mem::take(ins),
+        ));
+        // deps* = deps*(k) ∪ {k}: `{k}` alone names the same causal past
+        // (k's own deps are in it) and keeps each record small.
+        *deps = [*id].into();
+        *seen = [*id].into();
+        *id = NodeId::new(id.counter + 1, id.replica.0);
+    };
+    for d in edit.del.iter().copied() {
+        let mut t = del.clone();
+        t.push(d);
+        if !fits(id, &deps, &seen, &t, &ins) {
+            if del.is_empty() && ins.is_empty() {
+                return None;
+            }
+            flush(&mut out, &mut id, &mut deps, &mut seen, &mut del, &mut ins);
+            if !fits(id, &deps, &seen, &[d], &[]) {
+                return None;
+            }
+        }
+        del.push(d);
+    }
+    for run in edit.ins.iter().cloned() {
+        let mut run = run;
+        loop {
+            let mut t = ins.clone();
+            t.push(run.clone());
+            if fits(id, &deps, &seen, &del, &t) {
+                ins.push(run);
+                break;
+            }
+            // Longest prefix that fits (at a char boundary), then prefer
+            // the last line end inside it.
+            let bounds: Vec<usize> = (1..=run.bytes.len())
+                .filter(|&i| i == run.bytes.len() || !is_cont(run.bytes[i]))
+                .collect();
+            let ok = |m: usize| {
+                let mut t = ins.clone();
+                t.push(Ins {
+                    left: run.left,
+                    right: run.right,
+                    bytes: run.bytes[..m].to_vec(),
+                });
+                fits(id, &deps, &seen, &del, &t)
+            };
+            let (mut lo, mut hi) = (0usize, bounds.len());
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                if ok(bounds[mid - 1]) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            if lo == 0 {
+                if del.is_empty() && ins.is_empty() {
+                    return None;
+                }
+                flush(&mut out, &mut id, &mut deps, &mut seen, &mut del, &mut ins);
+                continue;
+            }
+            let mut m = bounds[lo - 1];
+            if let Some(nl) = run.bytes[..m].iter().rposition(|&b| b == b'\n') {
+                if nl + 1 >= m / 2 {
+                    m = nl + 1;
+                }
+            }
+            let start: u32 = ins.iter().map(|i| i.bytes.len() as u32).sum();
+            let mut last = m - 1;
+            while is_cont(run.bytes[last]) {
+                last -= 1;
+            }
+            ins.push(Ins {
+                left: run.left,
+                right: run.right,
+                bytes: run.bytes[..m].to_vec(),
+            });
+            let left = Some(ElemId {
+                op: id,
+                off: start + last as u32,
+            });
+            flush(&mut out, &mut id, &mut deps, &mut seen, &mut del, &mut ins);
+            run = Ins {
+                left,
+                right: run.right,
+                bytes: run.bytes[m..].to_vec(),
+            };
+        }
+    }
+    if !del.is_empty() || !ins.is_empty() {
+        out.push(mk(id, &deps, &seen, del, ins));
+    }
+    Some(out)
+}
+
 /// Name of the line diff (7.5.2), reported by a server that diffs.
 pub const DIFF_NAME: &str = "hub-diff-line/1";
 /// 7.5.2 cost bound: above this many edited lines, delete all, insert all.
 pub const DIFF_MAX_D: usize = 20_000;
 
 /// Read access to blob bytes (the CLI supplies its store; tests a map).
-/// The empty blob is always available.
+/// The empty blob is always available. Issue #54: a source may read on
+/// demand (the CLI's `.hub/blobs`), so bytes come back as a `Cow`.
 pub trait BlobSource {
-    fn blob_bytes(&self, id: &BlobId) -> Option<&[u8]>;
+    fn blob_bytes(&self, id: &BlobId) -> Option<Cow<'_, [u8]>>;
 }
 
 impl BlobSource for BlobStore {
-    fn blob_bytes(&self, id: &BlobId) -> Option<&[u8]> {
-        self.get(id)
+    fn blob_bytes(&self, id: &BlobId) -> Option<Cow<'_, [u8]>> {
+        self.get(id).map(Cow::Borrowed)
     }
 }
 
 impl BlobSource for BTreeMap<BlobId, Vec<u8>> {
-    fn blob_bytes(&self, id: &BlobId) -> Option<&[u8]> {
-        self.get(id).map(|v| v.as_slice())
+    fn blob_bytes(&self, id: &BlobId) -> Option<Cow<'_, [u8]>> {
+        self.get(id).map(|v| Cow::Borrowed(v.as_slice()))
     }
 }
 
 impl BlobSource for HashMap<BlobId, Vec<u8>> {
-    fn blob_bytes(&self, id: &BlobId) -> Option<&[u8]> {
-        self.get(id).map(|v| v.as_slice())
+    fn blob_bytes(&self, id: &BlobId) -> Option<Cow<'_, [u8]>> {
+        self.get(id).map(|v| Cow::Borrowed(v.as_slice()))
     }
 }
 
@@ -105,14 +267,14 @@ impl BlobSource for HashMap<BlobId, Vec<u8>> {
 pub struct NoBlobs;
 
 impl BlobSource for NoBlobs {
-    fn blob_bytes(&self, _: &BlobId) -> Option<&[u8]> {
+    fn blob_bytes(&self, _: &BlobId) -> Option<Cow<'_, [u8]>> {
         None
     }
 }
 
-fn fetch<'a>(src: &'a dyn BlobSource, id: &BlobId) -> Option<&'a [u8]> {
+pub(crate) fn fetch<'a>(src: &'a dyn BlobSource, id: &BlobId) -> Option<Cow<'a, [u8]>> {
     if *id == BlobId::empty() {
-        return Some(&[]);
+        return Some(Cow::Borrowed(&[]));
     }
     src.blob_bytes(id)
 }
@@ -147,6 +309,33 @@ pub struct NodeText {
 pub enum DocSlot {
     Doc(Box<TextDoc>),
     Deferred,
+    /// Issue #54 (snapshot v2): a doc decoded from a snapshot that
+    /// references its seed by blob id; the seed bytes are read on first
+    /// use ([`load_slot`]). Never produced by `evaluate`.
+    Lazy(Box<TextDoc>, BlobId),
+}
+
+/// Load a [`DocSlot::Lazy`] doc's seed from `blobs` (checked against the
+/// blob id and the recorded length). `Err(blob)` if it is missing or
+/// does not match; other slots are left as they are.
+pub(crate) fn load_slot(slot: &mut DocSlot, blobs: &dyn BlobSource) -> Result<(), BlobId> {
+    let DocSlot::Lazy(d, blob) = slot else {
+        return Ok(());
+    };
+    let blob = *blob;
+    let Some(b) = fetch(blobs, &blob) else {
+        return Err(blob);
+    };
+    if b.len() != d.op_bytes[0].1 as usize || BlobId::of(&b) != blob {
+        return Err(blob);
+    }
+    let mut arena = Vec::with_capacity(b.len() + d.arena.len());
+    arena.extend_from_slice(&b);
+    arena.extend_from_slice(&d.arena);
+    let mut doc = std::mem::replace(d, Box::new(TextDoc::new(d.epoch, b"")));
+    doc.arena = arena;
+    *slot = DocSlot::Doc(doc);
+    Ok(())
 }
 
 /// Text part of an evaluation. Empty when the op set has no `TextEdit`.
@@ -174,14 +363,48 @@ impl TextEval {
 
 // ---------------------------------------------------------------- TextDoc
 
-const NIL: u32 = u32::MAX;
+/// A fast non-cryptographic hasher for the doc's internal indices (Issue
+/// #54: snapshot open time; keys are local ids, not attacker-chosen in a
+/// way that matters for a local cache).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Fx(u64);
+
+impl std::hash::Hasher for Fx {
+    fn write(&mut self, b: &[u8]) {
+        for c in b.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            self.write_u64(u64::from_le_bytes(w));
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    fn write_u32(&mut self, v: u32) {
+        self.write_u64(v as u64)
+    }
+    fn write_u128(&mut self, v: u128) {
+        self.write_u64(v as u64);
+        self.write_u64((v >> 64) as u64);
+    }
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64)
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+pub(crate) type FxMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
+
+pub(crate) const NIL: u32 = u32::MAX;
 const START_F: u32 = 0;
 const CHUNK: usize = 128;
 /// Tag of an inline one-deleter set in `Frag::del`.
-const ONE: u32 = 1 << 31;
+pub(crate) const ONE: u32 = 1 << 31;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Side {
+pub(crate) enum Side {
     L,
     R,
 }
@@ -192,22 +415,22 @@ enum Side {
 /// memory): ops are interned indices, children are sorted sibling lists
 /// (`first_l` / `first_r` / `next`), deleter sets are interned.
 #[derive(Clone, Debug)]
-struct Frag {
-    op: u32,
-    off: u32,
-    len: u32,
-    parent: u32,
-    chunk: u32,
-    first_l: u32,
-    first_r: u32,
-    next: u32,
+pub(crate) struct Frag {
+    pub(crate) op: u32,
+    pub(crate) off: u32,
+    pub(crate) len: u32,
+    pub(crate) parent: u32,
+    pub(crate) chunk: u32,
+    pub(crate) first_l: u32,
+    pub(crate) first_r: u32,
+    pub(crate) next: u32,
     /// The run's right origin (FugueMax right-sibling key): op index and
     /// offset, `ro_op == NIL` for END.
-    ro_op: u32,
-    ro_off: u32,
+    pub(crate) ro_op: u32,
+    pub(crate) ro_off: u32,
     /// Interned set of deleting ops (0 = none).
-    del: u32,
-    side: Side,
+    pub(crate) del: u32,
+    pub(crate) side: Side,
 }
 
 #[derive(Clone, Copy)]
@@ -221,25 +444,25 @@ enum Place {
 /// op; versions are filters ([`TextDoc::materialize`], 7.3.4).
 #[derive(Clone, Debug)]
 pub struct TextDoc {
-    epoch: OpId,
-    ops: Vec<OpId>,
-    op_ix: HashMap<OpId, u32>,
+    pub(crate) epoch: OpId,
+    pub(crate) ops: Vec<OpId>,
+    pub(crate) op_ix: FxMap<OpId, u32>,
     /// Per op index: start in `arena` and byte length.
-    op_bytes: Vec<(u64, u32)>,
-    arena: Vec<u8>,
+    pub(crate) op_bytes: Vec<(u64, u32)>,
+    pub(crate) arena: Vec<u8>,
     /// Per op index: its fragment at offset 0, or `NIL`.
-    op_first: Vec<u32>,
+    pub(crate) op_first: Vec<u32>,
     /// Ops split into several fragments: `(start offset, fragment)`.
-    split: HashMap<u32, Vec<(u32, u32)>>,
-    frags: Vec<Frag>,
+    pub(crate) split: FxMap<u32, Vec<(u32, u32)>>,
+    pub(crate) frags: Vec<Frag>,
     /// Interned sorted deleter sets (op indices) of two or more ops;
     /// `delsets[0]` is empty. A one-op set is stored inline in
     /// `Frag::del` as `ONE | op index`.
-    delsets: Vec<Vec<u32>>,
-    delset_ix: HashMap<Vec<u32>, u32>,
-    chunks: Vec<Vec<u32>>,
-    order: Vec<u32>,
-    rank: Vec<u32>,
+    pub(crate) delsets: Vec<Vec<u32>>,
+    pub(crate) delset_ix: FxMap<Vec<u32>, u32>,
+    pub(crate) chunks: Vec<Vec<u32>>,
+    pub(crate) order: Vec<u32>,
+    pub(crate) rank: Vec<u32>,
 }
 
 fn char_len(b: u8) -> u32 {
@@ -278,14 +501,14 @@ impl TextDoc {
         let mut d = TextDoc {
             epoch,
             ops: Vec::new(),
-            op_ix: HashMap::new(),
+            op_ix: FxMap::default(),
             op_bytes: Vec::new(),
             arena: Vec::new(),
             op_first: Vec::new(),
-            split: HashMap::new(),
+            split: FxMap::default(),
             frags: vec![start],
             delsets: vec![Vec::new()],
-            delset_ix: HashMap::new(),
+            delset_ix: FxMap::default(),
             chunks: vec![Vec::new()],
             order: vec![0],
             rank: vec![0],
@@ -311,6 +534,16 @@ impl TextDoc {
 
     pub fn epoch(&self) -> OpId {
         self.epoch
+    }
+
+    /// Length of the epoch's seed.
+    pub fn seed_len(&self) -> u32 {
+        self.op_bytes[0].1
+    }
+
+    /// The epoch's seed bytes (its blob, 7.4.2).
+    pub fn seed(&self) -> &[u8] {
+        self.op_slice(0)
     }
 
     /// Whether `op` has been integrated (or is the epoch).
@@ -934,53 +1167,72 @@ pub(crate) fn text_pass(
         if outcomes.get(&id) != Some(&Outcome::Applied) {
             continue;
         }
+        let eb = epoch_blob(ops, outcomes, t.node, t.epoch);
         let in_deps = |x: OpId| causal.precedes(x, id);
-        let ok = (|| {
-            let blob = epoch_blob(ops, outcomes, t.node, t.epoch)?;
-            if !in_deps(t.epoch) || !t.seen.iter().all(|&s| in_deps(s)) {
-                return None;
-            }
-            let slot =
-                tv.docs
-                    .entry((t.node, t.epoch))
-                    .or_insert_with(|| match fetch(blobs, &blob) {
-                        Some(b) if std::str::from_utf8(b).is_ok() => {
-                            DocSlot::Doc(Box::new(TextDoc::new(t.epoch, b)))
-                        }
-                        Some(_) => DocSlot::Deferred,
-                        None => DocSlot::Deferred,
-                    });
-            match slot {
-                DocSlot::Doc(d) => {
-                    if !d.check(t, &in_deps) {
-                        return None;
-                    }
-                    d.apply(id, t);
-                }
-                DocSlot::Deferred => {
-                    // A blob that is present but not UTF-8 is a bytes
-                    // epoch: no TextEdit on it is valid.
-                    if fetch(blobs, &blob).is_some()
-                        || !t
-                            .ins
-                            .iter()
-                            .all(|i| !i.bytes.is_empty() && std::str::from_utf8(&i.bytes).is_ok())
-                    {
-                        return None;
-                    }
-                }
-            }
-            Some(())
-        })();
-        match ok {
-            Some(()) => {
-                tv.valid.insert(id);
-            }
-            None => invalid.push(id),
+        if text_step(id, t, eb, &in_deps, &mut tv.docs, blobs) {
+            tv.valid.insert(id);
+        } else {
+            invalid.push(id);
         }
     }
     invalid.sort();
     (tv, invalid)
+}
+
+/// 7.4.1/7.4.2 validity of one structurally Applied `TextEdit` `id` and,
+/// if valid, its integration into its epoch's doc (created from the epoch
+/// blob on first use). `epoch_blob` = [`epoch_blob`] of its epoch;
+/// `in_deps(x)` = `x ∈ deps*(id)`. Validity depends only on the op's
+/// causal past, so any causal order of calls gives the same docs (Issue
+/// #54: the incremental [`crate::tree::Replica`] calls it per new op).
+pub(crate) fn text_step(
+    id: OpId,
+    t: &TextEdit,
+    epoch_blob: Option<BlobId>,
+    in_deps: &dyn Fn(OpId) -> bool,
+    docs: &mut BTreeMap<(NodeId, OpId), DocSlot>,
+    blobs: &dyn BlobSource,
+) -> bool {
+    let ok = (|| {
+        let blob = epoch_blob?;
+        if !in_deps(t.epoch) || !t.seen.iter().all(|&s| in_deps(s)) {
+            return None;
+        }
+        let slot = docs
+            .entry((t.node, t.epoch))
+            .or_insert_with(|| match fetch(blobs, &blob) {
+                Some(b) if std::str::from_utf8(&b).is_ok() => {
+                    DocSlot::Doc(Box::new(TextDoc::new(t.epoch, &b)))
+                }
+                Some(_) => DocSlot::Deferred,
+                None => DocSlot::Deferred,
+            });
+        match slot {
+            DocSlot::Doc(d) => {
+                if !d.check(t, in_deps) {
+                    return None;
+                }
+                d.apply(id, t);
+            }
+            // Not loaded (its seed is missing or damaged): the caller has
+            // recorded the error; the op is not integrated.
+            DocSlot::Lazy(..) => return None,
+            DocSlot::Deferred => {
+                // A blob that is present but not UTF-8 is a bytes
+                // epoch: no TextEdit on it is valid.
+                if fetch(blobs, &blob).is_some()
+                    || !t
+                        .ins
+                        .iter()
+                        .all(|i| !i.bytes.is_empty() && std::str::from_utf8(&i.bytes).is_ok())
+                {
+                    return None;
+                }
+            }
+        }
+        Some(())
+    })();
+    ok.is_some()
 }
 
 fn text_of(op: &Op) -> Option<&TextEdit> {
@@ -1008,108 +1260,143 @@ pub(crate) fn derive(
     blobs: &dyn BlobSource,
     tv: &mut TextEval,
 ) -> Vec<Conflict> {
-    let mut conflicts = Vec::new();
     let nodes: BTreeSet<NodeId> = tv
         .valid
         .iter()
         .map(|v| text_of(&ops[v]).unwrap().node)
         .collect();
-    for node in nodes {
-        // Content ops of `node`, ascending.
-        let cs: Vec<OpId> = ops
-            .iter()
-            .filter(|(id, o)| match &o.payload {
-                Payload::SetContent { node: n, .. } => {
-                    *n == node && outcomes[*id] == Outcome::Applied
-                }
-                Payload::TextEdit(t) => t.node == node && tv.valid.contains(id),
-                _ => false,
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        let w = *cs.last().unwrap();
-        let we = epoch_of(&ops[&w]);
-        let epoch_blob_id = |e: OpId| match &ops[&e].payload {
-            Payload::SetContent { blob, .. } => *blob,
-            _ => BlobId::empty(),
+    // Content ops per text node, ascending (one pass, Issue #54).
+    let mut by_node: BTreeMap<NodeId, Vec<OpId>> = BTreeMap::new();
+    for (id, o) in ops {
+        let n = match &o.payload {
+            Payload::SetContent { node, .. } if outcomes[id] == Outcome::Applied => *node,
+            Payload::TextEdit(t) if tv.valid.contains(id) => t.node,
+            _ => continue,
         };
-        // Blob of a content op (7.4.3): a SetContent's blob; for a text
-        // op, its epoch materialized at deps*(x) ∪ {x}.
-        let op_blob = |x: OpId, tv: &mut TextEval| -> BlobId {
-            match &ops[&x].payload {
-                Payload::SetContent { blob, .. } => *blob,
-                Payload::TextEdit(t) => match tv.doc(node, t.epoch) {
-                    Some(d) => {
-                        let b = d.materialize(&|o| o == x || causal.precedes(o, x));
-                        let id = BlobId::of(&b);
-                        tv.blobs.insert(id, b);
-                        id
-                    }
-                    None => epoch_blob_id(t.epoch),
-                },
-                _ => unreachable!(),
-            }
-        };
-        let (blob, bytes) = match tv.docs.get(&(node, we)) {
-            Some(DocSlot::Doc(d)) => {
-                let b = d.materialize_head();
-                let id = BlobId::of(&b);
-                tv.blobs.insert(id, b.clone());
-                (id, Some(b))
-            }
-            Some(DocSlot::Deferred) => (epoch_blob_id(we), None),
-            None => {
-                let id = epoch_blob_id(we);
-                (id, fetch(blobs, &id).map(|b| b.to_vec()))
-            }
-        };
-        tv.content.insert(
-            node,
-            NodeText {
-                epoch: we,
-                blob,
-                bytes,
-            },
-        );
-        // Winner blob = the merged head of the winning epoch (Issue #53
-        // repair R2): "keep winner" never drops concurrent merged edits.
-        let winner_blob = blob;
-        for &e in &cs[..cs.len() - 1] {
-            if epoch_of(&ops[&e]) == we {
-                continue;
-            }
-            let over = cs.iter().any(|&c| {
-                c != e
-                    && causal.precedes(e, c)
-                    && match &ops[&c].payload {
-                        Payload::TextEdit(t) => {
-                            t.seen.iter().any(|&s| s == e || causal.precedes(e, s))
-                        }
-                        _ => true,
-                    }
-            });
-            if !over {
-                let loser_blob = op_blob(e, tv);
-                conflicts.push(Conflict::Content {
-                    node,
-                    winner: w,
-                    loser: e,
-                    winner_blob,
-                    loser_blob,
-                });
-            }
-        }
-        if let Some(d) = tv.doc(node, we) {
-            let group: Vec<OpId> = cs
-                .iter()
-                .copied()
-                .filter(|c| text_of(&ops[c]).is_some_and(|t| t.epoch == we))
-                .collect();
-            let ns = notices(ops, causal, d, node, &group, &cs);
-            tv.notices.extend(ns);
+        if nodes.contains(&n) {
+            by_node.entry(n).or_default().push(*id);
         }
     }
+    let mut conflicts = Vec::new();
+    for (node, cs) in by_node {
+        let d = derive_node(node, &cs, &|x| &ops[&x], causal, blobs, &tv.docs);
+        tv.content.insert(node, d.content);
+        tv.notices.extend(d.notices);
+        tv.blobs.extend(d.blobs);
+        conflicts.extend(d.conflicts);
+    }
     conflicts
+}
+
+/// What [`derive_node`] derives for one text node.
+pub(crate) struct NodeDerived {
+    pub content: NodeText,
+    pub conflicts: Vec<Conflict>,
+    pub notices: Vec<Notice>,
+    pub blobs: Vec<(BlobId, Vec<u8>)>,
+}
+
+/// 7.4.3/7.8 for one node: `cs` = its content ops (Applied `SetContent`s
+/// and valid `TextEdit`s), ascending; `get` resolves any op id named by
+/// them (content ops and epochs).
+pub(crate) fn derive_node<'o>(
+    node: NodeId,
+    cs: &[OpId],
+    get: &dyn Fn(OpId) -> &'o Op,
+    causal: &Causality,
+    blobs: &dyn BlobSource,
+    docs: &BTreeMap<(NodeId, OpId), DocSlot>,
+) -> NodeDerived {
+    let mut conflicts = Vec::new();
+    let mut out_blobs = Vec::new();
+    let doc = |e: OpId| match docs.get(&(node, e)) {
+        Some(DocSlot::Doc(d)) => Some(&**d),
+        _ => None,
+    };
+    let w = *cs.last().unwrap();
+    let we = epoch_of(get(w));
+    let epoch_blob_id = |e: OpId| match &get(e).payload {
+        Payload::SetContent { blob, .. } => *blob,
+        _ => BlobId::empty(),
+    };
+    // Blob of a content op (7.4.3): a SetContent's blob; for a text
+    // op, its epoch materialized at deps*(x) ∪ {x}.
+    let mut op_blob = |x: OpId| -> BlobId {
+        match &get(x).payload {
+            Payload::SetContent { blob, .. } => *blob,
+            Payload::TextEdit(t) => match doc(t.epoch) {
+                Some(d) => {
+                    let b = d.materialize(&|o| o == x || causal.precedes(o, x));
+                    let id = BlobId::of(&b);
+                    out_blobs.push((id, b));
+                    id
+                }
+                None => epoch_blob_id(t.epoch),
+            },
+            _ => unreachable!(),
+        }
+    };
+    let (blob, bytes) = match docs.get(&(node, we)) {
+        Some(DocSlot::Doc(d)) => {
+            let b = d.materialize_head();
+            let id = BlobId::of(&b);
+            (id, Some(b))
+        }
+        // (A lazy doc is loaded by the replica before deriving.)
+        Some(DocSlot::Deferred | DocSlot::Lazy(..)) => (epoch_blob_id(we), None),
+        None => {
+            let id = epoch_blob_id(we);
+            (id, fetch(blobs, &id).map(|b| b.to_vec()))
+        }
+    };
+    // Winner blob = the merged head of the winning epoch (Issue #53
+    // repair R2): "keep winner" never drops concurrent merged edits.
+    let winner_blob = blob;
+    for &e in &cs[..cs.len() - 1] {
+        if epoch_of(get(e)) == we {
+            continue;
+        }
+        let over = cs.iter().any(|&c| {
+            c != e
+                && causal.precedes(e, c)
+                && match &get(c).payload {
+                    Payload::TextEdit(t) => t.seen.iter().any(|&s| s == e || causal.precedes(e, s)),
+                    _ => true,
+                }
+        });
+        if !over {
+            let loser_blob = op_blob(e);
+            conflicts.push(Conflict::Content {
+                node,
+                winner: w,
+                loser: e,
+                winner_blob,
+                loser_blob,
+            });
+        }
+    }
+    let mut ns = Vec::new();
+    if let Some(d) = doc(we) {
+        let group: Vec<OpId> = cs
+            .iter()
+            .copied()
+            .filter(|c| text_of(get(*c)).is_some_and(|t| t.epoch == we))
+            .collect();
+        ns = notices(get, causal, d, node, &group, cs);
+    }
+    if let (Some(DocSlot::Doc(_)), Some(b)) = (docs.get(&(node, we)), &bytes) {
+        out_blobs.push((blob, b.clone()));
+    }
+    NodeDerived {
+        content: NodeText {
+            epoch: we,
+            blob,
+            bytes,
+        },
+        conflicts,
+        notices: ns,
+        blobs: out_blobs,
+    }
 }
 
 /// Touch set of a text op (7.8) as byte ranges `(op, start, end)`.
@@ -1148,8 +1435,8 @@ fn find_root(p: &mut [usize], mut x: usize) -> usize {
 
 /// `concurrent-edit` notices of one node's winning epoch (7.8, D-053
 /// E-T2: on; identical concurrent edits are not flagged).
-fn notices(
-    ops: &BTreeMap<OpId, Op>,
+fn notices<'o>(
+    get: &dyn Fn(OpId) -> &'o Op,
     causal: &Causality,
     d: &TextDoc,
     node: NodeId,
@@ -1161,7 +1448,7 @@ fn notices(
     }
     let mut pts: Vec<(OpId, u32, u32, usize)> = Vec::new();
     for (k, &g) in group.iter().enumerate() {
-        for (o, s, e) in touch(d, g, text_of(&ops[&g]).unwrap()) {
+        for (o, s, e) in touch(d, g, text_of(get(g)).unwrap()) {
             pts.push((o, s, e, k));
         }
     }
@@ -1180,8 +1467,8 @@ fn notices(
     let mut parent: Vec<usize> = (0..group.len()).collect();
     for (a, b) in pairs {
         let (ta, tb) = (
-            text_of(&ops[&group[a]]).unwrap(),
-            text_of(&ops[&group[b]]).unwrap(),
+            text_of(get(group[a])).unwrap(),
+            text_of(get(group[b])).unwrap(),
         );
         if ta.del == tb.del && ta.ins == tb.ins {
             continue;
@@ -1590,11 +1877,11 @@ pub fn author_text_edit_on(
     let fresh;
     let doc = match ev_deps.text.docs.get(&(node, epoch)) {
         Some(DocSlot::Doc(d)) => d,
-        Some(DocSlot::Deferred) => return None,
+        Some(DocSlot::Deferred | DocSlot::Lazy(..)) => return None,
         None => {
             let b = fetch(blobs, &blob)?;
-            std::str::from_utf8(b).ok()?;
-            fresh = TextDoc::new(epoch, b);
+            std::str::from_utf8(&b).ok()?;
+            fresh = TextDoc::new(epoch, &b);
             &fresh
         }
     };

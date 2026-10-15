@@ -75,13 +75,37 @@ pub fn op_hash(o: &Op) -> [u8; 32] {
             id(&mut h, *node);
             h.update(blob.0);
         }
-        // Issue #53 (T1): core only; `h(o)` tag 4 lands with T2. Nothing
-        // authors or decodes a TextEdit before then.
-        // Fail-safe, never a panic: a tag no v1 op uses, so the hash never
-        // equals any encodable op's.
-        Payload::TextEdit(_) => {
-            h.update([0xff]);
-            h.update(b"text-ops-need-T2");
+        // Issue #54 (Text-CRDT 7.4.1): tag 4 over the `T` record's
+        // fields, length-prefixed, `seen` included.
+        Payload::TextEdit(t) => {
+            h.update([4]);
+            id(&mut h, t.node);
+            id(&mut h, t.epoch);
+            h.update((t.seen.len() as u64).to_be_bytes());
+            for s in &t.seen {
+                id(&mut h, *s);
+            }
+            h.update((t.del.len() as u64).to_be_bytes());
+            for (e, n) in &t.del {
+                id(&mut h, e.op);
+                h.update(e.off.to_be_bytes());
+                h.update(n.to_be_bytes());
+            }
+            h.update((t.ins.len() as u64).to_be_bytes());
+            for i in &t.ins {
+                for e in [i.left, i.right] {
+                    match e {
+                        None => h.update([0]),
+                        Some(e) => {
+                            h.update([1]);
+                            id(&mut h, e.op);
+                            h.update(e.off.to_be_bytes());
+                        }
+                    }
+                }
+                h.update((i.bytes.len() as u64).to_be_bytes());
+                h.update(&i.bytes);
+            }
         }
     }
     h.finalize().into()
