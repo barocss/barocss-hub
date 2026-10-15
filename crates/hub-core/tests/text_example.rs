@@ -424,3 +424,112 @@ fn snapshot_and_replica_conflicts_fall_back_for_text_ops() {
     assert!(r.encode_snapshot().is_none());
     assert!(r.conflicts(&map).is_none());
 }
+
+/// A true Myers tie: the forward step's tie goes to the deletion, which
+/// keeps the leftmost alignment (`a[0]` matches) and inserts at the top.
+#[test]
+fn diff_line_golden_tie() {
+    let s = id(1, 1);
+    assert_eq!(
+        golden("a\na\n", "b\na\n"),
+        (vec![(e(s, 2), 2)], vec![ins(None, Some(e(s, 0)), "b\n")])
+    );
+}
+
+/// FugueMax right siblings with different right origins (7.3.2): `a` and
+/// `b` are concurrent right children of `L`'s last element; `a`'s author
+/// saw `r` after `L`, `b`'s author saw `Z` (a concurrent left sibling of
+/// `L` under `r`) after `L`. Later right origin first: `a` before `b`.
+#[test]
+fn right_siblings_ordered_by_right_origin() {
+    let n = id(1, 1);
+    let s = id(2, 1);
+    let blob = BlobId::of(b"r\n");
+    let mut blobs = BTreeMap::new();
+    blobs.insert(blob, b"r\n".to_vec());
+    let edit =
+        |c: u64, r: u128, d: &[OpId], left: Option<ElemId>, right: Option<ElemId>, t: &str| Op {
+            id: id(c, r),
+            deps: deps(d),
+            payload: Payload::TextEdit(TextEdit {
+                node: n,
+                epoch: s,
+                seen: deps(&[s]),
+                del: vec![],
+                ins: vec![ins(left, right, t)],
+            }),
+        };
+    let l = id(3, 1);
+    let z = id(4, 2);
+    let ops = vec![
+        Op {
+            id: n,
+            deps: deps(&[]),
+            payload: Payload::Create {
+                kind: Kind::File,
+                parent: ROOT,
+                name: "f".into(),
+            },
+        },
+        Op {
+            id: s,
+            deps: deps(&[n]),
+            payload: Payload::SetContent { node: n, blob },
+        },
+        edit(3, 1, &[s], None, Some(e(s, 0)), "L\n"),
+        edit(4, 2, &[s], None, Some(e(s, 0)), "Z\n"),
+        // A saw L but not Z: successor of L's '\n' is r.
+        edit(5, 3, &[l], Some(e(l, 1)), Some(e(s, 0)), "a\n"),
+        // B saw both: successor of L's '\n' is Z.
+        edit(6, 4, &[l, z], Some(e(l, 1)), Some(e(z, 0)), "b\n"),
+    ];
+    let ev = evaluate_with(ops.iter(), &blobs);
+    assert_eq!(head(&ev, n), b"L\na\nb\nZ\nr\n");
+    let or = hub_core::text::oracle::evaluate(&ops, &blobs);
+    assert_eq!(or.content[&n].1, b"L\na\nb\nZ\nr\n");
+}
+
+/// 7.4.3 seen rule: a TextEdit whose deps reach past its diff base (here
+/// the API-like path, deps = V_wd ∪ {S2}, diff base and `seen` at V_wd)
+/// does not overwrite S2: S2 stays a visible `content` loser.
+#[test]
+fn seen_rule_deps_past_the_diff_base() {
+    use common::text::*;
+    let base = b"x\ny\n".to_vec();
+    let mut sim = TSim::new(2, &base);
+    let s2 = sim.flip(1, b"x\nflip\n");
+    sim.sync(0, 1);
+    let base_ops = sim.wd_ops(0);
+    let ev_base = evaluate_with(base_ops.values(), &sim.blobs);
+    let mut deps_ops = base_ops.clone();
+    deps_ops.insert(s2, sim.reps[0].known[&s2].clone());
+    let ev_deps = evaluate_with(deps_ops.values(), &sim.blobs);
+    let t = author_text_edit_on(
+        &ev_deps,
+        &base_ops,
+        &ev_base,
+        &sim.blobs,
+        sim.file,
+        b"x\ny\nmine\n",
+    )
+    .unwrap();
+    assert!(!t.seen.contains(&s2));
+    let mut ops = sim.all_ops();
+    let me = id(50, 1);
+    ops.push(Op {
+        id: me,
+        deps: deps_ops.keys().copied().collect(),
+        payload: Payload::TextEdit(t),
+    });
+    let ev = evaluate_with(ops.iter(), &sim.blobs);
+    assert_eq!(head(&ev, sim.file), b"x\ny\nmine\n");
+    let losers: Vec<OpId> = ev
+        .conflicts
+        .iter()
+        .filter_map(|c| match c {
+            Conflict::Content { loser, winner, .. } if *winner == me => Some(*loser),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(losers, vec![s2]);
+}
