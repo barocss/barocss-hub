@@ -345,7 +345,7 @@ pub fn evaluate(ops: &[Op], blobs: &dyn BlobSource) -> OracleText {
                     node,
                     winner: w,
                     loser: e,
-                    winner_blob: blob_of(w),
+                    winner_blob: BlobId::of(&out.content[&node].1),
                     loser_blob: blob_of(e),
                 });
             }

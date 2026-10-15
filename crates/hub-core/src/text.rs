@@ -1071,7 +1071,9 @@ pub(crate) fn derive(
                 bytes,
             },
         );
-        let winner_blob = op_blob(w, tv);
+        // Winner blob = the merged head of the winning epoch (Issue #53
+        // repair R2): "keep winner" never drops concurrent merged edits.
+        let winner_blob = blob;
         for &e in &cs[..cs.len() - 1] {
             if epoch_of(&ops[&e]) == we {
                 continue;

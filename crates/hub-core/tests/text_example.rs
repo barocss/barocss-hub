@@ -309,8 +309,8 @@ fn worked_example_variant_c_old_peer() {
         order.extend(p.iter().map(|o| o.id));
         let ev = evaluate_in_order(&ops, &blobs, &order);
         assert_eq!(head(&ev, n), b"# Plan\n- a\n- a1\n- B\n");
-        // winner_blob: the winner's epoch text at deps*(winner) ∪ {winner}.
-        let wb = BlobId::of(b"# Plan\n- a\n- B\n");
+        // winner_blob: the merged head of the winning epoch (repair R2).
+        let wb = BlobId::of(b"# Plan\n- a\n- a1\n- B\n");
         assert_eq!(
             ev.conflicts,
             [Conflict::Content {
@@ -323,7 +323,7 @@ fn worked_example_variant_c_old_peer() {
             .into_iter()
             .collect()
         );
-        assert_eq!(ev.text.blobs[&wb], b"# Plan\n- a\n- B\n");
+        assert_eq!(ev.text.blobs[&wb], b"# Plan\n- a\n- a1\n- B\n");
     }
     let or = hub_core::text::oracle::evaluate(&ops, &blobs);
     assert_eq!(or.conflicts, evaluate_with(ops.iter(), &blobs).conflicts);

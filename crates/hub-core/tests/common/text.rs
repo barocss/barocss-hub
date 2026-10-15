@@ -415,7 +415,7 @@ pub fn causal_order(ops: &[Op], seed: u64) -> Vec<OpId> {
 
 /// Add invalid TextEdits (7.4.1/7.4.2) authored by replica 99 on top of
 /// `ops`; returns the new ops.
-pub fn invalid_text_ops(ops: &[Op], file: NodeId, seed: u64) -> Vec<Op> {
+pub fn invalid_text_ops(ops: &[Op], file: NodeId, blobs: &Blobs, seed: u64) -> Vec<Op> {
     let mut rng = Xr(seed | 1);
     let map: BTreeMap<OpId, Op> = ops.iter().map(|o| (o.id, o.clone())).collect();
     let all: BTreeSet<OpId> = map.keys().copied().collect();
@@ -475,6 +475,48 @@ pub fn invalid_text_ops(ops: &[Op], file: NodeId, seed: u64) -> Vec<Op> {
             deps,
             payload: Payload::TextEdit(t),
         });
+    }
+    // Issue #53 repair R1: deletes that end or start inside a multibyte
+    // character (é, 한, 🙂, BOM) of a seed run or of a TextEdit run.
+    let mut k = 3u64;
+    let mut cands: Vec<(OpId, OpId, Vec<u8>)> = Vec::new(); // (epoch, elem op, bytes)
+    for o in map.values() {
+        match &o.payload {
+            Payload::SetContent { node, blob } if *node == file => {
+                if let Some(b) = blobs.get(blob) {
+                    cands.push((o.id, o.id, b.clone()));
+                }
+            }
+            Payload::TextEdit(t) if t.node == file && o.id.replica != ReplicaId(99) => {
+                let b: Vec<u8> = t.ins.iter().flat_map(|i| i.bytes.iter().copied()).collect();
+                cands.push((t.epoch, o.id, b));
+            }
+            _ => {}
+        }
+    }
+    let mut kinds = 0;
+    for (epoch, x, b) in cands.iter().rev() {
+        let Some(p) = b.iter().position(|&c| c >= 0xC0) else {
+            continue;
+        };
+        for (off, len) in [(p as u32, 1u32), (p as u32 + 1, 1)] {
+            out.push(Op {
+                id: NodeId::new(max + 1 + k, 99),
+                deps: hs.clone(),
+                payload: Payload::TextEdit(TextEdit {
+                    node: file,
+                    epoch: *epoch,
+                    seen: BTreeSet::new(),
+                    del: vec![(ElemId { op: *x, off }, len)],
+                    ins: vec![],
+                }),
+            });
+            k += 1;
+        }
+        kinds += 1;
+        if kinds == 2 {
+            break;
+        }
     }
     out
 }

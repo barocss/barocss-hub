@@ -187,7 +187,10 @@ pub fn try_encode_op(op: &Op) -> Result<String, &'static str> {
 
 /// One op record. A `TextEdit` (no v1 record before T2, Issue #53) encodes
 /// to a marker record that [`decode_op`] rejects, so it can never be read
-/// back as an op; durable writes use [`try_encode_op`] and refuse it.
+/// back as an op. The ops.log append uses [`try_encode_op`] and refuses
+/// it; other writers (pending.log, rescue manifest, wire `Ops`, reported)
+/// still call this and would write the marker: unreachable in T1 (nothing
+/// constructs a `TextEdit`); T2 routes every path through the `T` record.
 pub fn encode_op(op: &Op) -> String {
     let p = match &op.payload {
         Payload::Create { kind, parent, name } => {

@@ -41,7 +41,7 @@ fn build(nrep: usize, seed: usize, script: &[(u8, u8, u8, u8)], inv: u64) -> (TS
     let sim = text_history(nrep, seed, script);
     let mut ops = sim.all_ops();
     if inv % 3 == 0 {
-        ops.extend(invalid_text_ops(&ops, sim.file, inv));
+        ops.extend(invalid_text_ops(&ops, sim.file, &sim.blobs, inv));
     }
     (sim, ops)
 }
@@ -358,7 +358,7 @@ proptest! {
     fn p13_utf8_and_invalid_ops((nrep, seed, script, seeds) in text_strategy()) {
         let sim = text_history(nrep, seed, &script);
         let mut ops = sim.all_ops();
-        let bad = invalid_text_ops(&ops, sim.file, seeds[0]);
+        let bad = invalid_text_ops(&ops, sim.file, &sim.blobs, seeds[0]);
         ops.extend(bad.clone());
         let ev = evaluate_with(ops.iter(), &sim.blobs);
         let clean = evaluate_with(sim.all_ops().iter(), &sim.blobs);
@@ -553,6 +553,7 @@ fn text_generator_coverage_floor() {
     let n = 512;
     let (mut same_pos, mut same_del, mut revive, mut flip, mut stale, mut invalid, mut notice) =
         (0, 0, 0, 0, 0, 0, 0);
+    let mut midchar = 0;
     for _ in 0..n {
         let (nrep, seed, script, seeds) = strat.new_tree(&mut runner).unwrap().current();
         let (sim, ops) = build(nrep, seed, &script, seeds[0]);
@@ -607,10 +608,12 @@ fn text_generator_coverage_floor() {
             .any(|c| matches!(c, Conflict::InvalidOp { op } if text_of(&map[op]).is_some()))
             as usize;
         notice += (!ev.text.notices.is_empty()) as usize;
+        midchar +=
+            (invalid_text_ops(&sim.all_ops(), sim.file, &sim.blobs, seeds[0]).len() > 3) as usize;
     }
     eprintln!(
         "text coverage over {n} cases: same-position inserts={same_pos} same-range deletes={same_del} \
-         revive={revive} flip={flip} stale-epoch saves={stale} invalid={invalid} notices={notice}"
+         revive={revive} flip={flip} stale-epoch saves={stale} invalid={invalid} notices={notice} mid-char deletes={midchar}"
     );
     assert!(
         same_pos * 10 >= n,
@@ -628,4 +631,8 @@ fn text_generator_coverage_floor() {
         "invalid TextEdits {invalid}/{n} below 20%"
     );
     assert!(notice * 10 >= n, "notices {notice}/{n} below 10%");
+    assert!(
+        midchar * 5 >= n,
+        "mid-character deletes {midchar}/{n} below 20%"
+    );
 }
