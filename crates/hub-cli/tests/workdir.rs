@@ -800,6 +800,15 @@ fn racy_entries_are_smudged_and_guard_is_enforced() {
     let d = tmp("racy");
     ok(&d, &["init"]);
     write(&d, "f", b"aaaa");
+    // Pin the mtime inside the racy window regardless of how long `record`
+    // takes to start under load (#55): a minute ahead of now is always
+    // within `RACY_NS` of the save time.
+    fs::File::options()
+        .write(true)
+        .open(d.join("f"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        .unwrap();
     ok(&d, &["record"]);
     let ip = d.join(".hub/index");
     let text = fs::read_to_string(&ip).unwrap();

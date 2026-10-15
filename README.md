@@ -127,3 +127,24 @@ Only `HUB_PROPTEST_SEED` is read. proptest's global `PROPTEST_RNG_SEED` is
 ignored by this test, so exporting it elsewhere never disables the floor
 below. Under an override the 20% interruption floor is reported
 but not enforced.
+
+## Test hooks (`HUB_TEST_*`, Issue #55)
+
+The test suites drive the binary through `HUB_TEST_*` environment variables.
+Two are honored only in debug/test builds; a release binary ignores them
+(proved by the release branch of the tests that use them):
+
+- `HUB_TEST_NO_REJECTION_DEDUP`, `HUB_TEST_RESCUE_EDIT_AFTER_SYNC`
+
+These eleven are still read by release builds (known; moving all hooks
+behind a test-only cargo feature is tracked separately):
+
+- crash points: `HUB_TEST_CRASH_STAGE`, `HUB_TEST_CRASH_IN_SYNC`,
+  `HUB_TEST_CRASH_IN_CHECKOUT`, `HUB_TEST_CRASH_IN_BLOB_PUT`
+- logs: `HUB_TEST_FLUSH_LOG`, `HUB_TEST_SYNC_STATS`, `HUB_TEST_BLOB_BARRIER_LOG`
+- limits and timing: `HUB_TEST_MAX_BLOB_SIZE`, `HUB_TEST_SESSION_MS`,
+  `HUB_TEST_WIRE_TIMEOUT_MS`
+- platform: `HUB_TEST_FORCE_CASE_INSENSITIVE`
+
+`HUB_TEST_FULL_PROPTEST` and `HUB_TEST_OLD_BIN` are read only by the tests.
+`cargo test --workspace --release` is expected to pass.
