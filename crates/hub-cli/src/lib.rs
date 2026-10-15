@@ -16,6 +16,8 @@ pub mod session;
 pub mod snapshot;
 pub mod store;
 pub mod sync;
+#[cfg(test)]
+mod text_tests;
 pub mod trust;
 pub mod watch;
 pub mod wd;
@@ -106,6 +108,10 @@ pub enum Code {
     /// on this machine, without a terminal to ask and without `--yes`
     /// (Issue #45).
     UntrustedRemote,
+    /// The peer lacks wire feature `text` but the ops it is missing (pull)
+    /// or would receive (push) include text edits (Issue #54, Text-CRDT
+    /// 7.9, D-053 E-T6). Fatal for the session; nothing is persisted.
+    UpgradeRequired,
     /// Anything else.
     Error,
 }
@@ -141,6 +147,7 @@ impl Code {
         Code::Forbidden,
         Code::Bare,
         Code::UntrustedRemote,
+        Code::UpgradeRequired,
         Code::Error,
     ];
     pub fn as_str(self) -> &'static str {
@@ -174,6 +181,7 @@ impl Code {
             Code::Forbidden => "forbidden",
             Code::Bare => "bare",
             Code::UntrustedRemote => "untrusted-remote",
+            Code::UpgradeRequired => "upgrade-required",
             Code::Error => "error",
         }
     }
@@ -293,6 +301,8 @@ pub struct Repo {
     /// Lamport floor for new local ops (Issue #49: `reid --rescue` records
     /// above every op it removed). In memory only; 0 = none.
     pub counter_floor: u64,
+    /// On-disk format v2 (Issue #54): the replica header says v2.
+    v2: bool,
 }
 
 #[derive(Clone)]
@@ -477,7 +487,7 @@ impl Repo {
                     migrated = Some((r, p, covered));
                     warnings.push(format!("migrated {} to on-disk format v1", dir.display()));
                 }
-                migrate::Format::V1 => migrate::finish(&dir)?,
+                migrate::Format::V1 | migrate::Format::V2 => migrate::finish(&dir)?,
             }
             if mode != LockMode::Exclusive {
                 drop(lock);
@@ -491,13 +501,13 @@ impl Repo {
             reported::sweep_tmp(&dir);
         }
         let (fmt, rid) = migrate::read_replica(&dir)?;
-        if fmt != migrate::Format::V1 {
+        if fmt == migrate::Format::V0 {
             return errc(
                 Code::Corrupt,
                 format!("corrupt {}", dir.join("replica").display()),
             );
         }
-        migrate::check_format(&dir)?;
+        migrate::check_format_for(&dir, &fmt)?;
         let replica_id = ReplicaId(rid);
         let (_, op, cp) = Self::paths(&dir);
         if !store::LOCKING_AVAILABLE {
@@ -643,6 +653,7 @@ impl Repo {
             head_memo: std::cell::RefCell::new(head_memo),
             fast_memo: std::cell::Cell::new(Some((st_len, fast))),
             counter_floor: 0,
+            v2: fmt == migrate::Format::V2,
         };
         // Step 5 of a migration; otherwise the policy (writers only).
         if let Some(w) = repo.maybe_snapshot() {
@@ -769,6 +780,26 @@ impl Repo {
         evaluate(self.store.values().chain(ops.iter())).state
     }
 
+    /// Whether the repository is format v2 (Issue #54).
+    pub fn is_v2(&self) -> bool {
+        self.v2
+    }
+
+    /// Format v2 before the first `TextEdit` reaches any `.hub/` file
+    /// (Issue #54, Text-CRDT 7.9: lazily, under the exclusive lock,
+    /// header only). A no-op for a v2 repository.
+    pub fn ensure_text_format(&mut self) -> Result<(), Error> {
+        if self.v2 {
+            return Ok(());
+        }
+        if self.mode != LockMode::Exclusive {
+            return err("internal: format v2 upgrade without the exclusive lock");
+        }
+        migrate::upgrade_v2(&self.dir)?;
+        self.v2 = true;
+        Ok(())
+    }
+
     /// Persist then apply an op (any author; used by tests and `mint`).
     pub fn append_op(&mut self, op: Op) -> Result<(), Error> {
         let (_, r) = self.append_ops_with(std::iter::once(op), |_| Ok(()));
@@ -793,19 +824,45 @@ impl Repo {
         ops: impl IntoIterator<Item = Op>,
         mut before: impl FnMut(usize) -> Result<(), Error>,
     ) -> (usize, Result<(), Error>) {
+        let ops: Vec<Op> = ops.into_iter().collect();
+        if ops
+            .iter()
+            .any(|o| matches!(o.payload, Payload::TextEdit(_)))
+        {
+            if let Err(e) = self.ensure_text_format() {
+                return (0, Err(e));
+            }
+        }
         let mut done = Vec::new();
         let mut res = Ok(());
+        // Issue #54 guard: an op authored here whose record exceeds
+        // TEXT_OP_MAX could not travel in the smallest legal frame and
+        // would wedge every later sync: refuse the whole batch, nothing
+        // written. (Received ops are bounded by the wire frame limit.)
+        if let Some(o) = ops.iter().find(|o| {
+            o.id.replica == self.replica_id && store::encode_op(o).len() > store::TEXT_OP_MAX
+        }) {
+            return (
+                0,
+                Err(Error::new(
+                    Code::Limit,
+                    format!(
+                        "op {} encodes to {} bytes, over the {}-byte record limit (TEXT_OP_MAX); \
+                         split the edit (split_text_edit)",
+                        store::fmt_id(o.id),
+                        store::encode_op(o).len(),
+                        store::TEXT_OP_MAX
+                    ),
+                )),
+            );
+        }
         let mut log = match store::LogAppender::open(&self.dir.join("ops.log")) {
             Ok(l) => l,
             Err(e) => return (0, Err(e.into())),
         };
         for op in ops {
-            let r = before(done.len()).and_then(|()| {
-                // Issue #53: a text op has no v1 record before T2.
-                let line =
-                    store::try_encode_op(&op).map_err(|m| Error::new(Code::Unsupported, m))?;
-                log.write(&line).map_err(Error::from)
-            });
+            let r = before(done.len())
+                .and_then(|()| log.write(&store::encode_op(&op)).map_err(Error::from));
             if let Err(e) = r {
                 res = Err(e);
                 break;
@@ -833,7 +890,11 @@ impl Repo {
             self.store.insert(op.id, op.clone());
         }
         let n = done.len();
-        self.replica.receive_all(done);
+        self.replica
+            .receive_all_with(done, &DiskBlobs(self.dir.join("blobs")));
+        if let Some(b) = self.replica.text_seed_error() {
+            return (n, Err(seed_error(&self.dir, b)));
+        }
         (n, res)
     }
 
@@ -936,6 +997,32 @@ fn head_of(ops: &[&Op]) -> snapshot::Head {
     }
 }
 
+/// Epoch seeds (Text-CRDT 7.4.2, Issue #54) read on demand from
+/// `<.hub>/blobs`, hash-verified: a missing or damaged blob is `None` (a
+/// new doc stays deferred; a snapshot's lazy doc reports
+/// [`Replica::text_seed_error`]).
+pub(crate) struct DiskBlobs(pub PathBuf);
+
+impl hub_core::text::BlobSource for DiskBlobs {
+    fn blob_bytes(&self, id: &hub_core::tree::BlobId) -> Option<std::borrow::Cow<'_, [u8]>> {
+        blobs::read_verified(&self.0, id)
+            .ok()
+            .map(std::borrow::Cow::Owned)
+    }
+}
+
+/// The error for a snapshot-referenced seed blob that is gone (#54).
+pub(crate) fn seed_error(dir: &Path, b: hub_core::tree::BlobId) -> Error {
+    Error::new(
+        Code::Corrupt,
+        format!(
+            "corrupt {}: blob {} (the seed of a text file, referenced by .hub/snapshot) is missing or damaged",
+            dir.join("blobs").display(),
+            b.hex()
+        ),
+    )
+}
+
 /// Decode `records` (op bodies of `file`; record `i` is at line `line_of(i)`)
 /// and replay them on top of `base` (a snapshot's replica) or from
 /// scratch. Exact repeats are skipped; a repeated id with a different op
@@ -980,7 +1067,13 @@ pub(crate) fn replay_records(
     }
     // One batch: the view is refreshed once, not per op (Issue #28).
     if !replay.is_empty() || replica.is_empty() {
-        replica.receive_all(replay);
+        let dir = file.parent().unwrap_or(Path::new("."));
+        replica.receive_all_with(replay, &DiskBlobs(dir.join("blobs")));
+        if let Some(b) = replica.text_seed_error() {
+            // A snapshot's referenced seed is gone: the caller falls back
+            // to a full replay (A.2.3).
+            return Err(seed_error(dir, b));
+        }
     }
     if replica.pending_len() != 0 {
         return errc(

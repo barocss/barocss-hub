@@ -13,12 +13,18 @@
 //! * B3: 20 editors × 500 line edits on one 10k-line file in 20 sync
 //!   rounds; three random causal delivery orders into fresh docs.
 //!   Target: convergence, p99 integrate ≤ 1 ms per op.
+//! * B2 + B5 (Issue #54): 1M `TextEdit`s over 10k files of 2–200 KiB
+//!   (uniform), through the incremental `Replica`: full replay (open
+//!   without a snapshot), snapshot v2 encode, size (B5), file read +
+//!   decode (open with a snapshot, B2 target ≤ 1 s) and one more edit
+//!   on the reopened replica (the record step's core cost, ≤ 1 s).
+//!   `-- b2 [files] [edits]`.
 
 use std::collections::BTreeSet;
 use std::time::Instant;
 
 use hub_core::text::{diff_line, ElemId, Ins, TextDoc, TextEdit};
-use hub_core::tree::{evaluate_with, BlobId, Kind, NodeId, Op, OpId, Payload, ROOT};
+use hub_core::tree::{evaluate_with, BlobId, Kind, NodeId, Op, OpId, Payload, Replica, ROOT};
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -452,6 +458,197 @@ fn case_b3(editors: usize, edits: usize, lines: usize, rounds: usize) -> bool {
     ok
 }
 
+/// Per file: node, last op, epoch, seed length, last insert (op, length).
+type B2File = (NodeId, OpId, OpId, u32, Option<(OpId, u32)>);
+
+fn case_b2(nfiles: usize, nedits: usize) -> bool {
+    let mut rng = Rng::new(54);
+    let mut ops: Vec<Op> = Vec::with_capacity(2 * nfiles + nedits);
+    let mut blobs: std::collections::HashMap<BlobId, Vec<u8>> = std::collections::HashMap::new();
+    let mut counter = 10u64;
+    let mut next = |r: u128| {
+        counter += 1;
+        NodeId::new(counter, r)
+    };
+    // Per file: (node, last op, epoch, seed len, last insert (op, len)).
+    let mut files: Vec<B2File> = Vec::new();
+    let mut seed_bytes = 0usize;
+    let mut setup: Option<OpId> = None;
+    for i in 0..nfiles {
+        let n = next(1);
+        ops.push(Op {
+            id: n,
+            deps: setup.into_iter().collect(),
+            payload: Payload::Create {
+                kind: Kind::File,
+                parent: ROOT,
+                name: format!("f{i}.txt"),
+            },
+        });
+        let size = 2048 + rng.below(198 * 1024) as usize;
+        let mut seed = Vec::with_capacity(size + 64);
+        while seed.len() < size {
+            for _ in 0..8 {
+                seed.extend_from_slice(WORDS[rng.below(8) as usize].as_bytes());
+            }
+            seed.push(b'\n');
+        }
+        seed_bytes += seed.len();
+        let b = BlobId::of(&seed);
+        let s = next(1);
+        ops.push(Op {
+            id: s,
+            deps: [n].into(),
+            payload: Payload::SetContent { node: n, blob: b },
+        });
+        setup = Some(s);
+        files.push((n, s, s, seed.len() as u32, None));
+        blobs.insert(b, seed);
+    }
+    // Each editor's ops form one causal chain (§2.6 #7, as real replicas
+    // author on top of their own previous op).
+    let mut mine: Vec<Option<OpId>> = vec![None; 20];
+    for k in 0..nedits {
+        let f = rng.below(nfiles as u64) as usize;
+        let (n, last, epoch, slen, prev) = files[f];
+        let r = 2 + (k % 20) as u128;
+        let id = next(r);
+        let mut deps: BTreeSet<OpId> = [last].into();
+        deps.extend(mine[k % 20]);
+        mine[k % 20] = Some(id);
+        let line = format!("edit {k} by {r}\n").into_bytes();
+        let off = rng.below(slen as u64) as u32;
+        let mut del = Vec::new();
+        if k % 5 == 4 {
+            if let Some((p, l)) = prev {
+                del.push((ElemId { op: p, off: 0 }, l));
+            }
+        }
+        let len = line.len() as u32;
+        ops.push(Op {
+            id,
+            deps,
+            payload: Payload::TextEdit(TextEdit {
+                node: n,
+                epoch,
+                seen: [last].into(),
+                del,
+                ins: vec![Ins {
+                    left: Some(ElemId { op: epoch, off }),
+                    right: None,
+                    bytes: line,
+                }],
+            }),
+        });
+        files[f] = (n, id, epoch, slen, Some((id, len)));
+    }
+    println!(
+        "B2/B5: {nfiles} files, {} MiB of seeds, {nedits} TextEdits, {} ops",
+        seed_bytes >> 20,
+        ops.len()
+    );
+    let t = Instant::now();
+    let mut r = Replica::new();
+    r.receive_all_with(ops.clone(), &blobs);
+    let replay = t.elapsed().as_secs_f64();
+    let valid = r.text_valid().len();
+    println!("  full replay (open without snapshot): {replay:.2} s, valid edits {valid}");
+    let t = Instant::now();
+    let snap = r.encode_snapshot().expect("closed");
+    let enc = t.elapsed().as_secs_f64();
+    let path = std::env::temp_dir().join(format!("hub54-b2-{}.snap", std::process::id()));
+    std::fs::write(&path, &snap).unwrap();
+    drop(r);
+    let size = snap.len();
+    drop(snap);
+    // The CLI keeps seeds in `blobs/` and checks each referenced one
+    // exists with its length before trusting the snapshot (A.2.9).
+    let bdir = std::env::temp_dir().join(format!("hub54-b2-blobs-{}", std::process::id()));
+    std::fs::create_dir_all(&bdir).unwrap();
+    for (b, bytes) in &blobs {
+        std::fs::write(bdir.join(b.hex()), bytes).unwrap();
+    }
+    alloc_peak_reset();
+    let t = Instant::now();
+    let bytes = std::fs::read(&path).unwrap();
+    let read = t.elapsed().as_secs_f64();
+    let back = Replica::decode_snapshot(&bytes).expect("decodes");
+    let decoded = t.elapsed().as_secs_f64();
+    let lazy = back.text_lazy_seeds();
+    for (b, n) in &lazy {
+        assert_eq!(
+            std::fs::metadata(bdir.join(b.hex())).unwrap().len(),
+            *n as u64
+        );
+    }
+    let open = t.elapsed().as_secs_f64();
+    drop(bytes);
+    let peak = alloc_peak();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&bdir);
+    println!(
+        "  B2 open with snapshot: read {read:.2} s + decode {:.2} s + {} seed checks {:.2} s = {open:.2} s (target 1 s), peak {} MiB",
+        decoded - read,
+        lazy.len(),
+        open - decoded,
+        peak >> 20
+    );
+    // One more edit on the reopened replica (record's core step).
+    let (n, last, epoch, _, _) = files[0];
+    let mut back = back;
+    let one = Op {
+        id: next(99),
+        deps: [last].into(),
+        payload: Payload::TextEdit(TextEdit {
+            node: n,
+            epoch,
+            seen: [last].into(),
+            del: vec![],
+            ins: vec![Ins {
+                left: None,
+                right: None,
+                bytes: b"one more\n".to_vec(),
+            }],
+        }),
+    };
+    let t = Instant::now();
+    back.receive_all_with(vec![one], &blobs);
+    let rec = t.elapsed().as_secs_f64();
+    println!(
+        "  one more TextEdit on the reopened replica: {:.0} ms (target 1 s)",
+        rec * 1e3
+    );
+    // B5 (7.11 target, Planner #54): size <= 1.2 x (live inserted bytes
+    // + 40 B x runs) + a fixed overhead.
+    let t = Instant::now();
+    back.load_text_docs(&blobs).unwrap();
+    let load = t.elapsed().as_secs_f64();
+    let (mut runs, mut live) = (0usize, 0u64);
+    for (n, _, e, _, _) in &files {
+        let d = back.text_doc(*n, *e).unwrap();
+        runs += d.runs();
+        for (x, len, del) in d.elements() {
+            if del.is_empty() && x.op != *e {
+                live += len as u64;
+            }
+        }
+    }
+    let bound = 1.2 * (live as f64 + 40.0 * runs as f64);
+    println!(
+        "  B5 snapshot: {:.1} MiB; live inserted {:.1} MiB, {runs} runs; 1.2 x (live + 40 B x runs) = {:.1} MiB; size / that = {:.2} (fixed overhead {:.1} MiB if positive); encode {enc:.2} s; loading every lazy doc afterwards {load:.2} s",
+        size as f64 / 1048576.0,
+        live as f64 / 1048576.0,
+        bound / 1048576.0,
+        size as f64 / bound,
+        (size as f64 - bound) / 1048576.0
+    );
+    let ok = valid == nedits && open <= 1.0 && rec <= 1.0;
+    if !ok {
+        println!("  B2: MISSED");
+    }
+    ok
+}
+
 fn main() {
     let args: Vec<String> = std::env::args()
         .skip(1)
@@ -465,6 +662,14 @@ fn main() {
     }
     if which == "all" || which == "b3" {
         ok &= case_b3(20, 500, 10_000, 20);
+    }
+    if which == "all" || which == "b2" || which == "b5" {
+        let f = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(10_000);
+        let e = args
+            .get(2)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000);
+        ok &= case_b2(f, e);
     }
     if !ok {
         eprintln!("text bench: a target was missed or a check failed (see above)");

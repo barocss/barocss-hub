@@ -393,11 +393,12 @@ fn ckpts_naming(path: &Path, header: &str, r: &BTreeSet<OpId>) -> Result<Vec<Str
 /// technique): pre-#49 binaries refuse it ("unsupported repository
 /// format") before reading or writing anything else.
 fn set_replica(hub: &Path, rid: ReplicaId, rescuing: bool) -> Result<(), Error> {
-    let h = if rescuing {
-        store::REPLICA_HEADER_RESCUE
-    } else {
-        store::REPLICA_HEADER
-    };
+    // Issue #54: the marker keeps the format (v1-rescue / v2-rescue).
+    let v2 = matches!(
+        crate::migrate::read_replica(hub),
+        Ok((crate::migrate::Format::V2, _))
+    );
+    let h = store::replica_header(v2, rescuing);
     let want = format!("{h}\n{}\n", rid_hex(rid));
     if fs::read_to_string(hub.join("replica")).ok().as_deref() != Some(want.as_str()) {
         write_durable(&hub.join("replica"), &want, None)?;
@@ -407,8 +408,12 @@ fn set_replica(hub: &Path, rid: ReplicaId, rescuing: bool) -> Result<(), Error> 
 
 /// Whether the replica header carries the rescue marker.
 pub fn marked(hub: &Path) -> bool {
-    fs::read_to_string(hub.join("replica"))
-        .is_ok_and(|t| t.lines().next() == Some(store::REPLICA_HEADER_RESCUE))
+    fs::read_to_string(hub.join("replica")).is_ok_and(|t| {
+        matches!(
+            t.lines().next(),
+            Some(store::REPLICA_HEADER_RESCUE | store::REPLICA_HEADER_V2_RESCUE)
+        )
+    })
 }
 
 /// Stages 1-4 on the raw files, under the exclusive lock.
@@ -946,4 +951,33 @@ pub fn dirs(hub: &Path) -> Vec<PathBuf> {
         .unwrap_or_default();
     v.sort();
     v
+}
+
+/// Issue #54: the rescue manifest carries a `TextEdit` as its `T` record.
+#[cfg(test)]
+mod text_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn manifest_round_trips_a_text_edit() {
+        let d = std::env::temp_dir().join(format!("hub54-manifest-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let te = crate::wire::tests::golden_text_op();
+        let m = Manifest {
+            old: ReplicaId(7),
+            new: ReplicaId(9),
+            floor: 12,
+            ops: vec![te.clone()],
+            files: vec![],
+            ckpts: vec![],
+        };
+        let p = d.join("manifest");
+        fs::write(&p, encode_manifest(&m)).unwrap();
+        let back = read_manifest(&p).unwrap();
+        assert_eq!(back.ops, vec![te.clone()]);
+        assert!(fs::read_to_string(&p)
+            .unwrap()
+            .contains(&format!("op {}", store::encode_op(&te))));
+        let _ = fs::remove_dir_all(&d);
+    }
 }

@@ -25,6 +25,8 @@
 //! * #16 stale-epoch save visible: `p16_stale_epoch_save`
 //! * #17 anchor adjacency: `p17_anchor_adjacency`
 //! * coverage floors: `text_generator_coverage_floor`
+//! * Issue #54: incremental `Replica` (and its v2 snapshot) = evaluate for
+//!   text sets: `replica_and_snapshot_equal_evaluate`
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -635,4 +637,85 @@ fn text_generator_coverage_floor() {
         midchar * 5 >= n,
         "mid-character deletes {midchar}/{n} below 20%"
     );
+}
+
+/// Issue #54: everything the replica derives equals `evaluate_with`.
+fn replica_same(r: &Replica, ops: &[Op], blobs: &Blobs) -> Result<(), TestCaseError> {
+    let ev = evaluate_with(ops.iter(), blobs);
+    let map = map_of(ops);
+    prop_assert_eq!(r.state(), &ev.state);
+    let c = r.conflicts(&map);
+    prop_assert_eq!(c.as_ref(), Some(&ev.conflicts));
+    prop_assert_eq!(r.text_notices(), ev.text.notices.clone());
+    prop_assert_eq!(r.text_valid(), &ev.text.valid);
+    let content: BTreeMap<NodeId, (OpId, BlobId)> = ev
+        .text
+        .content
+        .iter()
+        .map(|(n, t)| (*n, (t.epoch, t.blob)))
+        .collect();
+    prop_assert_eq!(r.text_content(), &content);
+    // Docs of a decoded snapshot reference their seeds (Issue #54): load
+    // them on a copy, as a reader would.
+    let mut loaded = r.clone();
+    loaded
+        .load_text_docs(blobs)
+        .map_err(|b| TestCaseError::fail(format!("seed {b:?}")))?;
+    let r = &loaded;
+    for ((node, epoch), slot) in &ev.text.docs {
+        if let DocSlot::Doc(d) = slot {
+            let rd = r.text_doc(*node, *epoch);
+            prop_assert!(rd.is_some(), "doc {:?}", (node, epoch));
+            prop_assert_eq!(rd.unwrap().elements(), d.elements());
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    /// Issue #54 (T2 carry-over (c)): the incremental `Replica` fed in
+    /// random causal batches (duplicates included) equals `evaluate_with`
+    /// after every batch, with no evaluate fallback; a snapshot taken
+    /// after any batch decodes to a replica that keeps agreeing as more
+    /// batches arrive (carry-over (b)). Also out-of-order delivery (ops
+    /// before their deps are buffered).
+    #[test]
+    fn replica_and_snapshot_equal_evaluate((nrep, seed, script, seeds) in text_strategy()) {
+        let (sim, ops) = build(nrep, seed, &script, seeds[0]);
+        let blobs = &sim.blobs;
+        let order = causal_order(&ops, seeds[1]);
+        let by_id = map_of(&ops);
+        let mut rng = Xr(seeds[2] | 1);
+        let mut r = Replica::new();
+        let mut got: Vec<Op> = Vec::new();
+        let mut i = 0;
+        while i < order.len() {
+            let k = 1 + rng.below(4);
+            let mut batch: Vec<Op> = order[i..(i + k).min(order.len())]
+                .iter()
+                .map(|id| by_id[id].clone())
+                .collect();
+            if rng.below(3) == 0 {
+                batch.reverse();
+            }
+            if rng.below(4) == 0 && !got.is_empty() {
+                batch.push(got[rng.below(got.len())].clone());
+            }
+            i += k;
+            for o in &batch {
+                if !got.iter().any(|g| g.id == o.id) {
+                    got.push(o.clone());
+                }
+            }
+            r.receive_all_with(batch, blobs);
+            replica_same(&r, &got, blobs)?;
+            if rng.below(3) == 0 {
+                let snap = r.encode_snapshot().expect("closed replica");
+                let back = Replica::decode_snapshot(&snap).map_err(TestCaseError::fail)?;
+                prop_assert_eq!(back.encode_snapshot().unwrap(), snap);
+                r = back;
+                replica_same(&r, &got, blobs)?;
+            }
+        }
+    }
 }
