@@ -404,3 +404,23 @@ fn diff_line_cost_fallback() {
     assert_eq!(ins_[0].bytes, b.as_bytes());
     assert_eq!(ins_[0].left, Some(e(s, a.len() as u32 - 1)));
 }
+
+/// Issue #53 T1 boundary (T2 carry-overs): the v1 snapshot and the
+/// incremental `Replica` are text-unaware. With a text op in the set,
+/// `encode_snapshot` returns `None` and `Replica::conflicts` returns `None`,
+/// so callers fall back to the log and to `evaluate_with`.
+#[test]
+fn snapshot_and_replica_conflicts_fall_back_for_text_ops() {
+    let (mut ops, n, s, _) = base();
+    let mut r = Replica::new();
+    r.receive_all(ops.clone());
+    let map: BTreeMap<OpId, Op> = ops.iter().map(|o| (o.id, o.clone())).collect();
+    assert!(r.encode_snapshot().is_some());
+    assert!(r.conflicts(&map).is_some());
+    ops.extend(example_ops(n, s));
+    let mut r = Replica::new();
+    r.receive_all(ops.clone());
+    let map: BTreeMap<OpId, Op> = ops.iter().map(|o| (o.id, o.clone())).collect();
+    assert!(r.encode_snapshot().is_none());
+    assert!(r.conflicts(&map).is_none());
+}
