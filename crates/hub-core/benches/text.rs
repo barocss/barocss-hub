@@ -458,6 +458,9 @@ fn case_b3(editors: usize, edits: usize, lines: usize, rounds: usize) -> bool {
     ok
 }
 
+/// Per file: node, last op, epoch, seed length, last insert (op, length).
+type B2File = (NodeId, OpId, OpId, u32, Option<(OpId, u32)>);
+
 fn case_b2(nfiles: usize, nedits: usize) -> bool {
     let mut rng = Rng::new(54);
     let mut ops: Vec<Op> = Vec::with_capacity(2 * nfiles + nedits);
@@ -468,7 +471,7 @@ fn case_b2(nfiles: usize, nedits: usize) -> bool {
         NodeId::new(counter, r)
     };
     // Per file: (node, last op, epoch, seed len, last insert (op, len)).
-    let mut files: Vec<(NodeId, OpId, OpId, u32, Option<(OpId, u32)>)> = Vec::new();
+    let mut files: Vec<B2File> = Vec::new();
     let mut seed_bytes = 0usize;
     for i in 0..nfiles {
         let n = next(1);
