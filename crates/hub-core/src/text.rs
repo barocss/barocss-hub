@@ -177,6 +177,8 @@ impl TextEval {
 const NIL: u32 = u32::MAX;
 const START_F: u32 = 0;
 const CHUNK: usize = 128;
+/// Tag of an inline one-deleter set in `Frag::del`.
+const ONE: u32 = 1 << 31;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Side {
@@ -186,21 +188,26 @@ enum Side {
 
 /// A fragment of a run: elements `(op, off..off+len)`, a chain. Left
 /// children hang on its first element, right children on its last; inner
-/// elements have exactly the chain child (split on demand).
+/// elements have exactly the chain child (split on demand). Compact (7.11
+/// memory): ops are interned indices, children are sorted sibling lists
+/// (`first_l` / `first_r` / `next`), deleter sets are interned.
 #[derive(Clone, Debug)]
 struct Frag {
-    op: OpId,
+    op: u32,
     off: u32,
     len: u32,
     parent: u32,
-    side: Side,
-    /// The run's right origin (FugueMax right-sibling key).
-    ro: Option<ElemId>,
-    left_ch: Vec<u32>,
-    right_ch: Vec<u32>,
-    /// Ops deleting these elements (sorted).
-    del: Vec<OpId>,
     chunk: u32,
+    first_l: u32,
+    first_r: u32,
+    next: u32,
+    /// The run's right origin (FugueMax right-sibling key): op index and
+    /// offset, `ro_op == NIL` for END.
+    ro_op: u32,
+    ro_off: u32,
+    /// Interned set of deleting ops (0 = none).
+    del: u32,
+    side: Side,
 }
 
 #[derive(Clone, Copy)]
@@ -215,10 +222,21 @@ enum Place {
 #[derive(Clone, Debug)]
 pub struct TextDoc {
     epoch: OpId,
+    ops: Vec<OpId>,
+    op_ix: HashMap<OpId, u32>,
+    /// Per op index: start in `arena` and byte length.
+    op_bytes: Vec<(u64, u32)>,
+    arena: Vec<u8>,
+    /// Per op index: its fragment at offset 0, or `NIL`.
+    op_first: Vec<u32>,
+    /// Ops split into several fragments: `(start offset, fragment)`.
+    split: HashMap<u32, Vec<(u32, u32)>>,
     frags: Vec<Frag>,
-    bytes: HashMap<OpId, Vec<u8>>,
-    /// Per op: fragments by start offset, ascending.
-    index: HashMap<OpId, Vec<(u32, u32)>>,
+    /// Interned sorted deleter sets (op indices) of two or more ops;
+    /// `delsets[0]` is empty. A one-op set is stored inline in
+    /// `Frag::del` as `ONE | op index`.
+    delsets: Vec<Vec<u32>>,
+    delset_ix: HashMap<Vec<u32>, u32>,
     chunks: Vec<Vec<u32>>,
     order: Vec<u32>,
     rank: Vec<u32>,
@@ -244,31 +262,51 @@ impl TextDoc {
     /// The epoch's seed (7.4.2): `seed` as one run created by `epoch`.
     pub fn new(epoch: OpId, seed: &[u8]) -> Self {
         let start = Frag {
-            op: epoch,
+            op: 0,
             off: 0,
             len: 0,
             parent: NIL,
-            side: Side::R,
-            ro: None,
-            left_ch: Vec::new(),
-            right_ch: Vec::new(),
-            del: Vec::new(),
             chunk: NIL,
+            first_l: NIL,
+            first_r: NIL,
+            next: NIL,
+            ro_op: NIL,
+            ro_off: 0,
+            del: 0,
+            side: Side::R,
         };
         let mut d = TextDoc {
             epoch,
+            ops: Vec::new(),
+            op_ix: HashMap::new(),
+            op_bytes: Vec::new(),
+            arena: Vec::new(),
+            op_first: Vec::new(),
+            split: HashMap::new(),
             frags: vec![start],
-            bytes: HashMap::new(),
-            index: HashMap::new(),
+            delsets: vec![Vec::new()],
+            delset_ix: HashMap::new(),
             chunks: vec![Vec::new()],
             order: vec![0],
             rank: vec![0],
         };
-        d.bytes.insert(epoch, seed.to_vec());
+        d.delset_ix.insert(Vec::new(), 0);
+        let ix = d.add_op(epoch, seed);
         if !seed.is_empty() {
-            d.insert_run(epoch, 0, seed.len() as u32, None, None);
+            d.insert_run(ix, 0, seed.len() as u32, None, None);
         }
         d
+    }
+
+    fn add_op(&mut self, id: OpId, bytes: &[u8]) -> u32 {
+        let ix = self.ops.len() as u32;
+        self.ops.push(id);
+        self.op_ix.insert(id, ix);
+        self.op_bytes
+            .push((self.arena.len() as u64, bytes.len() as u32));
+        self.arena.extend_from_slice(bytes);
+        self.op_first.push(NIL);
+        ix
     }
 
     pub fn epoch(&self) -> OpId {
@@ -277,7 +315,7 @@ impl TextDoc {
 
     /// Whether `op` has been integrated (or is the epoch).
     pub fn has_op(&self, op: OpId) -> bool {
-        self.bytes.contains_key(&op)
+        self.op_ix.contains_key(&op)
     }
 
     /// Number of fragments (runs after splits).
@@ -285,17 +323,25 @@ impl TextDoc {
         self.frags.len() - 1
     }
 
+    fn op_slice(&self, ix: u32) -> &[u8] {
+        let (s, n) = self.op_bytes[ix as usize];
+        &self.arena[s as usize..s as usize + n as usize]
+    }
+
+    fn bytes_of(&self, op: OpId) -> Option<&[u8]> {
+        self.op_ix.get(&op).map(|&ix| self.op_slice(ix))
+    }
+
     /// `e` is an element of this epoch: a character start of an
     /// integrated op's bytes.
     pub fn is_elem(&self, e: ElemId) -> bool {
-        self.bytes
-            .get(&e.op)
+        self.bytes_of(e.op)
             .and_then(|b| b.get(e.off as usize))
             .is_some_and(|&b| !is_cont(b))
     }
 
     fn range_ok(&self, e: ElemId, len: u32) -> bool {
-        let Some(b) = self.bytes.get(&e.op) else {
+        let Some(b) = self.bytes_of(e.op) else {
             return false;
         };
         let end = e.off as u64 + len as u64;
@@ -334,27 +380,41 @@ impl TextDoc {
         for i in &edit.ins {
             all.extend_from_slice(&i.bytes);
         }
-        self.bytes.insert(id, all);
+        let ix = self.add_op(id, &all);
         let mut off = 0u32;
         for i in &edit.ins {
             let n = i.bytes.len() as u32;
-            self.insert_run(id, off, n, i.left, i.right);
+            self.insert_run(ix, off, n, i.left, i.right);
             off += n;
         }
         for &(e, len) in &edit.del {
-            self.delete(id, e, len);
+            self.delete(ix, e, len);
         }
     }
 
     fn find(&self, e: ElemId) -> Option<u32> {
-        let v = self.index.get(&e.op)?;
-        let i = v.partition_point(|&(o, _)| o <= e.off);
-        let (s, f) = *v.get(i.checked_sub(1)?)?;
-        (e.off < s + self.frags[f as usize].len).then_some(f)
+        let ix = *self.op_ix.get(&e.op)?;
+        let f = match self.split.get(&ix) {
+            None => self.op_first[ix as usize],
+            Some(v) => {
+                let i = v.partition_point(|&(o, _)| o <= e.off);
+                v.get(i.checked_sub(1)?)?.1
+            }
+        };
+        if f == NIL {
+            return None;
+        }
+        let fr = &self.frags[f as usize];
+        (e.off >= fr.off && e.off < fr.off + fr.len).then_some(f)
     }
 
-    fn index_add(&mut self, op: OpId, off: u32, f: u32) {
-        let v = self.index.entry(op).or_default();
+    fn index_add(&mut self, ix: u32, off: u32, f: u32) {
+        if off == 0 {
+            self.op_first[ix as usize] = f;
+            return;
+        }
+        let first = self.op_first[ix as usize];
+        let v = self.split.entry(ix).or_insert_with(|| vec![(0, first)]);
         let i = v.partition_point(|&(o, _)| o < off);
         v.insert(i, (off, f));
     }
@@ -392,16 +452,25 @@ impl TextDoc {
         }
     }
 
-    /// List position of element `e` (`None` = END, last).
-    fn epos(&self, e: Option<ElemId>) -> (u32, u32, u32) {
-        match e {
-            None => (u32::MAX, u32::MAX, u32::MAX),
-            Some(e) => {
-                let f = self.find(e).expect("origin exists");
-                let (c, i) = self.locate(f);
-                (self.rank[c], i as u32, e.off)
-            }
+    /// List position of the right origin `(op index, off)` (`NIL` = END).
+    fn epos(&self, ro_op: u32, ro_off: u32) -> (u32, u32, u32) {
+        if ro_op == NIL {
+            return (u32::MAX, u32::MAX, u32::MAX);
         }
+        let e = ElemId {
+            op: self.ops[ro_op as usize],
+            off: ro_off,
+        };
+        let f = self.find(e).expect("origin exists");
+        let (c, i) = self.locate(f);
+        (self.rank[c], i as u32, ro_off)
+    }
+
+    fn children(&self, first: u32) -> impl Iterator<Item = u32> + '_ {
+        std::iter::successors((first != NIL).then_some(first), move |&c| {
+            let n = self.frags[c as usize].next;
+            (n != NIL).then_some(n)
+        })
     }
 
     /// Split `f` so that a fragment starts at `at`; returns it.
@@ -412,35 +481,36 @@ impl TextDoc {
         }
         debug_assert!(at > fr.off && at < fr.off + fr.len);
         let g = self.frags.len() as u32;
-        let right_ch = std::mem::take(&mut self.frags[f as usize].right_ch);
-        let fr = &self.frags[f as usize];
         let gf = Frag {
             op: fr.op,
             off: at,
             len: fr.off + fr.len - at,
             parent: f,
-            side: Side::R,
-            ro: fr.ro,
-            left_ch: Vec::new(),
-            right_ch,
-            del: fr.del.clone(),
             chunk: NIL,
+            first_l: NIL,
+            first_r: fr.first_r,
+            next: NIL,
+            ro_op: fr.ro_op,
+            ro_off: fr.ro_off,
+            del: fr.del,
+            side: Side::R,
         };
         let op = fr.op;
-        for &c in &gf.right_ch {
+        let moved: Vec<u32> = self.children(gf.first_r).collect();
+        for c in moved {
             self.frags[c as usize].parent = g;
         }
         self.frags.push(gf);
         let fm = &mut self.frags[f as usize];
         fm.len = at - fm.off;
-        fm.right_ch = vec![g];
+        fm.first_r = g;
         self.index_add(op, at, g);
         self.place(Place::After(f), g);
         g
     }
 
     fn last_char_start(&self, op: OpId, end: u32) -> u32 {
-        let b = &self.bytes[&op];
+        let b = self.bytes_of(op).expect("op in doc");
         let mut p = end as usize - 1;
         while p > 0 && is_cont(b[p]) {
             p -= 1;
@@ -449,22 +519,30 @@ impl TextDoc {
     }
 
     fn leftmost(&self, mut f: u32) -> u32 {
-        while let Some(&c) = self.frags[f as usize].left_ch.first() {
-            f = c;
+        while self.frags[f as usize].first_l != NIL {
+            f = self.frags[f as usize].first_l;
         }
         f
     }
 
     fn rightmost(&self, mut f: u32) -> u32 {
-        while let Some(&c) = self.frags[f as usize].right_ch.last() {
+        while let Some(c) = self.children(self.frags[f as usize].first_r).last() {
             f = c;
         }
         f
     }
 
+    fn fid(&self, f: u32) -> ElemId {
+        let fr = &self.frags[f as usize];
+        ElemId {
+            op: self.ops[fr.op as usize],
+            off: fr.off,
+        }
+    }
+
     fn insert_run(
         &mut self,
-        op: OpId,
+        op: u32,
         off: u32,
         len: u32,
         left: Option<ElemId>,
@@ -472,7 +550,7 @@ impl TextDoc {
     ) {
         if let Some(l) = left {
             let f = self.find(l).expect("left exists");
-            let e = l.off + char_len(self.bytes[&l.op][l.off as usize]);
+            let e = l.off + char_len(self.bytes_of(l.op).unwrap()[l.off as usize]);
             let fr = &self.frags[f as usize];
             if e < fr.off + fr.len {
                 self.split(f, e);
@@ -497,77 +575,108 @@ impl TextDoc {
             self.frags[f as usize].parent == fl
         });
         let n = self.frags.len() as u32;
-        let nid = ElemId { op, off };
+        let nid = ElemId {
+            op: self.ops[op as usize],
+            off,
+        };
         let (parent, side) = match (under, fr) {
             (true, Some(fr)) => (fr, Side::L),
             _ => (fl, Side::R),
+        };
+        let (ro_op, ro_off) = match right {
+            None => (NIL, 0),
+            Some(r) => (self.op_ix[&r.op], r.off),
         };
         self.frags.push(Frag {
             op,
             off,
             len,
             parent,
-            side,
-            ro: right,
-            left_ch: Vec::new(),
-            right_ch: Vec::new(),
-            del: Vec::new(),
             chunk: NIL,
+            first_l: NIL,
+            first_r: NIL,
+            next: NIL,
+            ro_op,
+            ro_off,
+            del: 0,
+            side,
         });
         self.index_add(op, off, n);
-        let place = if side == Side::R {
+        // Find the sibling `n` goes before (`None` = last), then place.
+        let (first, before) = if side == Side::R {
             // Right siblings: right origin later in the list first, then
             // ElemId ascending (FugueMax).
-            let pn = self.epos(right);
-            let sibs = &self.frags[fl as usize].right_ch;
-            let i = sibs
-                .iter()
-                .position(|&s| {
-                    let sf = &self.frags[s as usize];
-                    let ps = self.epos(sf.ro);
-                    pn > ps
-                        || (pn == ps
-                            && nid
-                                < ElemId {
-                                    op: sf.op,
-                                    off: sf.off,
-                                })
-                })
-                .unwrap_or(sibs.len());
-            let p = if i < sibs.len() {
-                Place::Before(self.leftmost(sibs[i]))
-            } else if sibs.is_empty() {
-                Place::After(fl)
-            } else {
-                Place::After(self.rightmost(fl))
-            };
-            self.frags[fl as usize].right_ch.insert(i, n);
-            p
+            let pn = self.epos(ro_op, ro_off);
+            let first = self.frags[fl as usize].first_r;
+            let before = self.children(first).find(|&s| {
+                let sf = &self.frags[s as usize];
+                let ps = self.epos(sf.ro_op, sf.ro_off);
+                pn > ps || (pn == ps && nid < self.fid(s))
+            });
+            (first, before)
         } else {
             // Left siblings: ElemId ascending.
-            let sibs = &self.frags[parent as usize].left_ch;
-            let i = sibs
-                .iter()
-                .position(|&s| {
-                    let sf = &self.frags[s as usize];
-                    nid < ElemId {
-                        op: sf.op,
-                        off: sf.off,
-                    }
-                })
-                .unwrap_or(sibs.len());
-            let p = if i < sibs.len() {
-                Place::Before(self.leftmost(sibs[i]))
-            } else {
-                Place::Before(parent)
-            };
-            self.frags[parent as usize].left_ch.insert(i, n);
-            p
+            let first = self.frags[parent as usize].first_l;
+            let before = self.children(first).find(|&s| nid < self.fid(s));
+            (first, before)
         };
-        self.place(place, n);
+        let p = match (before, side) {
+            (Some(s), _) => Place::Before(self.leftmost(s)),
+            (None, Side::R) if first == NIL => Place::After(fl),
+            (None, Side::R) => Place::After(self.rightmost(fl)),
+            (None, Side::L) => Place::Before(parent),
+        };
+        // Link `n` into the sibling list before `before`.
+        let prev = self
+            .children(first)
+            .take_while(|&s| Some(s) != before)
+            .last();
+        self.frags[n as usize].next = before.unwrap_or(NIL);
+        match prev {
+            Some(pv) => self.frags[pv as usize].next = n,
+            None if side == Side::R => self.frags[fl as usize].first_r = n,
+            None => self.frags[parent as usize].first_l = n,
+        }
+        self.place(p, n);
     }
 
-    fn delete(&mut self, by: OpId, e: ElemId, len: u32) {
+    /// The deleter set `d` (op indices).
+    fn del_list(&self, d: u32) -> Vec<u32> {
+        if d & ONE != 0 {
+            vec![d & !ONE]
+        } else {
+            self.delsets[d as usize].clone()
+        }
+    }
+
+    fn any_del(&self, d: u32, f: impl Fn(u32) -> bool) -> bool {
+        if d & ONE != 0 {
+            f(d & !ONE)
+        } else {
+            self.delsets[d as usize].iter().any(|&x| f(x))
+        }
+    }
+
+    fn add_deleter(&mut self, set: u32, by: u32) -> u32 {
+        if set == 0 {
+            return ONE | by;
+        }
+        let mut v = self.del_list(set);
+        let Err(i) = v.binary_search(&by) else {
+            return set;
+        };
+        v.insert(i, by);
+        if let Some(&k) = self.delset_ix.get(&v) {
+            return k;
+        }
+        let k = self.delsets.len() as u32;
+        assert!(k < ONE, "too many deleter sets");
+        self.delsets.push(v.clone());
+        self.delset_ix.insert(v, k);
+        k
+    }
+
+    fn delete(&mut self, by: u32, e: ElemId, len: u32) {
         let end = e.off + len;
         let mut f = self.find(e).expect("deleted element exists");
         f = self.split(f, e.off);
@@ -576,10 +685,9 @@ impl TextDoc {
             if fr.off + fr.len > end {
                 self.split(f, end);
             }
-            let fr = &mut self.frags[f as usize];
-            if let Err(i) = fr.del.binary_search(&by) {
-                fr.del.insert(i, by);
-            }
+            let set = self.frags[f as usize].del;
+            self.frags[f as usize].del = self.add_deleter(set, by);
+            let fr = &self.frags[f as usize];
             let next = fr.off + fr.len;
             if next >= end {
                 break;
@@ -601,7 +709,23 @@ impl TextDoc {
     }
 
     fn slice(&self, f: &Frag) -> &[u8] {
-        &self.bytes[&f.op][f.off as usize..(f.off + f.len) as usize]
+        &self.op_slice(f.op)[f.off as usize..(f.off + f.len) as usize]
+    }
+
+    fn visible_at(&self, f: &Frag, in_v: &dyn Fn(OpId) -> bool) -> bool {
+        in_v(self.ops[f.op as usize]) && !self.any_del(f.del, |d| in_v(self.ops[d as usize]))
+    }
+
+    /// Per fragment in list order: `(op, deleting ops, bytes)` (notices).
+    fn frag_views(&self) -> impl Iterator<Item = (OpId, Vec<OpId>, &[u8])> + '_ {
+        self.iter().map(move |f| {
+            let dels = self
+                .del_list(f.del)
+                .into_iter()
+                .map(|d| self.ops[d as usize])
+                .collect();
+            (self.ops[f.op as usize], dels, self.slice(f))
+        })
     }
 
     /// 7.3.4: bytes, in list order, of elements whose op satisfies `in_v`
@@ -609,7 +733,7 @@ impl TextDoc {
     pub fn materialize(&self, in_v: &dyn Fn(OpId) -> bool) -> Vec<u8> {
         let mut out = Vec::new();
         for f in self.iter() {
-            if in_v(f.op) && !f.del.iter().any(|d| in_v(*d)) {
+            if self.visible_at(f, in_v) {
                 out.extend_from_slice(self.slice(f));
             }
         }
@@ -618,7 +742,13 @@ impl TextDoc {
 
     /// Head text: every integrated op.
     pub fn materialize_head(&self) -> Vec<u8> {
-        self.materialize(&|_| true)
+        let mut out = Vec::new();
+        for f in self.iter() {
+            if f.del == 0 {
+                out.extend_from_slice(self.slice(f));
+            }
+        }
+        out
     }
 
     /// Visible text at `in_v` as runs `(first element, bytes)`, contiguous
@@ -626,23 +756,17 @@ impl TextDoc {
     pub fn visible_runs(&self, in_v: &dyn Fn(OpId) -> bool) -> Vec<(ElemId, Vec<u8>)> {
         let mut out: Vec<(ElemId, Vec<u8>)> = Vec::new();
         for f in self.iter() {
-            let visible = in_v(f.op) && !f.del.iter().any(|d| in_v(*d));
-            if !visible {
+            if !self.visible_at(f, in_v) {
                 continue;
             }
+            let op = self.ops[f.op as usize];
             if let Some((id, b)) = out.last_mut() {
-                if id.op == f.op && id.off + b.len() as u32 == f.off {
+                if id.op == op && id.off + b.len() as u32 == f.off {
                     b.extend_from_slice(self.slice(f));
                     continue;
                 }
             }
-            out.push((
-                ElemId {
-                    op: f.op,
-                    off: f.off,
-                },
-                self.slice(f).to_vec(),
-            ));
+            out.push((ElemId { op, off: f.off }, self.slice(f).to_vec()));
         }
         out
     }
@@ -655,32 +779,26 @@ impl TextDoc {
         left: Option<ElemId>,
         in_deps: &dyn Fn(OpId) -> bool,
     ) -> Option<ElemId> {
-        let mut after = match left {
-            None => None,
+        // Start right after `left`'s fragment (or at the front for START).
+        let (r0, i0) = match left {
+            None => (0, 0),
             Some(l) => {
                 let f = self.find(l)?;
                 let fr = &self.frags[f as usize];
-                let e = l.off + char_len(self.bytes[&l.op][l.off as usize]);
+                let e = l.off + char_len(self.bytes_of(l.op).unwrap()[l.off as usize]);
                 if e < fr.off + fr.len {
                     return Some(ElemId { op: l.op, off: e });
                 }
-                Some(f)
+                let (c, i) = self.locate(f);
+                (self.rank[c] as usize, i + 1)
             }
         };
-        for &c in &self.order {
-            for &f in &self.chunks[c as usize] {
-                if let Some(a) = after {
-                    if a == f {
-                        after = None;
-                    }
-                    continue;
-                }
+        for (k, &c) in self.order.iter().enumerate().skip(r0) {
+            let from = if k == r0 { i0 } else { 0 };
+            for &f in self.chunks[c as usize].iter().skip(from) {
                 let fr = &self.frags[f as usize];
-                if in_deps(fr.op) {
-                    return Some(ElemId {
-                        op: fr.op,
-                        off: fr.off,
-                    });
+                if in_deps(self.ops[fr.op as usize]) {
+                    return Some(self.fid(f));
                 }
             }
         }
@@ -692,19 +810,26 @@ impl TextDoc {
     pub fn elements(&self) -> Vec<(ElemId, u32, Vec<OpId>)> {
         let mut out = Vec::new();
         for f in self.iter() {
-            let b = &self.bytes[&f.op];
+            let b = self.op_slice(f.op);
+            let op = self.ops[f.op as usize];
+            let mut dels: Vec<OpId> = self
+                .del_list(f.del)
+                .into_iter()
+                .map(|d| self.ops[d as usize])
+                .collect();
+            dels.sort();
             let mut p = f.off;
             while p < f.off + f.len {
                 let n = char_len(b[p as usize]);
-                out.push((ElemId { op: f.op, off: p }, n, f.del.clone()));
+                out.push((ElemId { op, off: p }, n, dels.clone()));
                 p += n;
             }
         }
         out
     }
 
-    /// Element before the run starting at `e` and after the run ending at
-    /// element `last`, in the full list (7.8 touch neighbours).
+    /// Element before the run starting at `first` and after the run
+    /// ending at element `last`, in the full list (7.8 touch neighbours).
     fn neighbours(&self, first: ElemId, last: ElemId) -> (Option<ElemId>, Option<ElemId>) {
         let ff = self.find(first).unwrap();
         let prev = if first.off > self.frags[ff as usize].off {
@@ -715,28 +840,23 @@ impl TextDoc {
         } else {
             self.adjacent(ff, false).map(|g| {
                 let gf = &self.frags[g as usize];
+                let op = self.ops[gf.op as usize];
                 ElemId {
-                    op: gf.op,
-                    off: self.last_char_start(gf.op, gf.off + gf.len),
+                    op,
+                    off: self.last_char_start(op, gf.off + gf.len),
                 }
             })
         };
         let lf = self.find(last).unwrap();
         let lfr = &self.frags[lf as usize];
-        let e = last.off + char_len(self.bytes[&last.op][last.off as usize]);
+        let e = last.off + char_len(self.bytes_of(last.op).unwrap()[last.off as usize]);
         let next = if e < lfr.off + lfr.len {
             Some(ElemId {
                 op: last.op,
                 off: e,
             })
         } else {
-            self.adjacent(lf, true).map(|g| {
-                let gf = &self.frags[g as usize];
-                ElemId {
-                    op: gf.op,
-                    off: gf.off,
-                }
-            })
+            self.adjacent(lf, true).map(|g| self.fid(g))
         };
         (prev, next)
     }
@@ -1104,10 +1224,9 @@ fn notice_lines(d: &TextDoc, set: &BTreeSet<OpId>) -> (u32, u32) {
     let total = (nl + u32::from(!head.is_empty() && *head.last().unwrap() != b'\n')).max(1);
     let mut line = 1u32;
     let (mut lo, mut hi) = (u32::MAX, 0u32);
-    for f in d.iter() {
-        let mine = set.contains(&f.op) || f.del.iter().any(|x| set.contains(x));
-        let visible = f.del.is_empty();
-        let b = d.slice(f);
+    for (op, dels, b) in d.frag_views() {
+        let mine = set.contains(&op) || dels.iter().any(|x| set.contains(x));
+        let visible = dels.is_empty();
         if mine {
             let (a, z) = if visible {
                 let inner = b[..b.len() - 1].iter().filter(|&&c| c == b'\n').count() as u32;
