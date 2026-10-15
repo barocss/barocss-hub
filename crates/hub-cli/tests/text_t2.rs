@@ -921,3 +921,69 @@ fn chained_save_round_trips_and_syncs() {
     ok(&c, &["sync"], &env);
     assert_eq!(text(&c, n), big);
 }
+
+/// Snapshot v2 references each epoch's seed by blob id (B5): the seed
+/// bytes are not in `.hub/snapshot`, opening from it equals a full
+/// replay, and a missing referenced seed makes open ignore the snapshot
+/// with a warning and replay `ops.log` (A.2.3 fallback).
+#[test]
+fn snapshot_references_seeds_and_falls_back_without_them() {
+    let t = tmp("seedref");
+    let a = repo(&t, "a");
+    let seed = format!("{SEED}{}", "unique seed line zq\n".repeat(200));
+    let n = record_file(&a, &seed);
+    edit(&a, n, &format!("{seed}- edited\n"));
+    let snap0 = [("HUB_SNAPSHOT_MIN", "0")];
+    ok(&a, &["commit", "-m", "s"], &snap0);
+    let snap = fs::read(a.join(".hub/snapshot")).unwrap();
+    assert!(snap.starts_with(b"barocss-hub/snapshot/v2\n"));
+    assert!(
+        !snap.windows(20).any(|w| w == b"unique seed line zq\n"),
+        "seed copied"
+    );
+    let want = ok(&a, &["status"], &[("HUB_NO_SNAPSHOT", "1")]);
+    let o = hub(&a, &["status"], &[]);
+    assert!(o.status.success());
+    assert!(!String::from_utf8_lossy(&o.stderr).contains("ignoring"));
+    assert_eq!(String::from_utf8_lossy(&o.stdout), want);
+    // A later text edit loads the lazy doc from blobs/ and stays equal.
+    edit(&a, n, &format!("{seed}- edited\n- again\n"));
+    assert_eq!(text(&a, n), format!("{seed}- edited\n- again\n"));
+    ok(&a, &["commit", "-m", "s2"], &snap0);
+    // Remove the referenced seed blob: the snapshot is ignored.
+    let b = BlobId::of(seed.as_bytes()).hex();
+    let p = a.join(".hub/blobs").join(&b);
+    let keep = fs::read(&p).unwrap();
+    fs::remove_file(&p).unwrap();
+    let o = hub(&a, &["status"], &[]);
+    let e = String::from_utf8_lossy(&o.stderr);
+    assert!(e.contains("ignoring") && e.contains(&b), "{e}");
+    // Back in place (same length, damaged bytes): open trusts the
+    // snapshot (existence and length), the next text op that needs the
+    // seed reports corrupt, and an open after that falls back.
+    fs::write(&p, vec![b'x'; keep.len()]).unwrap();
+    let mut r = Repo::open_dir_with(a.join(".hub"), LockMode::Exclusive).unwrap();
+    let last = *r.store.keys().max().unwrap();
+    let te = hub_core::text::TextEdit {
+        node: n,
+        epoch: r
+            .store
+            .values()
+            .find(|o| matches!(o.payload, Payload::SetContent { node, .. } if node == n))
+            .unwrap()
+            .id,
+        seen: [last].into(),
+        del: vec![],
+        ins: vec![hub_core::text::Ins {
+            left: None,
+            right: None,
+            bytes: b"x\n".to_vec(),
+        }],
+    };
+    let op = r.prepare(Payload::TextEdit(te));
+    let err = r.append_op(op).unwrap_err();
+    assert!(err.to_string().contains(&b), "{err}");
+    fs::write(&p, &keep).unwrap();
+    drop(r);
+    ok(&a, &["status"], &[]);
+}

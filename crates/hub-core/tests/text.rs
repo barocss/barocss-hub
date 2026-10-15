@@ -655,6 +655,13 @@ fn replica_same(r: &Replica, ops: &[Op], blobs: &Blobs) -> Result<(), TestCaseEr
         .map(|(n, t)| (*n, (t.epoch, t.blob)))
         .collect();
     prop_assert_eq!(r.text_content(), &content);
+    // Docs of a decoded snapshot reference their seeds (Issue #54): load
+    // them on a copy, as a reader would.
+    let mut loaded = r.clone();
+    loaded
+        .load_text_docs(blobs)
+        .map_err(|b| TestCaseError::fail(format!("seed {b:?}")))?;
+    let r = &loaded;
     for ((node, epoch), slot) in &ev.text.docs {
         if let DocSlot::Doc(d) = slot {
             let rd = r.text_doc(*node, *epoch);

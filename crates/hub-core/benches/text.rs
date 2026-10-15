@@ -561,28 +561,36 @@ fn case_b2(nfiles: usize, nedits: usize) -> bool {
     drop(r);
     let size = snap.len();
     drop(snap);
+    // The CLI keeps seeds in `blobs/` and checks each referenced one
+    // exists with its length before trusting the snapshot (A.2.9).
+    let bdir = std::env::temp_dir().join(format!("hub54-b2-blobs-{}", std::process::id()));
+    std::fs::create_dir_all(&bdir).unwrap();
+    for (b, bytes) in &blobs {
+        std::fs::write(bdir.join(b.hex()), bytes).unwrap();
+    }
     alloc_peak_reset();
     let t = Instant::now();
     let bytes = std::fs::read(&path).unwrap();
     let read = t.elapsed().as_secs_f64();
     let back = Replica::decode_snapshot(&bytes).expect("decodes");
+    let decoded = t.elapsed().as_secs_f64();
+    let lazy = back.text_lazy_seeds();
+    for (b, n) in &lazy {
+        assert_eq!(
+            std::fs::metadata(bdir.join(b.hex())).unwrap().len(),
+            *n as u64
+        );
+    }
     let open = t.elapsed().as_secs_f64();
     drop(bytes);
     let peak = alloc_peak();
     let _ = std::fs::remove_file(&path);
-    let runs: usize = files
-        .iter()
-        .filter_map(|(n, _, e, _, _)| back.text_doc(*n, *e).map(|d| d.runs()))
-        .sum();
+    let _ = std::fs::remove_dir_all(&bdir);
     println!(
-        "  B5 snapshot: {:.1} MiB ({:.1} MiB over the seeds; {runs} runs, {:.0} B/run over seeds), encode {enc:.2} s",
-        size as f64 / 1048576.0,
-        (size - seed_bytes) as f64 / 1048576.0,
-        (size - seed_bytes) as f64 / runs.max(1) as f64
-    );
-    println!(
-        "  B2 open with snapshot: read {read:.2} s + decode {:.2} s = {open:.2} s (target 1 s), peak {} MiB",
-        open - read,
+        "  B2 open with snapshot: read {read:.2} s + decode {:.2} s + {} seed checks {:.2} s = {open:.2} s (target 1 s), peak {} MiB",
+        decoded - read,
+        lazy.len(),
+        open - decoded,
         peak >> 20
     );
     // One more edit on the reopened replica (record's core step).
@@ -609,6 +617,30 @@ fn case_b2(nfiles: usize, nedits: usize) -> bool {
     println!(
         "  one more TextEdit on the reopened replica: {:.0} ms (target 1 s)",
         rec * 1e3
+    );
+    // B5 (7.11 target, Planner #54): size <= 1.2 x (live inserted bytes
+    // + 40 B x runs) + a fixed overhead.
+    let t = Instant::now();
+    back.load_text_docs(&blobs).unwrap();
+    let load = t.elapsed().as_secs_f64();
+    let (mut runs, mut live) = (0usize, 0u64);
+    for (n, _, e, _, _) in &files {
+        let d = back.text_doc(*n, *e).unwrap();
+        runs += d.runs();
+        for (x, len, del) in d.elements() {
+            if del.is_empty() && x.op != *e {
+                live += len as u64;
+            }
+        }
+    }
+    let bound = 1.2 * (live as f64 + 40.0 * runs as f64);
+    println!(
+        "  B5 snapshot: {:.1} MiB; live inserted {:.1} MiB, {runs} runs; 1.2 x (live + 40 B x runs) = {:.1} MiB; size / that = {:.2} (fixed overhead {:.1} MiB if positive); encode {enc:.2} s; loading every lazy doc afterwards {load:.2} s",
+        size as f64 / 1048576.0,
+        live as f64 / 1048576.0,
+        bound / 1048576.0,
+        size as f64 / bound,
+        (size as f64 - bound) / 1048576.0
     );
     let ok = valid == nedits && open <= 1.0 && rec <= 1.0;
     if !ok {

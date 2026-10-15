@@ -534,7 +534,7 @@ pub fn doc_lists(ev: &Evaluation) -> DocLists {
                     .map(|(e, _, del)| (e, del))
                     .collect(),
             )),
-            DocSlot::Deferred => None,
+            DocSlot::Deferred | DocSlot::Lazy(..) => None,
         })
         .collect()
 }

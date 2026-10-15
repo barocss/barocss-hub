@@ -1079,6 +1079,9 @@ pub(crate) struct TextPart {
     pub(crate) fold: BTreeMap<NodeId, Option<BlobId>>,
     /// Some `TextEdit` is in the log (ops never leave it).
     pub(crate) any: bool,
+    /// A lazy doc's seed blob (snapshot v2) that was missing or damaged
+    /// when it was needed. Not snapshotted.
+    pub(crate) seed_error: Option<BlobId>,
 }
 
 impl TextPart {
@@ -1094,9 +1097,9 @@ struct SeedChain<'a> {
 }
 
 impl crate::text::BlobSource for SeedChain<'_> {
-    fn blob_bytes(&self, id: &BlobId) -> Option<&[u8]> {
+    fn blob_bytes(&self, id: &BlobId) -> Option<std::borrow::Cow<'_, [u8]>> {
         match self.seeds.get(id) {
-            Some(b) => Some(b),
+            Some(b) => Some(std::borrow::Cow::Borrowed(b)),
             None => self.next.blob_bytes(id),
         }
     }
@@ -1426,7 +1429,34 @@ impl Replica {
         self.text.docs.contains_key(&(node, epoch))
     }
 
-    /// The doc of one epoch (`None` if absent or deferred).
+    /// Seeds of the docs a snapshot v2 referenced and that are not loaded
+    /// yet: `(blob, length)` (the CLI checks they exist before trusting
+    /// the snapshot).
+    pub fn text_lazy_seeds(&self) -> Vec<(BlobId, u32)> {
+        self.text
+            .docs
+            .values()
+            .filter_map(|s| match s {
+                crate::text::DocSlot::Lazy(d, b) => Some((*b, d.seed_len())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Load every lazy doc's seed (tests, T3 materialization).
+    pub fn load_text_docs(&mut self, blobs: &dyn crate::text::BlobSource) -> Result<(), BlobId> {
+        for slot in self.text.docs.values_mut() {
+            crate::text::load_slot(slot, blobs)?;
+        }
+        Ok(())
+    }
+
+    /// A referenced seed blob that was missing or damaged when needed.
+    pub fn text_seed_error(&self) -> Option<BlobId> {
+        self.text.seed_error
+    }
+
+    /// The doc of one epoch (`None` if absent, deferred or not loaded).
     pub fn text_doc(&self, node: NodeId, epoch: OpId) -> Option<&crate::text::TextDoc> {
         match self.text.docs.get(&(node, epoch)) {
             Some(crate::text::DocSlot::Doc(d)) => Some(d),
@@ -1571,6 +1601,14 @@ impl Replica {
                 cs.entry(n).or_default().push(o.id);
             }
         }
+        // Every doc of an affected node is derived from: load lazy ones.
+        for (k, slot) in self.text.docs.iter_mut() {
+            if affected.contains(&k.0) {
+                if let Err(b) = crate::text::load_slot(slot, blobs) {
+                    self.text.seed_error = Some(b);
+                }
+            }
+        }
         let get = |x: OpId| &self.logged(x).expect("op in log").0;
         let mut out = Vec::new();
         for (node, c) in &cs {
@@ -1605,6 +1643,11 @@ impl Replica {
                 continue;
             };
             let t = t.clone();
+            if let Some(slot) = self.text.docs.get_mut(&(t.node, t.epoch)) {
+                if let Err(b) = crate::text::load_slot(slot, blobs) {
+                    self.text.seed_error = Some(b);
+                }
+            }
             let eb = self.epoch_blob_in(t.node, t.epoch);
             let in_deps = |x: OpId| causal.precedes(x, id);
             if crate::text::text_step(id, &t, eb, &in_deps, &mut self.text.docs, blobs) {

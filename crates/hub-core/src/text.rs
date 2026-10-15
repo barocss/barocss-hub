@@ -26,6 +26,7 @@
 //! child of `left`. For conforming authors this is the 7.3.2 rule; for any
 //! op it is a pure function of the op set.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::tree::{
@@ -238,26 +239,27 @@ pub const DIFF_NAME: &str = "hub-diff-line/1";
 pub const DIFF_MAX_D: usize = 20_000;
 
 /// Read access to blob bytes (the CLI supplies its store; tests a map).
-/// The empty blob is always available.
+/// The empty blob is always available. Issue #54: a source may read on
+/// demand (the CLI's `.hub/blobs`), so bytes come back as a `Cow`.
 pub trait BlobSource {
-    fn blob_bytes(&self, id: &BlobId) -> Option<&[u8]>;
+    fn blob_bytes(&self, id: &BlobId) -> Option<Cow<'_, [u8]>>;
 }
 
 impl BlobSource for BlobStore {
-    fn blob_bytes(&self, id: &BlobId) -> Option<&[u8]> {
-        self.get(id)
+    fn blob_bytes(&self, id: &BlobId) -> Option<Cow<'_, [u8]>> {
+        self.get(id).map(Cow::Borrowed)
     }
 }
 
 impl BlobSource for BTreeMap<BlobId, Vec<u8>> {
-    fn blob_bytes(&self, id: &BlobId) -> Option<&[u8]> {
-        self.get(id).map(|v| v.as_slice())
+    fn blob_bytes(&self, id: &BlobId) -> Option<Cow<'_, [u8]>> {
+        self.get(id).map(|v| Cow::Borrowed(v.as_slice()))
     }
 }
 
 impl BlobSource for HashMap<BlobId, Vec<u8>> {
-    fn blob_bytes(&self, id: &BlobId) -> Option<&[u8]> {
-        self.get(id).map(|v| v.as_slice())
+    fn blob_bytes(&self, id: &BlobId) -> Option<Cow<'_, [u8]>> {
+        self.get(id).map(|v| Cow::Borrowed(v.as_slice()))
     }
 }
 
@@ -265,14 +267,14 @@ impl BlobSource for HashMap<BlobId, Vec<u8>> {
 pub struct NoBlobs;
 
 impl BlobSource for NoBlobs {
-    fn blob_bytes(&self, _: &BlobId) -> Option<&[u8]> {
+    fn blob_bytes(&self, _: &BlobId) -> Option<Cow<'_, [u8]>> {
         None
     }
 }
 
-fn fetch<'a>(src: &'a dyn BlobSource, id: &BlobId) -> Option<&'a [u8]> {
+pub(crate) fn fetch<'a>(src: &'a dyn BlobSource, id: &BlobId) -> Option<Cow<'a, [u8]>> {
     if *id == BlobId::empty() {
-        return Some(&[]);
+        return Some(Cow::Borrowed(&[]));
     }
     src.blob_bytes(id)
 }
@@ -307,6 +309,33 @@ pub struct NodeText {
 pub enum DocSlot {
     Doc(Box<TextDoc>),
     Deferred,
+    /// Issue #54 (snapshot v2): a doc decoded from a snapshot that
+    /// references its seed by blob id; the seed bytes are read on first
+    /// use ([`load_slot`]). Never produced by `evaluate`.
+    Lazy(Box<TextDoc>, BlobId),
+}
+
+/// Load a [`DocSlot::Lazy`] doc's seed from `blobs` (checked against the
+/// blob id and the recorded length). `Err(blob)` if it is missing or
+/// does not match; other slots are left as they are.
+pub(crate) fn load_slot(slot: &mut DocSlot, blobs: &dyn BlobSource) -> Result<(), BlobId> {
+    let DocSlot::Lazy(d, blob) = slot else {
+        return Ok(());
+    };
+    let blob = *blob;
+    let Some(b) = fetch(blobs, &blob) else {
+        return Err(blob);
+    };
+    if b.len() != d.op_bytes[0].1 as usize || BlobId::of(&b) != blob {
+        return Err(blob);
+    }
+    let mut arena = Vec::with_capacity(b.len() + d.arena.len());
+    arena.extend_from_slice(&b);
+    arena.extend_from_slice(&d.arena);
+    let mut doc = std::mem::replace(d, Box::new(TextDoc::new(d.epoch, b"")));
+    doc.arena = arena;
+    *slot = DocSlot::Doc(doc);
+    Ok(())
 }
 
 /// Text part of an evaluation. Empty when the op set has no `TextEdit`.
@@ -505,6 +534,11 @@ impl TextDoc {
 
     pub fn epoch(&self) -> OpId {
         self.epoch
+    }
+
+    /// Length of the epoch's seed.
+    pub fn seed_len(&self) -> u32 {
+        self.op_bytes[0].1
     }
 
     /// The epoch's seed bytes (its blob, 7.4.2).
@@ -1167,8 +1201,8 @@ pub(crate) fn text_step(
         let slot = docs
             .entry((t.node, t.epoch))
             .or_insert_with(|| match fetch(blobs, &blob) {
-                Some(b) if std::str::from_utf8(b).is_ok() => {
-                    DocSlot::Doc(Box::new(TextDoc::new(t.epoch, b)))
+                Some(b) if std::str::from_utf8(&b).is_ok() => {
+                    DocSlot::Doc(Box::new(TextDoc::new(t.epoch, &b)))
                 }
                 Some(_) => DocSlot::Deferred,
                 None => DocSlot::Deferred,
@@ -1180,6 +1214,9 @@ pub(crate) fn text_step(
                 }
                 d.apply(id, t);
             }
+            // Not loaded (its seed is missing or damaged): the caller has
+            // recorded the error; the op is not integrated.
+            DocSlot::Lazy(..) => return None,
             DocSlot::Deferred => {
                 // A blob that is present but not UTF-8 is a bytes
                 // epoch: no TextEdit on it is valid.
@@ -1305,7 +1342,8 @@ pub(crate) fn derive_node<'o>(
             let id = BlobId::of(&b);
             (id, Some(b))
         }
-        Some(DocSlot::Deferred) => (epoch_blob_id(we), None),
+        // (A lazy doc is loaded by the replica before deriving.)
+        Some(DocSlot::Deferred | DocSlot::Lazy(..)) => (epoch_blob_id(we), None),
         None => {
             let id = epoch_blob_id(we);
             (id, fetch(blobs, &id).map(|b| b.to_vec()))
@@ -1839,11 +1877,11 @@ pub fn author_text_edit_on(
     let fresh;
     let doc = match ev_deps.text.docs.get(&(node, epoch)) {
         Some(DocSlot::Doc(d)) => d,
-        Some(DocSlot::Deferred) => return None,
+        Some(DocSlot::Deferred | DocSlot::Lazy(..)) => return None,
         None => {
             let b = fetch(blobs, &blob)?;
-            std::str::from_utf8(b).ok()?;
-            fresh = TextDoc::new(epoch, b);
+            std::str::from_utf8(&b).ok()?;
+            fresh = TextDoc::new(epoch, &b);
             &fresh
         }
     };

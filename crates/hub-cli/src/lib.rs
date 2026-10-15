@@ -890,8 +890,11 @@ impl Repo {
             self.store.insert(op.id, op.clone());
         }
         let n = done.len();
-        let seeds = text_seeds(&self.dir, &self.replica, &self.store, &done);
-        self.replica.receive_all_with(done, &seeds);
+        self.replica
+            .receive_all_with(done, &DiskBlobs(self.dir.join("blobs")));
+        if let Some(b) = self.replica.text_seed_error() {
+            return (n, Err(seed_error(&self.dir, b)));
+        }
         (n, res)
     }
 
@@ -994,41 +997,30 @@ fn head_of(ops: &[&Op]) -> snapshot::Head {
     }
 }
 
-/// Epoch seeds (Text-CRDT 7.4.2, Issue #54) for the `TextEdit`s of `ops`
-/// whose epoch doc `replica` does not hold yet: the bytes of the epoch
-/// `SetContent`'s blob, read and hash-verified from `dir/blobs` (a blob
-/// that is missing or damaged leaves the doc deferred, as on a thin
-/// client). Epoch ops are looked up in `store` (which holds `ops`).
-pub(crate) fn text_seeds(
-    dir: &Path,
-    replica: &Replica,
-    store: &Store,
-    ops: &[Op],
-) -> std::collections::HashMap<hub_core::tree::BlobId, Vec<u8>> {
-    let mut out = std::collections::HashMap::new();
-    for o in ops {
-        let Payload::TextEdit(t) = &o.payload else {
-            continue;
-        };
-        if replica.has_text_doc(t.node, t.epoch) {
-            continue;
-        }
-        let epoch = store
-            .get(&t.epoch)
-            .or_else(|| ops.iter().find(|x| x.id == t.epoch));
-        if let Some(Op {
-            payload: Payload::SetContent { blob, .. },
-            ..
-        }) = epoch
-        {
-            if *blob != hub_core::tree::BlobId::empty() && !out.contains_key(blob) {
-                if let Ok(b) = blobs::read_verified(&dir.join("blobs"), blob) {
-                    out.insert(*blob, b);
-                }
-            }
-        }
+/// Epoch seeds (Text-CRDT 7.4.2, Issue #54) read on demand from
+/// `<.hub>/blobs`, hash-verified: a missing or damaged blob is `None` (a
+/// new doc stays deferred; a snapshot's lazy doc reports
+/// [`Replica::text_seed_error`]).
+pub(crate) struct DiskBlobs(pub PathBuf);
+
+impl hub_core::text::BlobSource for DiskBlobs {
+    fn blob_bytes(&self, id: &hub_core::tree::BlobId) -> Option<std::borrow::Cow<'_, [u8]>> {
+        blobs::read_verified(&self.0, id)
+            .ok()
+            .map(std::borrow::Cow::Owned)
     }
-    out
+}
+
+/// The error for a snapshot-referenced seed blob that is gone (#54).
+pub(crate) fn seed_error(dir: &Path, b: hub_core::tree::BlobId) -> Error {
+    Error::new(
+        Code::Corrupt,
+        format!(
+            "corrupt {}: blob {} (the seed of a text file, referenced by .hub/snapshot) is missing or damaged",
+            dir.join("blobs").display(),
+            b.hex()
+        ),
+    )
 }
 
 /// Decode `records` (op bodies of `file`; record `i` is at line `line_of(i)`)
@@ -1076,8 +1068,12 @@ pub(crate) fn replay_records(
     // One batch: the view is refreshed once, not per op (Issue #28).
     if !replay.is_empty() || replica.is_empty() {
         let dir = file.parent().unwrap_or(Path::new("."));
-        let seeds = text_seeds(dir, &replica, &st, &replay);
-        replica.receive_all_with(replay, &seeds);
+        replica.receive_all_with(replay, &DiskBlobs(dir.join("blobs")));
+        if let Some(b) = replica.text_seed_error() {
+            // A snapshot's referenced seed is gone: the caller falls back
+            // to a full replay (A.2.3).
+            return Err(seed_error(dir, b));
+        }
     }
     if replica.pending_len() != 0 {
         return errc(

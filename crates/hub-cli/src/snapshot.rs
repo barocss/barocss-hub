@@ -211,6 +211,14 @@ pub fn load(dir: &Path) -> Result<Option<(Replica, LogPos, Head)>, String> {
     };
     let (r, pos, head) = decode(&bytes)?;
     bound_to_log(&dir.join("ops.log"), &pos)?;
+    // Snapshot v2 (#54): the seeds it references must be in `blobs/`
+    // with their length (the content is hash-checked when loaded).
+    for (b, n) in r.text_lazy_seeds() {
+        match fs::metadata(dir.join("blobs").join(b.hex())) {
+            Ok(m) if m.len() == n as u64 => {}
+            _ => return Err(format!("referenced seed blob {} is missing", b.hex())),
+        }
+    }
     Ok(Some((r, pos, head)))
 }
 

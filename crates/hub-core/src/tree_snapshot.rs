@@ -173,10 +173,11 @@ impl W {
             self.id(*x);
         }
     }
-    fn doc(&mut self, d: &TextDoc) {
-        let seed = d.seed();
-        self.u(seed.len() as u64);
-        self.buf.extend_from_slice(seed);
+    /// One doc; the seed is referenced by its blob id and length (Issue
+    /// #54: the bytes live in `blobs/`), never copied.
+    fn doc(&mut self, d: &TextDoc, seed: BlobId) {
+        self.blob(&seed);
+        self.u(d.op_bytes[0].1 as u64);
         self.ids(&d.ops[1..]);
         for &f in &d.op_first {
             self.nix(f);
@@ -231,7 +232,7 @@ impl W {
             self.u(r as u64);
         }
     }
-    fn text(&mut self, t: &TextPart) {
+    fn text(&mut self, t: &TextPart, seed_of: &dyn Fn(OpId) -> BlobId) {
         self.u(t.docs.len() as u64);
         for ((node, epoch), slot) in &t.docs {
             self.id(*node);
@@ -240,7 +241,11 @@ impl W {
                 DocSlot::Deferred => self.b(0),
                 DocSlot::Doc(d) => {
                     self.b(1);
-                    self.doc(d)
+                    self.doc(d, seed_of(*epoch))
+                }
+                DocSlot::Lazy(d, b) => {
+                    self.b(1);
+                    self.doc(d, *b)
                 }
             }
         }
@@ -493,15 +498,21 @@ impl R<'_> {
     }
     /// One epoch doc; `bytes_of(op)` = an integrated op's inserted bytes
     /// (from its log record).
-    fn doc(&mut self, epoch: OpId, bytes_of: &dyn Fn(OpId, &mut Vec<u8>) -> bool) -> Res<TextDoc> {
-        let n = self.len()?;
-        let seed_at = self.p;
-        self.bytes(n)?;
+    fn doc(
+        &mut self,
+        epoch: OpId,
+        bytes_of: &dyn Fn(OpId, &mut Vec<u8>) -> bool,
+    ) -> Res<(TextDoc, BlobId)> {
+        let seed = self.blob()?;
+        let n = self.u32()? as usize;
+        if seed == BlobId::empty() && n != 0 {
+            return Err("empty seed with a length".into());
+        }
         let mut ops = vec![epoch];
         ops.extend(self.ids()?);
-        // One copy of the seed, op bytes appended in place (open time, B2).
-        let mut arena = Vec::with_capacity(n + 32 * ops.len());
-        arena.extend_from_slice(&self.b[seed_at..seed_at + n]);
+        // The arena holds the inserted bytes; offsets count the seed first
+        // (spliced in front when the doc is loaded, `text::load_slot`).
+        let mut arena = Vec::with_capacity(32 * ops.len());
         let mut op_bytes = Vec::with_capacity(ops.len());
         op_bytes.push((0u64, n as u32));
         let mut op_ix = crate::text::FxMap::default();
@@ -512,7 +523,7 @@ impl R<'_> {
             if !bytes_of(*o, &mut arena) {
                 return Err("doc op not in the log".into());
             }
-            op_bytes.push((start as u64, (arena.len() - start) as u32));
+            op_bytes.push(((n + start) as u64, (arena.len() - start) as u32));
             if op_ix.insert(*o, i as u32).is_some() {
                 return Err("duplicate doc op".into());
             }
@@ -635,21 +646,24 @@ impl R<'_> {
             .enumerate()
             .map(|(i, v)| (v.clone(), i as u32))
             .collect();
-        Ok(TextDoc {
-            epoch,
-            ops,
-            op_ix,
-            op_bytes,
-            arena,
-            op_first,
-            split,
-            frags,
-            delsets,
-            delset_ix,
-            chunks,
-            order,
-            rank,
-        })
+        Ok((
+            TextDoc {
+                epoch,
+                ops,
+                op_ix,
+                op_bytes,
+                arena,
+                op_first,
+                split,
+                frags,
+                delsets,
+                delset_ix,
+                chunks,
+                order,
+                rank,
+            },
+            seed,
+        ))
     }
     fn text(&mut self, log: &[(Op, Undo, Outcome)]) -> Res<TextPart> {
         // One index over the log's text ops (a binary search per doc op
@@ -681,7 +695,10 @@ impl R<'_> {
             let epoch = self.id()?;
             let slot = match self.b()? {
                 0 => DocSlot::Deferred,
-                1 => DocSlot::Doc(Box::new(self.doc(epoch, &bytes_of)?)),
+                1 => match self.doc(epoch, &bytes_of)? {
+                    (d, b) if b == BlobId::empty() => DocSlot::Doc(Box::new(d)),
+                    (d, b) => DocSlot::Lazy(Box::new(d), b),
+                },
                 _ => return Err("bad doc tag".into()),
             };
             t.docs.insert((node, epoch), slot);
@@ -805,7 +822,13 @@ impl Replica {
         }
         let text = !self.text.is_empty();
         if text {
-            w.text(&self.text);
+            // The seed blob of an epoch: its SetContent's blob, or the
+            // empty blob for a Create.
+            let seed_of = |e: OpId| match self.logged(e).map(|(o, _, _)| &o.payload) {
+                Some(Payload::SetContent { blob, .. }) => *blob,
+                _ => BlobId::empty(),
+            };
+            w.text(&self.text, &seed_of);
         }
         let mut out = Vec::with_capacity(w.buf.len() + 16 * w.table.len() + 16);
         out.extend_from_slice(if text { MAGIC2 } else { MAGIC });

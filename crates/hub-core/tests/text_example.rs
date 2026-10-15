@@ -424,7 +424,20 @@ fn replica_and_snapshot_are_text_aware() {
     assert_eq!(r.text_valid(), &ev.text.valid);
     let snap = r.encode_snapshot().expect("text-aware snapshot");
     assert!(snap.starts_with(b"RSNAP2"));
-    let back = Replica::decode_snapshot(&snap).unwrap();
+    let mut back = Replica::decode_snapshot(&snap).unwrap();
+    // The seed is referenced by blob id, not copied (#54 B5): nothing
+    // to load for a Create epoch, the SetContent epoch's doc is lazy.
+    assert!(!snap.windows(SEED.len()).any(|w| w == SEED));
+    assert_eq!(
+        back.text_lazy_seeds(),
+        vec![(BlobId::of(SEED), SEED.len() as u32)]
+    );
+    assert!(back.text_doc(n, s).is_none());
+    assert_eq!(
+        back.load_text_docs(&BTreeMap::<BlobId, Vec<u8>>::new()),
+        Err(BlobId::of(SEED))
+    );
+    back.load_text_docs(&blobs).unwrap();
     assert_eq!(back.encode_snapshot().unwrap(), snap);
     assert_eq!(back.conflicts(&map).as_ref(), Some(&ev.conflicts));
     assert_eq!(back.state(), &ev.state);

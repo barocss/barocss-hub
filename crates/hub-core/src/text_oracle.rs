@@ -248,12 +248,12 @@ pub fn evaluate(ops: &[Op], blobs: &dyn BlobSource) -> OracleText {
             continue;
         }
         let seed = fetch(blobs, &blob).expect("oracle needs every epoch blob");
-        if std::str::from_utf8(seed).is_err() {
+        if std::str::from_utf8(&seed).is_err() {
             continue;
         }
         let d = docs
             .entry((t.node, t.epoch))
-            .or_insert_with(|| OracleDoc::new(t.epoch, seed));
+            .or_insert_with(|| OracleDoc::new(t.epoch, &seed));
         let elem_ok = |e: &Option<ElemId>| e.is_none_or(|e| d.is_elem(e) && p.contains(&e.op));
         let ins_ok = t
             .ins
