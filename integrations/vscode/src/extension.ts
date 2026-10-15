@@ -1,8 +1,8 @@
 // barocss-hub for VS Code (D-034). Everything goes through `barocss-hub --json`.
 
 import * as vscode from 'vscode';
-import { CliError, Checkpoint, WatchEvent } from './cli';
-import { explain, watchNotice, Action, Explained } from './errors';
+import { CliError, Checkpoint, WatchEvent, run } from './cli';
+import { explain, watchNotice, rescueSummary, Action, Explained, RescuePlan } from './errors';
 import { RepoController } from './repo';
 import { BLOB_SCHEME, BlobProvider, ConflictItem, ConflictsProvider, HistoryProvider, conflictDiff, blobUri } from './views';
 
@@ -28,6 +28,8 @@ export interface Api {
   notices: Explained[];
   /** The `watch` arguments used for a repository right now. */
   watchArgs: () => string[];
+  /** Rescue (Issue #49): dry-run plan, `confirm`, then `reid --rescue`. */
+  rescue: (cwd: string, confirm?: (p: RescuePlan) => Promise<boolean>) => Promise<Record<string, unknown> | undefined>;
 }
 
 let controllers: RepoController[] = [];
@@ -117,6 +119,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
       case 'Open Settings': await vscode.commands.executeCommand('workbench.action.openSettings', 'barocssHub.binaryPath'); break;
       case 'Stop Watch': if (r) { await r.stopWatch(); } break;
       case 'Show Log': log.show(); break;
+      case 'Rescue…': if (r) { await doRescue(r.cwd); await r.refresh(); } break;
       case 'Copy reid Command': await vscode.env.clipboard.writeText(`cd "${r?.status?.root ?? r?.cwd ?? ''}" && barocss-hub reid`); break;
     }
   }
@@ -127,6 +130,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
     const cur = current();
     const p = await vscode.window.showQuickPick(repos.map((r) => ({ label: r.folder.name, description: r.label().text.replace(/\$\([^)]*\)\s*/g, ''), r, picked: r === cur })), { placeHolder: 'barocss-hub repository' });
     return p?.r;
+  }
+
+  /** CLI only (D-034): the plan comes from `reid --rescue --dry-run --json`. */
+  async function doRescue(cwd: string, confirm?: (p: RescuePlan) => Promise<boolean>): Promise<Record<string, unknown> | undefined> {
+    try {
+      log.appendLine(`barocss-hub reid --rescue --dry-run --json (${cwd})`);
+      const plan = await run<RescuePlan>(bin(), cwd, ['reid', '--rescue', '--dry-run']);
+      if (plan.noop) { vscode.window.showInformationMessage(`barocss-hub: ${rescueSummary(plan)}`); return undefined; }
+      const ok = confirm
+        ? await confirm(plan)
+        : (await vscode.window.showWarningMessage('barocss-hub: rescue this copied repository?', { modal: true, detail: rescueSummary(plan) }, 'Rescue')) === 'Rescue';
+      if (!ok) { return undefined; }
+      log.appendLine(`barocss-hub reid --rescue --json (${cwd})`);
+      const res = await run<Record<string, unknown>>(bin(), cwd, ['reid', '--rescue']);
+      vscode.window.setStatusBarMessage(`barocss-hub: rescued; ${String(res.next ?? '')}`, 8000);
+      return res;
+    } catch (e) { await showError(e); return undefined; }
   }
 
   async function doCheckout(r: RepoController, force: boolean) {
@@ -307,6 +327,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
     setTrustOverride: (t) => { trustOverride = t; restrictedSaid = false; },
     notices,
     watchArgs,
+    rescue: (cwd: string, confirm?: (p: RescuePlan) => Promise<boolean>) => doRescue(cwd, confirm),
   };
 }
 

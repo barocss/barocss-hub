@@ -159,9 +159,17 @@ pub fn classify(repo: &Repo, key: Option<&TrustKey>, rej: &[(OpId, String)]) -> 
 
 thread_local! {
     /// Test-only switch (mutation check): false disables suppression.
+    /// Honored only in debug/test builds (#50 follow-up): a release build
+    /// ignores `HUB_TEST_NO_REJECTION_DEDUP`.
     static DEDUP: std::cell::Cell<bool> = std::cell::Cell::new(
-        std::env::var_os("HUB_TEST_NO_REJECTION_DEDUP").is_none()
+        !cfg!(debug_assertions) || std::env::var_os("HUB_TEST_NO_REJECTION_DEDUP").is_none()
     );
+}
+
+/// Remove a stale `.reported-rejections.tmp` (crash between temp and
+/// rename). Caller holds the exclusive lock (#50 follow-up).
+pub fn sweep_tmp(dir: &Path) {
+    let _ = fs::remove_file(dir.join(format!(".{FILE}.tmp")));
 }
 
 /// Remember the new rejections of a finished, already printed sync.

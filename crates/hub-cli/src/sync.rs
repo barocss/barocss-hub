@@ -256,13 +256,13 @@ pub fn equivocation_sides(w: &RejectWarning) -> Option<(&str, &str)> {
 pub fn warning_action(w: &RejectWarning) -> &'static str {
     match w.reason {
         RejectReason::Equivocation => {
-            "two repositories share a replica id (a copied .hub/): run `barocss-hub reid` in the copy, then redo the dropped change there"
+            "two repositories share a replica id (a copied .hub/): run `barocss-hub reid --rescue` in the copy (it re-authors the dropped change under a fresh id)"
         }
         RejectReason::LamportViolation => {
             "the op was not made by a correct barocss-hub; ask the author to upgrade, and redo the change"
         }
         RejectReason::CorruptBlob => "sync again; the blob is fetched again from a peer with a good copy",
-        RejectReason::DuplicateReplica => "run `barocss-hub reid` in one of the two repositories",
+        RejectReason::DuplicateReplica => "run `barocss-hub reid --rescue` in the copied repository",
     }
 }
 
@@ -556,7 +556,7 @@ impl Synced {
 /// What a rejection reason means for the author, and what to do.
 pub fn rejected_message(reason: &str) -> &'static str {
     match reason {
-        "equivocation" => "the remote already has a different op with this id (another repository shares this replica id, probably a copied .hub/); run `barocss-hub reid` here, then redo the change",
+        "equivocation" => "the remote already has a different op with this id (another repository shares this replica id, probably a copied .hub/); run `barocss-hub reid --rescue` here (it re-authors the change under a fresh id)",
         "lamport-violation" => "its deps are not older than the op (not made by a correct barocss-hub); redo the change with an up-to-date barocss-hub",
         _ => "rejected by the remote",
     }
@@ -754,6 +754,20 @@ pub fn behind_by(repo: &Repo, base: &[hub_core::tree::OpId]) -> usize {
 /// keep them until cleared by hand; `reid_clears_duplicate_replica_warnings`
 /// in `tests/sync.rs` pins the current behavior.
 pub const REID_CLEARS_DUPLICATE_WARNINGS: bool = true;
+
+/// Drop the saved warnings matching `drop` (Issue #49). Returns how many.
+pub(crate) fn drop_warnings(
+    dir: &Path,
+    drop: impl Fn(&RejectWarning) -> bool,
+) -> Result<usize, Error> {
+    let ws = read_warnings(dir)?;
+    let keep: Vec<String> = ws.iter().filter(|w| !drop(w)).map(encode_warning).collect();
+    let n = ws.len() - keep.len();
+    if n > 0 {
+        rewrite(&dir.join("warnings.log"), WARNINGS_HEADER, &keep)?;
+    }
+    Ok(n)
+}
 
 /// `hub reid`: a fresh CSPRNG replica id. Old ops keep their author id.
 /// Run it before recording in a copied repository: ops already recorded

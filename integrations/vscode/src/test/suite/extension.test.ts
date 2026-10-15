@@ -5,7 +5,8 @@ import { spawnSync } from 'child_process';
 import * as vscode from 'vscode';
 import type { Api } from '../../extension';
 import { statusLabel } from '../../repo';
-import { watchNotice } from '../../errors';
+import { watchNotice, explain, rescueSummary } from '../../errors';
+import * as os from 'os';
 
 const BIN = process.env.BAROCSS_HUB_BIN!;
 const WS = process.env.HUB_TEST_WS!;
@@ -231,6 +232,33 @@ describe('barocss-hub extension (real CLI, temp repos)', function () {
     assert.strictEqual(n.severity, 'warning');
     assert.match(n.message, /remote origin rejected 1 of your change\(s\): 5\.00ab \(equivocation\): run `barocss-hub reid` here/);
     assert.strictEqual(watchNotice({ schema: 1, event: 'synced' }), undefined);
+  });
+
+  it('duplicate-replica offers Rescue: dry-run plan, confirm, then reid --rescue (CLI only)', async () => {
+    assert.ok(explain('duplicate-replica', '').actions.includes('Rescue…'));
+    const t = fs.mkdtempSync(path.join(os.tmpdir(), 'hub49-vsc-'));
+    const a = path.join(t, 'a'); const c = path.join(t, 'c'); const srv = path.join(t, 'srv');
+    hub(t, 'init', '--bare', 'srv');
+    fs.mkdirSync(a); hub(a, 'init');
+    hub(a, 'remote', 'add', '--default', 'origin', `file://${fs.realpathSync(srv)}`);
+    write(a, 'f', 'base\n'); hub(a, 'record'); hub(a, 'sync');
+    fs.cpSync(a, c, { recursive: true });
+    hub(c, 'remote', 'trust', 'origin');
+    write(a, 'f', 'A'); hub(a, 'record'); hub(a, 'sync');
+    write(c, 'f', 'BB'); hub(c, 'record');
+    assert.notStrictEqual(spawnSync(BIN, ['sync'], { cwd: c }).status, 0);
+    // Declined: nothing changes, the sync is still refused.
+    let shown = '';
+    assert.strictEqual(await api.rescue(c, async (p) => { shown = rescueSummary(p); return false; }), undefined);
+    assert.match(shown, /Re-record 1 rejected change/);
+    assert.match(shown, /modified: f/);
+    assert.notStrictEqual(spawnSync(BIN, ['sync'], { cwd: c }).status, 0);
+    // Confirmed: rescued and confirmed by one sync; the next sync exits 0.
+    const res = (await api.rescue(c, async () => true))!;
+    assert.strictEqual(res.noop, false);
+    assert.strictEqual((res.sync as { ok: boolean }).ok, true);
+    assert.strictEqual(spawnSync(BIN, ['sync'], { cwd: c }).status, 0);
+    fs.rmSync(t, { recursive: true, force: true });
   });
 
   it('deactivate-style stop leaves no watch process', async () => {

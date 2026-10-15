@@ -1241,3 +1241,44 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
     fs::File::open(hub_dir)?.sync_all()?;
     Ok(warnings)
 }
+
+/// The index of target `t` as if it were materialized, without touching
+/// the working directory (Issue #49, `reid --rescue`): every file entry has
+/// size and mtime 0, so the next scan rehashes it. Case-clashing paths are
+/// indexed as unmaterialized (D-019).
+pub fn index_for(t: &Target, case_insensitive: bool) -> Index {
+    let mut idx = Index {
+        base: {
+            let mut b = t.frontier.clone();
+            b.sort();
+            b
+        },
+        ..Index::default()
+    };
+    let paths = t.proj.entries.keys().filter(|p| !p.is_empty());
+    let clash = clashing(paths, case_insensitive);
+    for (path, node) in &t.proj.entries {
+        if path.is_empty() {
+            continue;
+        }
+        let e = if clash.contains(path) {
+            Entry::Unmaterialized
+        } else {
+            match t.state[node].kind {
+                Kind::File => Entry::File {
+                    blob: t
+                        .proj
+                        .blobs
+                        .get(node)
+                        .copied()
+                        .unwrap_or_else(BlobId::empty),
+                    size: 0,
+                    mtime: 0,
+                },
+                _ => Entry::Dir,
+            }
+        };
+        idx.entries.insert(path.clone(), (*node, e));
+    }
+    idx
+}

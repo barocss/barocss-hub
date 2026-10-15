@@ -680,3 +680,314 @@ fn diverged_copy_detected_over_ssh() {
 fn diverged_copy_detected_over_file() {
     diverge_repro("file");
 }
+
+// ---------------------------------------------------------------- #49
+
+/// Every file under `d` (including `.hub/`) with its bytes.
+fn all_bytes(d: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    files_mtimes(d)
+        .into_iter()
+        .map(|(p, (b, _))| (p, b))
+        .collect()
+}
+
+/// The #46 repro up to the copy's refused sync. `edit` runs in the copy
+/// before its diverging record. Returns (env, server, original, copy).
+fn diverged(tag: &str, via: &str, edit: impl Fn(&Path)) -> (Env, PathBuf, PathBuf, PathBuf) {
+    let e = Env::new(tag);
+    let srv = e.bare("srv.hub");
+    let a = e.repo("a");
+    let url = match via {
+        "ssh" => format!("ssh://localhost{}", srv.display()),
+        _ => format!("file://{}", srv.display()),
+    };
+    ok(
+        &a,
+        &["remote", "add", "--exec", BIN, "--default", "origin", &url],
+    );
+    fs::write(a.join("f"), "base\n").unwrap();
+    fs::write(a.join("g"), "gee\n").unwrap();
+    fs::write(a.join("h"), "aitch\n").unwrap();
+    ok(&a, &["record"]);
+    e.sync(&a, "origin");
+    let c = e.t.join("c");
+    let st = Command::new("cp")
+        .args(["-R", a.to_str().unwrap(), c.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    ok(&c, &["remote", "trust", "origin"]);
+    fs::write(a.join("f"), "A").unwrap();
+    ok(&a, &["record"]);
+    fs::write(c.join("f"), "BB").unwrap();
+    edit(&c);
+    ok(&c, &["record"]);
+    e.sync(&a, "origin");
+    let err = fail_env(&c, &["sync"], &e.env());
+    assert!(err.contains("reid --rescue"), "{err}");
+    (e, srv, a, c)
+}
+
+/// A fresh clone of the server's head: its working tree.
+fn server_tree(e: &Env, srv: &Path, tag: &str) -> BTreeMap<String, Vec<u8>> {
+    let d = e.repo(tag);
+    ok(
+        &d,
+        &[
+            "remote",
+            "add",
+            "--exec",
+            BIN,
+            "origin",
+            &format!("file://{}", srv.display()),
+        ],
+    );
+    e.sync(&d, "origin");
+    ok(&d, &["checkout"]);
+    worktree(&d)
+}
+
+/// Blob ids of every set-content op on `path` in `d` (history).
+fn content_history(d: &Path, path: &str) -> Vec<Vec<u8>> {
+    let j = ok(d, &["log", "--path", path, "--json"]);
+    let mut v = Vec::new();
+    for part in j.split("\"blob\":\"").skip(1) {
+        let b = &part[..64];
+        let o = Command::new(BIN)
+            .args(["cat-blob", b])
+            .current_dir(d)
+            .output()
+            .unwrap();
+        if o.status.success() && !v.contains(&o.stdout) {
+            v.push(o.stdout);
+        }
+    }
+    v
+}
+
+fn backups(c: &Path) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Ok(rd) = fs::read_dir(c.join(".hub/rescue")) {
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                v.push(e.path());
+            }
+        }
+    }
+    v
+}
+
+/// Issue #49: the #46 repro, then `reid --rescue` (online: it confirms with
+/// one sync); the next syncs exit 0, the server has the copy's content at
+/// head and the original's in history, and the backup holds the copy's
+/// bytes.
+fn rescue_repro(via: &str) {
+    let (e, srv, a, c) = diverged(&format!("res49-{via}"), via, |_| {});
+    let o = hub_env(&c, &["reid", "--rescue"], &e.env());
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{out}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(out.contains("re-authored by effect"), "{out}");
+    assert!(out.contains("modified: f"), "{out}");
+    assert!(out.contains("synced with"), "{out}");
+    let b = backups(&c);
+    assert_eq!(b.len(), 1);
+    assert_eq!(fs::read(b[0].join("files/f")).unwrap(), b"BB");
+    assert!(b[0].join("done").exists() && !c.join(".hub/rescue/current").exists());
+    for _ in 0..2 {
+        let o = hub_env(&c, &["sync"], &e.env());
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&o.stderr).contains("rejected"));
+    }
+    let t = server_tree(&e, &srv, "check");
+    assert_eq!(t["f"], b"BB");
+    assert_eq!(t["g"], b"gee\n");
+    let hist = content_history(&e.t.join("check"), "f");
+    assert!(hist.contains(&b"A".to_vec()), "{hist:?}");
+    assert!(hist.contains(&b"BB".to_vec()), "{hist:?}");
+    // The original converges on the rescued content too.
+    e.sync(&a, "origin");
+    ok(&a, &["checkout"]);
+    assert_eq!(fs::read(a.join("f")).unwrap(), b"BB");
+    assert_eq!(worktree(&a), worktree(&c));
+    // Idempotent rerun: a no-op, .hub/ and the tree byte-identical.
+    let before = all_bytes(&c);
+    let o = ok_env(&c, &["reid", "--rescue"], &e.env());
+    assert!(o.contains("nothing to rescue"), "{o}");
+    assert_eq!(all_bytes(&c), before);
+}
+
+#[test]
+fn rescue_after_divergence_over_ssh() {
+    rescue_repro("ssh");
+}
+
+#[test]
+fn rescue_after_divergence_over_file() {
+    rescue_repro("file");
+}
+
+/// After a plain `reid` and the exit-3 report (D-045/D-050), rescue finds
+/// the op through the reported-rejections memory and forgets it; offline,
+/// then a sync.
+#[test]
+fn rescue_offline_after_reported_rejection() {
+    let (e, srv, _a, c) = diverged("res49-rep", "file", |_| {});
+    ok(&c, &["reid"]);
+    let _ = hub_env(&c, &["sync"], &e.env()); // the server stops once
+    let o = hub_env(&c, &["sync"], &e.env());
+    assert_eq!(o.status.code(), Some(3));
+    assert!(ok(&c, &["warnings"]).contains("reported rejection"));
+    let out = ok_env(&c, &["reid", "--rescue", "--offline"], &e.env());
+    assert!(!out.contains("synced with"), "{out}");
+    assert!(out.contains("re-authored by effect"), "{out}");
+    assert!(!ok(&c, &["warnings"]).contains("reported rejection"));
+    let o = hub_env(&c, &["sync"], &e.env());
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(server_tree(&e, &srv, "check")["f"], b"BB");
+}
+
+/// An untouched copy (nothing recorded under the shared id): rescue is a
+/// reid that clears the block; the copy then follows the server.
+#[test]
+fn rescue_untouched_copy_is_a_reid() {
+    let e = Env::new("res49-untouched");
+    let srv = e.bare("srv.hub");
+    let a = e.repo("a");
+    ok(
+        &a,
+        &[
+            "remote",
+            "add",
+            "--exec",
+            BIN,
+            "origin",
+            &format!("file://{}", srv.display()),
+        ],
+    );
+    fs::write(a.join("f"), "base\n").unwrap();
+    ok(&a, &["record"]);
+    e.sync(&a, "origin");
+    let c = e.t.join("c");
+    assert!(Command::new("cp")
+        .args(["-R", a.to_str().unwrap(), c.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    ok(&c, &["remote", "trust", "origin"]);
+    fs::write(a.join("f"), "A").unwrap();
+    ok(&a, &["record"]);
+    e.sync(&a, "origin");
+    let err = fail_env(&c, &["sync"], &e.env());
+    assert!(err.contains("reid --rescue"), "{err}");
+    let out = ok_env(&c, &["reid", "--rescue", "--offline"], &e.env());
+    assert!(out.contains("no ops to re-author"), "{out}");
+    assert!(!out.contains("recorded"), "{out}");
+    e.sync(&c, "origin");
+    ok(&c, &["checkout"]);
+    assert_eq!(fs::read(c.join("f")).unwrap(), b"A");
+}
+
+/// Deletes and moves in the copy are reproduced by effect.
+#[test]
+fn rescue_reproduces_deletes_and_moves() {
+    let (e, srv, _a, c) = diverged("res49-mv", "file", |c| {
+        fs::remove_file(c.join("g")).unwrap();
+        fs::rename(c.join("h"), c.join("h2")).unwrap();
+        fs::write(c.join("new"), "n\n").unwrap();
+    });
+    ok_env(&c, &["reid", "--rescue"], &e.env());
+    let o = hub_env(&c, &["sync"], &e.env());
+    assert_eq!(o.status.code(), Some(0));
+    let t = server_tree(&e, &srv, "check");
+    assert_eq!(t["f"], b"BB");
+    assert!(
+        !t.contains_key("g") && !t.contains_key("h"),
+        "{:?}",
+        t.keys()
+    );
+    assert_eq!(t["h2"], b"aitch\n");
+    assert_eq!(t["new"], b"n\n");
+}
+
+/// `--dry-run` (human and JSON) changes nothing.
+#[test]
+fn rescue_dry_run_changes_nothing() {
+    let (e, _srv, _a, c) = diverged("res49-dry", "file", |c| {
+        fs::write(c.join("unrecorded"), "u").unwrap();
+    });
+    let before = all_bytes(&c);
+    let out = ok_env(&c, &["reid", "--rescue", "--dry-run"], &e.env());
+    assert!(
+        out.contains("dry run") && out.contains("modified: f"),
+        "{out}"
+    );
+    let j = ok_env(&c, &["reid", "--rescue", "--dry-run", "--json"], &e.env());
+    assert!(
+        j.starts_with("{\"schema\":1,\"command\":\"reid\",\"dry_run\":true"),
+        "{j}"
+    );
+    assert!(j.contains("\"new_replica\":null"), "{j}");
+    assert_eq!(all_bytes(&c), before);
+    // The intended tree includes unrecorded edits.
+    let j = ok_env(&c, &["reid", "--rescue", "--json", "--offline"], &e.env());
+    assert!(
+        j.contains("\"dry_run\":false") && j.contains("\"noop\":false"),
+        "{j}"
+    );
+    assert!(j.contains("\"path\":\"unrecorded\""), "{j}");
+    assert!(j.contains("\"sync\":null"), "{j}");
+    let o = hub_env(&c, &["sync"], &e.env());
+    assert_eq!(o.status.code(), Some(0));
+}
+
+/// A crash (abort) at every stage, then a rerun: the same end state, and
+/// mutating commands refuse while the rescue is unfinished.
+#[test]
+fn rescue_crash_at_every_stage_then_rerun() {
+    for stage in hub_cli::rescue::STAGES {
+        let (e, srv, _a, c) = diverged(&format!("res49-crash-{stage}"), "file", |c| {
+            fs::rename(c.join("h"), c.join("h2")).unwrap();
+        });
+        let mut env = e.env();
+        env.push(("HUB_TEST_CRASH_STAGE", stage));
+        let o = hub_env(&c, &["reid", "--rescue", "--offline"], &env);
+        assert!(!o.status.success(), "{stage}: no crash");
+        if c.join(".hub/rescue/current").exists() {
+            let err = fail_env(&c, &["record"], &e.env());
+            assert!(err.contains("reid --rescue"), "{stage}: {err}");
+            let err = fail_env(&c, &["sync"], &e.env());
+            assert!(err.contains("interrupted"), "{stage}: {err}");
+        }
+        assert_eq!(fs::read(c.join("f")).unwrap(), b"BB", "{stage}");
+        let out = ok_env(&c, &["reid", "--rescue", "--offline"], &e.env());
+        assert!(!out.contains("nothing to rescue"), "{stage}: {out}");
+        assert!(!c.join(".hub/rescue/current").exists());
+        let o = hub_env(&c, &["sync"], &e.env());
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{stage}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let t = server_tree(&e, &srv, "check");
+        assert_eq!(t["f"], b"BB", "{stage}");
+        assert_eq!(t["h2"], b"aitch\n", "{stage}");
+        assert!(!t.contains_key("h"), "{stage}");
+        let _ = fs::remove_dir_all(&e.t);
+    }
+}
