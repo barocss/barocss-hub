@@ -234,6 +234,24 @@ describe('barocss-hub extension (real CLI, temp repos)', function () {
     assert.strictEqual(watchNotice({ schema: 1, event: 'synced' }), undefined);
   });
 
+  it('works on a format v2 repository with text ops (#54), and explains upgrade-required', () => {
+    const fx = path.resolve(__dirname, '../../../../../crates/hub-cli/tests/fixtures/v2_text');
+    const t = fs.mkdtempSync(path.join(os.tmpdir(), 'hub54-vsc-'));
+    const v2 = path.join(t, 'v2');
+    fs.mkdirSync(v2);
+    fs.cpSync(path.join(fx, 'dot-hub'), path.join(v2, '.hub'), { recursive: true }); // boundary-allow: copies the committed v2 fixture
+    assert.match(hub(v2, 'status'), /^head [0-9a-f]{8}/m);
+    // A v1 repository syncing from it receives the text ops (and becomes v2) and keeps working.
+    const v1 = path.join(t, 'v1');
+    fs.mkdirSync(v1); hub(v1, 'init');
+    assert.match(hub(v1, 'sync', v2), /received [1-9]/);
+    assert.match(hub(v1, 'log'), /\S/);
+    assert.match(hub(v1, 'status'), /^head [0-9a-f]{8}/m);
+    const e = explain('upgrade-required', 'x');
+    assert.strictEqual(e.severity, 'warning');
+    assert.match(e.message, /too old/);
+  });
+
   it('duplicate-replica offers Rescue: dry-run plan, confirm, then reid --rescue (CLI only)', async () => {
     assert.ok(explain('duplicate-replica', '').actions.includes('Rescue…'));
     const t = fs.mkdtempSync(path.join(os.tmpdir(), 'hub49-vsc-'));

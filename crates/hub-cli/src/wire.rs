@@ -73,7 +73,14 @@ pub const FEATURES: &[&str] = &[
     "resume",
     F_REJECTED_OPS,
     F_DIGEST,
+    F_TEXT,
 ];
+/// Issue #54 (Text-CRDT 7.9, D-053 E-T6): the side can encode and hold
+/// `TextEdit` (`T` records). A sender never sends a `TextEdit` to a peer
+/// without it; a missing set with text ops ends the session with
+/// `Error upgrade-required`. `HUB_TEST_NO_TEXT_FEATURE=1` leaves it out of
+/// our `Hello` (tests: a pre-#54 peer).
+pub const F_TEXT: &str = "text";
 /// Issue #46 (Remote-Sync 5.2.8): the answerer sends `Sums` after `Have`.
 /// Only when both Hellos carry it; a pre-#46 peer never sees frame 0x11.
 pub const F_DIGEST: &str = "digest";
@@ -148,6 +155,9 @@ pub struct Hello {
 impl Hello {
     pub fn new(replica: ReplicaId, read_only: bool) -> Hello {
         let mut features: Vec<String> = FEATURES.iter().map(|s| s.to_string()).collect();
+        if std::env::var_os("HUB_TEST_NO_TEXT_FEATURE").is_some_and(|v| v == "1") {
+            features.retain(|f| f != F_TEXT);
+        }
         if read_only {
             features.push(F_READ_ONLY.into());
         }

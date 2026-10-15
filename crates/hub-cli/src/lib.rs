@@ -108,6 +108,10 @@ pub enum Code {
     /// on this machine, without a terminal to ask and without `--yes`
     /// (Issue #45).
     UntrustedRemote,
+    /// The peer lacks wire feature `text` but the ops it is missing (pull)
+    /// or would receive (push) include text edits (Issue #54, Text-CRDT
+    /// 7.9, D-053 E-T6). Fatal for the session; nothing is persisted.
+    UpgradeRequired,
     /// Anything else.
     Error,
 }
@@ -143,6 +147,7 @@ impl Code {
         Code::Forbidden,
         Code::Bare,
         Code::UntrustedRemote,
+        Code::UpgradeRequired,
         Code::Error,
     ];
     pub fn as_str(self) -> &'static str {
@@ -176,6 +181,7 @@ impl Code {
             Code::Forbidden => "forbidden",
             Code::Bare => "bare",
             Code::UntrustedRemote => "untrusted-remote",
+            Code::UpgradeRequired => "upgrade-required",
             Code::Error => "error",
         }
     }

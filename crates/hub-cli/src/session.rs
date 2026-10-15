@@ -33,7 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hub_core::checkpoint::{Checkpoint, FrontierCheck};
 use hub_core::sync::{delta, Have, RejectReason, SyncReplica};
-use hub_core::tree::{BlobId, Op, OpId, ReplicaId};
+use hub_core::tree::{BlobId, Op, OpId, Payload, ReplicaId};
 use hub_core::version::Version;
 use sha2::{Digest, Sha256};
 
@@ -84,6 +84,10 @@ pub struct Side {
     pub rejected_last: Vec<(OpId, String)>,
     /// Feature `digest` negotiated (Issue #46).
     pub digest: bool,
+    /// Feature `text` negotiated (Issue #54): both sides carry it.
+    pub text: bool,
+    /// This side is the client (for the `upgrade-required` message).
+    client: bool,
     /// This half's digest localization found an op the peer holds with
     /// another payload (Issue #46): persist stops the session if its
     /// equivocation warning is new.
@@ -241,6 +245,8 @@ impl Side {
             got: Counts::default(),
             rejected_last: Vec::new(),
             digest: false,
+            text: false,
+            client: false,
             diverged: false,
             no_blobs: false,
             total: None,
@@ -457,7 +463,31 @@ impl Side {
         }
     }
 
+    /// Text-CRDT 7.9 gate (Issue #54): never send a `TextEdit` to a peer
+    /// without feature `text`; such a missing set ends the session.
+    fn text_gate(&self, ops: &[Op]) -> Result<(), Error> {
+        if self.text
+            || !ops
+                .iter()
+                .any(|o| matches!(o.payload, Payload::TextEdit(_)))
+        {
+            return Ok(());
+        }
+        Err(Error::new(
+            Code::UpgradeRequired,
+            if self.client {
+                "the remote barocss-hub lacks wire feature `text` and cannot hold the text \
+                 edits it is missing (Text-CRDT 7.9); upgrade barocss-hub on the remote, or \
+                 sync with a remote that has it"
+            } else {
+                "this repository holds text edits that your barocss-hub cannot receive (no \
+                 wire feature `text`, Text-CRDT 7.9); upgrade barocss-hub, then sync again"
+            },
+        ))
+    }
+
     fn send_ops(&self, conn: &mut Conn, ops: Vec<Op>) -> Result<(), Error> {
+        self.text_gate(&ops)?;
         let frontier = self.sr.frontier();
         let head = wire::fmt_ids(&frontier).len() + 8;
         let max = (conn.theirs.frame as usize).saturating_sub(head);
@@ -742,6 +772,16 @@ impl Side {
                     done,
                     ops,
                 } => {
+                    if !self.text
+                        && ops
+                            .iter()
+                            .any(|o| matches!(o.payload, Payload::TextEdit(_)))
+                    {
+                        return Err(Error::new(
+                            Code::Unsupported,
+                            "the remote sent text edits without negotiating wire feature `text`",
+                        ));
+                    }
                     for o in &ops {
                         self.sr.receive(peer, o.clone());
                     }
@@ -1088,6 +1128,7 @@ pub fn handshake(conn: &mut Conn, side: &Side) -> Result<Hello, Error> {
 fn hello(conn: &mut Conn, side: &mut Side) -> Result<Hello, Error> {
     let h = handshake(conn, side)?;
     side.digest = h.has(wire::F_DIGEST);
+    side.text = h.has(wire::F_TEXT) && Hello::new(side.id, false).has(wire::F_TEXT);
     Ok(h)
 }
 
@@ -1136,6 +1177,7 @@ pub fn client(conn: &mut Conn, side: &mut Side) -> Result<Report, Error> {
 }
 
 fn client_inner(conn: &mut Conn, side: &mut Side) -> Result<Report, Error> {
+    side.client = true;
     let h = hello(conn, side)?;
     let peer = h.replica;
     let ro = h.has(wire::F_READ_ONLY);
