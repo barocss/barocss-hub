@@ -1365,6 +1365,53 @@ pub(crate) mod tests {
         assert_eq!(store::decode_op(&l).unwrap(), empty);
     }
 
+    /// Issue #54: a chained op at the TEXT_OP_MAX bound fits one `Ops`
+    /// frame of a peer announcing the smallest legal frame (FRAME_FLOOR),
+    /// next to a sender frontier of 1000 ids.
+    #[test]
+    fn max_size_chained_op_fits_a_frame_floor_peer() {
+        let te = golden_text_op();
+        let Payload::TextEdit(mut t) = te.payload.clone() else {
+            unreachable!()
+        };
+        t.ins = vec![hub_core::text::Ins {
+            left: None,
+            right: None,
+            bytes: "x한\n".repeat(400_000).into_bytes(),
+        }];
+        let size = |o: &Op| store::encode_op(o).len();
+        let chain =
+            hub_core::text::split_text_edit(te.id, te.deps.clone(), t, &size, store::TEXT_OP_MAX)
+                .unwrap();
+        let biggest = chain.iter().max_by_key(|o| size(o)).unwrap();
+        assert!(size(biggest) <= store::TEXT_OP_MAX);
+        assert!(
+            size(biggest) > store::TEXT_OP_MAX - 1024,
+            "{}",
+            size(biggest)
+        );
+        let frontier: Vec<OpId> = (0..1000)
+            .map(|i| NodeId::new(1_000_000_000 + i, u128::MAX - i as u128))
+            .collect();
+        let f = Frame::Ops {
+            frontier,
+            done: true,
+            ops: vec![biggest.clone()],
+        };
+        let e = encode(&f);
+        assert!(
+            e.len() <= FRAME_FLOOR as usize,
+            "{} > {}",
+            e.len(),
+            FRAME_FLOOR
+        );
+        let floor = Limits {
+            frame: FRAME_FLOOR,
+            ..Limits::default()
+        };
+        assert_eq!(decode(e[0], &e[1..], &floor).unwrap(), f);
+    }
+
     /// base64 is canonical: every byte string round-trips, and only the
     /// [`store::b64`] spelling decodes.
     #[test]

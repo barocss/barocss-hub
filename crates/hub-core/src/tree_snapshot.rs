@@ -493,19 +493,26 @@ impl R<'_> {
     }
     /// One epoch doc; `bytes_of(op)` = an integrated op's inserted bytes
     /// (from its log record).
-    fn doc(&mut self, epoch: OpId, bytes_of: &dyn Fn(OpId) -> Option<Vec<u8>>) -> Res<TextDoc> {
+    fn doc(&mut self, epoch: OpId, bytes_of: &dyn Fn(OpId, &mut Vec<u8>) -> bool) -> Res<TextDoc> {
         let n = self.len()?;
-        let seed = self.bytes(n)?.to_vec();
+        let seed_at = self.p;
+        self.bytes(n)?;
         let mut ops = vec![epoch];
         ops.extend(self.ids()?);
-        let mut arena = seed;
-        let mut op_bytes = vec![(0u64, n as u32)];
-        let mut op_ix = std::collections::HashMap::new();
+        // One copy of the seed, op bytes appended in place (open time, B2).
+        let mut arena = Vec::with_capacity(n + 32 * ops.len());
+        arena.extend_from_slice(&self.b[seed_at..seed_at + n]);
+        let mut op_bytes = Vec::with_capacity(ops.len());
+        op_bytes.push((0u64, n as u32));
+        let mut op_ix = crate::text::FxMap::default();
+        op_ix.reserve(ops.len());
         op_ix.insert(epoch, 0u32);
         for (i, o) in ops.iter().enumerate().skip(1) {
-            let b = bytes_of(*o).ok_or("doc op not in the log")?;
-            op_bytes.push((arena.len() as u64, b.len() as u32));
-            arena.extend_from_slice(&b);
+            let start = arena.len();
+            if !bytes_of(*o, &mut arena) {
+                return Err("doc op not in the log".into());
+            }
+            op_bytes.push((start as u64, (arena.len() - start) as u32));
             if op_ix.insert(*o, i as u32).is_some() {
                 return Err("duplicate doc op".into());
             }
@@ -583,7 +590,7 @@ impl R<'_> {
             .into_iter()
             .map(|v| fix(v, nf))
             .collect::<Res<Vec<u32>>>()?;
-        let mut split = std::collections::HashMap::new();
+        let mut split = crate::text::FxMap::default();
         for (ix, v) in split_raw {
             let v = v
                 .into_iter()
@@ -645,17 +652,23 @@ impl R<'_> {
         })
     }
     fn text(&mut self, log: &[(Op, Undo, Outcome)]) -> Res<TextPart> {
-        let bytes_of = |id: OpId| -> Option<Vec<u8>> {
-            let i = log.binary_search_by_key(&id, |(o, _, _)| o.id).ok()?;
-            match &log[i].0.payload {
-                Payload::TextEdit(t) => {
-                    let mut b = Vec::new();
+        // One index over the log's text ops (a binary search per doc op
+        // costs a cache miss per step at 1M ops, B2).
+        let mut by_id: crate::text::FxMap<OpId, &TextEdit> = crate::text::FxMap::default();
+        for (o, _, _) in log {
+            if let Payload::TextEdit(t) = &o.payload {
+                by_id.insert(o.id, t);
+            }
+        }
+        let bytes_of = |id: OpId, out: &mut Vec<u8>| -> bool {
+            match by_id.get(&id) {
+                Some(t) => {
                     for x in &t.ins {
-                        b.extend_from_slice(&x.bytes);
+                        out.extend_from_slice(&x.bytes);
                     }
-                    Some(b)
+                    true
                 }
-                _ => None,
+                None => false,
             }
         };
         let mut t = TextPart {
@@ -888,7 +901,8 @@ impl Replica {
             revived.insert((r.id()?, r.id()?, r.id()?));
         }
         let text = if text {
-            r.text(&log)?
+            let x = r.text(&log)?;
+            x
         } else {
             if log
                 .iter()

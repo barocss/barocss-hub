@@ -145,6 +145,11 @@ proptest! {
             prop_assert!(ops.iter().any(|o| !ids.contains(o)));
         }
         let past = causal_past(&with_c);
+        // Authoring on the base (7.12 #18, Online-First 6.10 #20): every
+        // chain op's causal past is the author's base plus earlier chain ops.
+        for o in &chain {
+            prop_assert!(past[&o.id].iter().all(|x| base.contains_key(x) || ids.contains(x)));
+        }
         for a in &chain {
             for b in &chain {
                 prop_assert!(a.id == b.id || past[&a.id].contains(&b.id) || past[&b.id].contains(&a.id));

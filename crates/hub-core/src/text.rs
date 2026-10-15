@@ -334,6 +334,40 @@ impl TextEval {
 
 // ---------------------------------------------------------------- TextDoc
 
+/// A fast non-cryptographic hasher for the doc's internal indices (Issue
+/// #54: snapshot open time; keys are local ids, not attacker-chosen in a
+/// way that matters for a local cache).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Fx(u64);
+
+impl std::hash::Hasher for Fx {
+    fn write(&mut self, b: &[u8]) {
+        for c in b.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            self.write_u64(u64::from_le_bytes(w));
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    fn write_u32(&mut self, v: u32) {
+        self.write_u64(v as u64)
+    }
+    fn write_u128(&mut self, v: u128) {
+        self.write_u64(v as u64);
+        self.write_u64((v >> 64) as u64);
+    }
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64)
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+pub(crate) type FxMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
+
 pub(crate) const NIL: u32 = u32::MAX;
 const START_F: u32 = 0;
 const CHUNK: usize = 128;
@@ -383,20 +417,20 @@ enum Place {
 pub struct TextDoc {
     pub(crate) epoch: OpId,
     pub(crate) ops: Vec<OpId>,
-    pub(crate) op_ix: HashMap<OpId, u32>,
+    pub(crate) op_ix: FxMap<OpId, u32>,
     /// Per op index: start in `arena` and byte length.
     pub(crate) op_bytes: Vec<(u64, u32)>,
     pub(crate) arena: Vec<u8>,
     /// Per op index: its fragment at offset 0, or `NIL`.
     pub(crate) op_first: Vec<u32>,
     /// Ops split into several fragments: `(start offset, fragment)`.
-    pub(crate) split: HashMap<u32, Vec<(u32, u32)>>,
+    pub(crate) split: FxMap<u32, Vec<(u32, u32)>>,
     pub(crate) frags: Vec<Frag>,
     /// Interned sorted deleter sets (op indices) of two or more ops;
     /// `delsets[0]` is empty. A one-op set is stored inline in
     /// `Frag::del` as `ONE | op index`.
     pub(crate) delsets: Vec<Vec<u32>>,
-    pub(crate) delset_ix: HashMap<Vec<u32>, u32>,
+    pub(crate) delset_ix: FxMap<Vec<u32>, u32>,
     pub(crate) chunks: Vec<Vec<u32>>,
     pub(crate) order: Vec<u32>,
     pub(crate) rank: Vec<u32>,
@@ -438,14 +472,14 @@ impl TextDoc {
         let mut d = TextDoc {
             epoch,
             ops: Vec::new(),
-            op_ix: HashMap::new(),
+            op_ix: FxMap::default(),
             op_bytes: Vec::new(),
             arena: Vec::new(),
             op_first: Vec::new(),
-            split: HashMap::new(),
+            split: FxMap::default(),
             frags: vec![start],
             delsets: vec![Vec::new()],
-            delset_ix: HashMap::new(),
+            delset_ix: FxMap::default(),
             chunks: vec![Vec::new()],
             order: vec![0],
             rank: vec![0],

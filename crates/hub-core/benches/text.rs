@@ -473,11 +473,12 @@ fn case_b2(nfiles: usize, nedits: usize) -> bool {
     // Per file: (node, last op, epoch, seed len, last insert (op, len)).
     let mut files: Vec<B2File> = Vec::new();
     let mut seed_bytes = 0usize;
+    let mut setup: Option<OpId> = None;
     for i in 0..nfiles {
         let n = next(1);
         ops.push(Op {
             id: n,
-            deps: BTreeSet::new(),
+            deps: setup.into_iter().collect(),
             payload: Payload::Create {
                 kind: Kind::File,
                 parent: ROOT,
@@ -500,14 +501,21 @@ fn case_b2(nfiles: usize, nedits: usize) -> bool {
             deps: [n].into(),
             payload: Payload::SetContent { node: n, blob: b },
         });
+        setup = Some(s);
         files.push((n, s, s, seed.len() as u32, None));
         blobs.insert(b, seed);
     }
+    // Each editor's ops form one causal chain (§2.6 #7, as real replicas
+    // author on top of their own previous op).
+    let mut mine: Vec<Option<OpId>> = vec![None; 20];
     for k in 0..nedits {
         let f = rng.below(nfiles as u64) as usize;
         let (n, last, epoch, slen, prev) = files[f];
         let r = 2 + (k % 20) as u128;
         let id = next(r);
+        let mut deps: BTreeSet<OpId> = [last].into();
+        deps.extend(mine[k % 20]);
+        mine[k % 20] = Some(id);
         let line = format!("edit {k} by {r}\n").into_bytes();
         let off = rng.below(slen as u64) as u32;
         let mut del = Vec::new();
@@ -519,7 +527,7 @@ fn case_b2(nfiles: usize, nedits: usize) -> bool {
         let len = line.len() as u32;
         ops.push(Op {
             id,
-            deps: [last].into(),
+            deps,
             payload: Payload::TextEdit(TextEdit {
                 node: n,
                 epoch,
