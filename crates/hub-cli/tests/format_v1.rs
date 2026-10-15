@@ -624,17 +624,26 @@ fn migration_crash_at_every_step() {
     }
 }
 
-/// A newer format is refused, not migrated or damaged.
+/// A newer format is refused, not migrated or damaged (v2 is understood
+/// since #54, so the newer one is v3; also a v2 `format` under a v1
+/// `replica` is corrupt).
 #[test]
 fn newer_format_is_refused() {
     let d = setup("newer");
     let h = d.join(".hub");
     let r = fs::read_to_string(h.join("replica")).unwrap();
-    fs::write(h.join("replica"), r.replace("replica/v1", "replica/v2")).unwrap();
+    fs::write(h.join("replica"), r.replace("replica/v1", "replica/v3")).unwrap();
     let before = files(&h);
     let o = hub_env(&d, &["status"], &[]);
     assert!(!o.status.success());
-    assert!(String::from_utf8_lossy(&o.stderr).contains("unsupported repository format 'v2'"));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("unsupported repository format 'v3'"));
+    assert_eq!(files(&h), before);
+    fs::write(h.join("replica"), &r).unwrap();
+    fs::write(h.join("format"), "barocss-hub/format/v2\n").unwrap();
+    let before = files(&h);
+    let o = hub_env(&d, &["status"], &[]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("format v2 under a v1 replica"));
     assert_eq!(files(&h), before);
 }
 

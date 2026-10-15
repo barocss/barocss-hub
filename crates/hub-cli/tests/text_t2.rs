@@ -756,9 +756,10 @@ fn sync_local(a: &Path, b: &Path) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(
-        std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).map(|n: u32| n / 16).unwrap_or(8).max(4)
-    ))]
+    // Each case runs many in-process `file://` sessions on real `.hub/`
+    // directories (seconds per case): 4 by default, 8 at the merge gate
+    // (PROPTEST_CASES >= 512), 12 in the deep job.
+    #![proptest_config(ProptestConfig::with_cases(sync_cases()))]
     /// Two- and three-replica `file://` sync with random text edits and
     /// random sync pairs: after full rounds every replica has the same op
     /// set and the same head text, and each equals `evaluate_with`.
@@ -791,12 +792,29 @@ proptest! {
                 sync_local(&rs[i], &rs[0]);
             }
         }
-        let want = text(&rs[0], n);
-        for r in &rs[1..] {
+        let want = text_or_seed(&rs[0], n);
+        for r in &rs {
             prop_assert_eq!(ids(r), ids(&rs[0]));
-            prop_assert_eq!(text(r, n), want.clone());
+            prop_assert_eq!(text_or_seed(r, n), want.clone());
+            // Replica = evaluate (checked inside `text`) when text exists.
+            if want != SEED {
+                prop_assert_eq!(text(r, n), want.clone());
+            }
         }
         let _ = fs::remove_dir_all(&t);
+    }
+}
+
+fn sync_cases() -> u32 {
+    if std::env::var_os("HUB_TEST_FULL_PROPTEST").is_some_and(|v| v == "1") {
+        return 12;
+    }
+    match std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        Some(n) if n >= 512 => 8,
+        _ => 4,
     }
 }
 
