@@ -606,19 +606,26 @@ fn sync_all(hub: &Path, io: &mut Io, backoff: &mut Backoff, every: Duration) -> 
             Ok(s) => {
                 backoff.ok(&name);
                 backoff.1.remove(&name);
-                if !s.report.rejected.is_empty() {
+                // Issue #50: only rejections not reported before.
+                let new = s.new_rejected();
+                if !new.is_empty() {
                     if io.json {
                         io.event(
                             "rejected",
                             vec![
                                 ("peer", J::s(&name)),
-                                ("ops", crate::json::rejected_j(&s.report.rejected)),
+                                ("ops", crate::json::rejected_j(&new)),
                             ],
                         )?;
                     } else {
-                        for l in crate::sync::rejected_lines(&s.report.rejected) {
+                        for l in crate::sync::rejected_lines(&new) {
                             io.warning(&format!("{name}: {l}"))?;
                         }
+                    }
+                    let mut w = Vec::new();
+                    s.remember(&mut w)?;
+                    for l in String::from_utf8_lossy(&w).lines() {
+                        io.warning(l.trim_start_matches("warning: "))?;
                     }
                 }
                 let (g, t) = (s.report.received, s.report.sent);

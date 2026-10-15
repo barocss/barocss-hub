@@ -16,8 +16,12 @@ path = "src/main.rs"
 [dependencies]
 hub-core = { package = "barocss-hub-core", path = "../hub-core" }
 sha2 = "0.10"
-# Issue #46 R2: XOF for the LtHash16 divergence digest.
-blake3 = "=1.8.2"
+# Issue #46 R2: XOF for the LtHash16 digest (partial replicas, #47). Not
+# on the wire path, so optional and off by default (#50).
+blake3 = { version = "=1.8.2", optional = true }
+
+[features]
+lthash = ["dep:blake3"]
 
 [dev-dependencies]
 proptest = "1"

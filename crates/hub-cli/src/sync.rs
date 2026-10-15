@@ -510,7 +510,8 @@ pub fn sync_with(
 ) -> Result<(), Error> {
     let peer_path = cwd.join(peer_arg);
     let r = sync_local(cwd, &peer_path, stop, warn)?;
-    print_report(&r, out, warn)
+    print_report(&r, out, warn)?;
+    r.remember(warn)
 }
 
 /// A finished sync, for printing and for `watch`/`--json`.
@@ -523,6 +524,33 @@ pub struct Synced {
     pub head_short: String,
     pub head_id: String,
     pub behind_note: bool,
+    /// `report.rejected` classified against the reported-rejections
+    /// memory (Issue #50, D-050).
+    pub rej: Vec<crate::reported::Rejection>,
+    /// The remote's trust key (the memory key) and our `.hub/`.
+    pub key: Option<crate::trust::TrustKey>,
+    pub hub: std::path::PathBuf,
+}
+
+impl Synced {
+    /// Rejections not reported before (these warn and exit 3).
+    pub fn new_rejected(&self) -> Vec<(hub_core::tree::OpId, String)> {
+        self.rej
+            .iter()
+            .filter(|r| !r.already)
+            .map(|r| (r.op, r.reason.clone()))
+            .collect()
+    }
+
+    /// Record the new rejections as reported; call after printing them.
+    /// A failure is a warning, not a sync failure (the next sync reports
+    /// again).
+    pub fn remember(&self, warn: &mut dyn Write) -> Result<(), Error> {
+        if let Err(e) = crate::reported::remember(&self.hub, self.key.as_ref(), &self.rej) {
+            writeln!(warn, "warning: could not remember reported rejections: {e}")?;
+        }
+        Ok(())
+    }
 }
 
 /// What a rejection reason means for the author, and what to do.
@@ -579,10 +607,11 @@ pub fn print_report(r: &Synced, out: &mut dyn Write, warn: &mut dyn Write) -> Re
             )?;
         }
     }
-    if !r.report.rejected.is_empty() {
+    let new = r.new_rejected();
+    if !new.is_empty() {
         crate::note_rejected();
     }
-    for l in rejected_lines(&r.report.rejected) {
+    for l in rejected_lines(&new) {
         writeln!(warn, "warning: {l}")?;
     }
     if r.warnings > 0 {
@@ -607,13 +636,18 @@ pub(crate) fn summarize(
     side: &crate::session::Side,
     report: crate::session::Report,
     peer_pending: Option<usize>,
+    key: Option<crate::trust::TrustKey>,
 ) -> Result<Synced, Error> {
     let repo = side.repo().expect("client side holds its repo");
     let s = side.replica();
     let ix = repo.index();
     let hid = VersionId::of_frontier(&repo.head_frontier());
     let idx = crate::wd::Index::load(&repo.dir)?;
+    let rej = crate::reported::classify(repo, key.as_ref(), &report.rejected);
     Ok(Synced {
+        rej,
+        key,
+        hub: repo.dir.clone(),
         remote,
         behind_note: report.received.ops > 0 && idx.base != repo.head_frontier(),
         report,
@@ -695,7 +729,14 @@ pub fn sync_local(
         }
     }
     let peer_pending = Some(session::pending_len(&cb));
-    summarize(rb.display().to_string(), &ca, report, peer_pending)
+    let key = crate::remote::file_key(&theirs, &mine);
+    summarize(
+        rb.display().to_string(),
+        &ca,
+        report,
+        peer_pending,
+        Some(key),
+    )
 }
 
 /// Ops in head but not in the down-closure of `base` (0 if `base` does not

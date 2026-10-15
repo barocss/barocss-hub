@@ -10,6 +10,7 @@ pub mod ignore;
 pub mod json;
 pub mod migrate;
 pub mod remote;
+pub mod reported;
 pub mod session;
 pub mod snapshot;
 pub mod store;
@@ -306,6 +307,21 @@ pub(crate) fn test_cases(default: u32) -> u32 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// [`test_cases`] capped at `max` (Issue #50 gate-time proposal, for
+/// Review): the #46 divergence properties cost ~0.45 s per case, so at
+/// `PROPTEST_CASES=512` they add ~460 s of work to the merge gate. The
+/// cap keeps the gate at `max` cases; `HUB_TEST_FULL_PROPTEST=1` lifts it
+/// for a separate deep job.
+#[cfg(test)]
+pub(crate) fn test_cases_capped(default: u32, max: u32) -> u32 {
+    let n = test_cases(default);
+    if std::env::var_os("HUB_TEST_FULL_PROPTEST").is_some() {
+        n
+    } else {
+        n.min(max)
+    }
 }
 
 #[cfg(test)]
@@ -1704,7 +1720,10 @@ Commands:
                        foreground: auto-record working-directory changes,
                        sync with every remote, apply incoming ops; Ctrl-C stops
                        (untrusted remotes are skipped; --no-sync: local only)
-  warnings             list sync warnings (D-008) and pending ops
+  warnings [--clear-reported [<remote>]]
+                       list sync warnings (D-008), pending ops and rejections
+                       already reported (not warned again, no exit 3);
+                       --clear-reported: forget those (all, or one remote's)
   reid                 give this repo a fresh replica id (after copying a .hub/;
                        run it BEFORE recording in the copy); clears saved
                        duplicate-replica warnings (provisional default)
@@ -1837,6 +1856,24 @@ pub fn run(
         opts.json = json;
         return watch::watch_cmd(cwd, opts, out, warn);
     }
+    if let ["warnings", "--clear-reported", rest @ ..] = a.as_slice() {
+        let n = match rest {
+            [] => remote::clear_reported(cwd, None)?,
+            [r] => remote::clear_reported(cwd, Some(r))?,
+            _ => return Err(usage("warnings")),
+        };
+        if json {
+            return json::emit(
+                out,
+                json::doc("warnings", vec![("cleared_reported", json::J::n(n))]),
+            );
+        }
+        writeln!(
+            out,
+            "forgot {n} reported rejection(s); they are reported again on the next sync"
+        )?;
+        return Ok(());
+    }
     if a[0] == "sync" {
         let yes = a.iter().any(|x| matches!(*x, "--yes" | "-y"));
         let rest: Vec<&str> = a[1..]
@@ -1852,7 +1889,8 @@ pub fn run(
         if json {
             let mode = remote::cli_trust_mode(yes, true);
             let r = remote::sync(cwd, arg, true, mode, warn)?;
-            return json::emit(out, json::sync_doc(&r, warn)?);
+            json::emit(out, json::sync_doc(&r, warn)?)?;
+            return r.remember(warn);
         }
         return remote::sync_cmd(cwd, arg, yes, out, warn);
     }
@@ -2247,7 +2285,8 @@ pub fn run(
         ["warnings"] => {
             let (sw, _) = sync::warnings_view(&repo)?;
             let pend = sync::read_pending(&repo.dir)?;
-            if sw.is_empty() && pend.is_empty() {
+            let rep = reported::read(&repo.dir);
+            if sw.is_empty() && pend.is_empty() && rep.is_empty() {
                 writeln!(out, "no warnings")?;
             }
             for w in &sw {
@@ -2259,6 +2298,15 @@ pub fn run(
                     "pending op {} from peer {} (missing deps)",
                     store::fmt_id(o.id),
                     &format!("{:032x}", p.0)[..8]
+                )?;
+            }
+            for e in &rep {
+                writeln!(
+                    out,
+                    "reported rejection (suppressed): op {} ({}) by remote {}; `barocss-hub warnings --clear-reported` reports it again",
+                    store::fmt_id(e.op),
+                    e.reason,
+                    e.key.url
                 )?;
             }
         }

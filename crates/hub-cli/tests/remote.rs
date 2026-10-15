@@ -653,6 +653,22 @@ fn diverge_repro(via: &str) {
     assert!(so.contains("sent 0 op(s), 0 blob(s)"), "{so}");
     assert!(String::from_utf8_lossy(&o.stderr).contains("(equivocation)"));
     assert!(ok(&c, &["warnings"]).contains("equivocation"));
+    // Issue #50 (D-050): that rejection was reported; later syncs exit 0
+    // without repeating it, while the D-008 equivocation warning stays
+    // listed and the rejection is listed as already reported.
+    for _ in 0..2 {
+        let o = hub_env(&c, &["sync"], &e.env());
+        let err = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert_eq!(o.status.code(), Some(0), "{err}");
+        assert!(!err.contains("rejected your op"), "{err}");
+    }
+    let w = ok(&c, &["warnings"]);
+    assert!(w.contains("equivocation"), "{w}");
+    assert!(w.contains("reported rejection (suppressed)"), "{w}");
+    // Clearing reports it again.
+    ok(&c, &["warnings", "--clear-reported", "origin"]);
+    let o = hub_env(&c, &["sync"], &e.env());
+    assert_eq!(o.status.code(), Some(3));
 }
 
 #[test]

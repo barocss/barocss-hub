@@ -92,7 +92,7 @@ pub struct Side {
     /// payloads; their blobs are never requested.
     no_blobs: bool,
     /// Digest of the whole applied store at the frontier it was computed
-    /// for (#46: one LtHash pass per side per frontier; a frontier names
+    /// for (#46: one sequence-digest pass ([`Sums`]) per side per frontier; a frontier names
     /// one causally closed set, and keep-first never changes an op).
     total: Option<(Vec<OpId>, Sums)>,
 }
@@ -1366,18 +1366,30 @@ mod diverge46_tests {
         Ok(seen)
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig { cases: crate::test_cases(48), ..ProptestConfig::default() })]
+    /// The two properties at [`crate::test_cases_capped`] cases. A manual
+    /// `TestRunner`: the `proptest!` macro re-reads `PROPTEST_CASES` over
+    /// any configured count (proptest 1.11 `contextualize_config`), so a
+    /// cap there would have no effect in the merge gate.
+    fn capped(copies: bool) {
+        let cfg = ProptestConfig {
+            cases: crate::test_cases_capped(48, 192),
+            ..ProptestConfig::default()
+        };
+        let mut r = proptest::test_runner::TestRunner::new(cfg);
+        r.run(&(any::<u64>(), 1usize..11), |(seed, nsteps)| {
+            run(seed, nsteps, copies).map(|_| ())
+        })
+        .unwrap();
+    }
 
-        #[test]
-        fn same_id_copies_never_diverge_silently(seed in any::<u64>(), nsteps in 1usize..11) {
-            run(seed, nsteps, true)?;
-        }
+    #[test]
+    fn same_id_copies_never_diverge_silently() {
+        capped(true);
+    }
 
-        #[test]
-        fn honest_histories_never_report_divergence(seed in any::<u64>(), nsteps in 1usize..11) {
-            run(seed, nsteps, false)?;
-        }
+    #[test]
+    fn honest_histories_never_report_divergence() {
+        capped(false);
     }
 
     /// Review R1 regression (merge-gate seed): one side stopped with

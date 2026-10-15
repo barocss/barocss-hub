@@ -472,6 +472,23 @@ pub(crate) fn read_cmd(
                                 .collect(),
                         ),
                     ),
+                    (
+                        "reported_rejections",
+                        J::Arr(
+                            crate::reported::read(&repo.dir)
+                                .iter()
+                                .map(|e| {
+                                    J::obj(vec![
+                                        ("op", id(e.op)),
+                                        ("reason", J::s(&e.reason)),
+                                        ("payload_sha256", J::s(&e.payload)),
+                                        ("remote", J::s(&e.key.url)),
+                                        ("exec", J::s(&e.key.exec)),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
                 ],
             )
         }
@@ -879,6 +896,23 @@ pub fn rejected_j(rej: &[(hub_core::tree::OpId, String)]) -> J {
     )
 }
 
+/// A sync's rejections with `already_reported` (Issue #50): `true` ones
+/// were reported by an earlier sync and neither warn nor exit 3.
+pub fn rejections_j(rej: &[crate::reported::Rejection]) -> J {
+    J::Arr(
+        rej.iter()
+            .map(|r| {
+                J::obj(vec![
+                    ("op", id(r.op)),
+                    ("reason", J::s(&r.reason)),
+                    ("message", J::s(crate::sync::rejected_message(&r.reason))),
+                    ("already_reported", J::Bool(r.already)),
+                ])
+            })
+            .collect(),
+    )
+}
+
 /// `sync --json` (Issue #43): counts, `read_only`, head, and the human
 /// lines as `output`.
 pub fn sync_doc(r: &crate::sync::Synced, warn: &mut dyn Write) -> Result<J, Error> {
@@ -900,7 +934,7 @@ pub fn sync_doc(r: &crate::sync::Synced, warn: &mut dyn Write) -> Result<J, Erro
                 ]),
             ),
             ("pending_ops", J::n(r.pending)),
-            ("rejected", rejected_j(&r.report.rejected)),
+            ("rejected", rejections_j(&r.rej)),
             ("rejected_reported", J::Bool(r.report.rejected_reported)),
             ("output", J::strs(text.lines().collect::<Vec<_>>())),
         ],

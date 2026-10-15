@@ -1227,8 +1227,20 @@ fn zz_helper_scripted_server_over_stdio() {
     let (feature, rej) = if v == "-" {
         (false, vec![])
     } else {
-        let r = u128::from_str_radix(&v, 16).unwrap();
-        (true, vec![(NodeId::new(2, r), "equivocation".to_string())])
+        // `<replica hex>[/<counter>,...[/<reason>]]` (Issue #50).
+        let mut p = v.split('/');
+        let r = u128::from_str_radix(p.next().unwrap(), 16).unwrap();
+        let cs: Vec<u64> = p
+            .next()
+            .map(|c| c.split(',').map(|n| n.parse().unwrap()).collect())
+            .unwrap_or(vec![2]);
+        let why = p.next().unwrap_or("equivocation").to_string();
+        (
+            true,
+            cs.into_iter()
+                .map(|c| (NodeId::new(c, r), why.clone()))
+                .collect(),
+        )
     };
     scripted_server(y, feature, rej).unwrap();
 }
@@ -1279,14 +1291,16 @@ fn sync_exits_3_when_the_remote_rejects_ops() {
     );
     assert!(String::from_utf8_lossy(&o.stdout).contains("head "));
     let o = run(&["sync", "--json"], &mine);
-    assert_eq!(o.status.code(), Some(3));
     assert!(
         o.stderr.is_empty(),
         "{}",
         String::from_utf8_lossy(&o.stderr)
     );
+    // Issue #50: the repeat is already reported: exit 0, still listed.
+    assert_eq!(o.status.code(), Some(0));
     let j = String::from_utf8(o.stdout).unwrap();
     assert!(j.contains("\"rejected\":[{\"op\":\"2."), "{j}");
+    assert!(j.contains("\"already_reported\":true"), "{j}");
     assert!(j.contains("\"rejected_reported\":true"), "{j}");
     // An old server (no rejected-ops feature): nothing reported, exit 0.
     let o = run(&["sync", "--json"], "-");
@@ -1297,4 +1311,210 @@ fn sync_exits_3_when_the_remote_rejects_ops() {
         String::from_utf8_lossy(&o.stderr)
     );
     assert!(String::from_utf8_lossy(&o.stdout).contains("\"rejected_reported\":false"));
+}
+
+/// Issue #50 (D-050): a rejection is reported once per remote. Repeats
+/// exit 0 without a warning; a new op id, a different payload under the
+/// same id, or a cleared memory is reported again (exit 3);
+/// `duplicate-replica` is never suppressed; a crash while writing the
+/// memory never suppresses a report that was not printed. With
+/// `HUB_TEST_NO_REJECTION_DEDUP` (the mutation check) the repeat exits 3.
+#[test]
+fn rejections_are_reported_once_per_remote() {
+    let t = tmp("rej50");
+    let d = t.join("c");
+    fs::create_dir_all(&d).unwrap();
+    ok(&d, &["init"]);
+    fs::write(d.join("f.txt"), "x\n").unwrap();
+    ok(&d, &["record"]);
+    fs::write(d.join("g.txt"), "y\n").unwrap();
+    ok(&d, &["record"]);
+    let mine = format!("{:x}", replica_of(&d).0);
+    let ssh = t.join("fake-ssh");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nexec '{}' --exact zz_helper_scripted_server_over_stdio --nocapture --test-threads=1 3>&1 1>&2\n",
+            std::env::current_exe().unwrap().display()
+        ),
+    )
+    .unwrap();
+    Command::new("chmod").arg("+x").arg(&ssh).status().unwrap();
+    let run_env = |args: &[&str], rej: &str, env: &[(&str, &str)]| {
+        let mut c = Command::new(BIN);
+        c.args(args)
+            .current_dir(&d)
+            .env("HUB_SSH_COMMAND", &ssh)
+            .env("HUB45_SCRIPTED_SERVER", rej)
+            .env("BAROCSS_HUB_CONFIG_DIR", t.join("cfg"))
+            .env_remove("BAROCSS_HUB_SERVE_ROOT")
+            .env_remove("HUB_TEST_NO_REJECTION_DEDUP")
+            .env_remove("HUB_TEST_CRASH_STAGE")
+            .stdin(Stdio::null());
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    };
+    let run = |args: &[&str], rej: &str| run_env(args, rej, &[]);
+    let code = |o: &std::process::Output| o.status.code();
+    let err = |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).into_owned();
+    let o = run(&["remote", "add", "origin", "ssh://localhost/srv"], "-");
+    assert!(o.status.success(), "{}", err(&o));
+    let r2 = format!("{mine}/2");
+    // First report: exit 3 with the warning.
+    let o = run(&["sync"], &r2);
+    assert_eq!(code(&o), Some(3), "{}", err(&o));
+    assert!(err(&o).contains("rejected your op 2."));
+    let mem = d.join(".hub/reported-rejections");
+    assert!(mem.exists());
+    // Repeats: exit 0, no warning, twice.
+    for _ in 0..2 {
+        let o = run(&["sync"], &r2);
+        assert_eq!(code(&o), Some(0), "{}", err(&o));
+        assert!(!err(&o).contains("rejected"), "{}", err(&o));
+    }
+    // Mutation check: without the dedup the repeat exits 3 again.
+    let o = run_env(&["sync"], &r2, &[("HUB_TEST_NO_REJECTION_DEDUP", "1")]);
+    assert_eq!(code(&o), Some(3));
+    // `warnings` lists it, marked, in human and --json form.
+    let w = ok(&d, &["warnings"]);
+    assert!(w.contains("reported rejection (suppressed): op 2."), "{w}");
+    let wj = ok(&d, &["warnings", "--json"]);
+    assert!(wj.contains("\"reported_rejections\":[{\"op\":\"2."), "{wj}");
+    // A new rejection next to the known one: exit 3, only the new one warned.
+    let o = run(&["sync"], &format!("{mine}/2,3"));
+    assert_eq!(code(&o), Some(3));
+    assert!(err(&o).contains("rejected your op 3."), "{}", err(&o));
+    assert!(!err(&o).contains("rejected your op 2."), "{}", err(&o));
+    let o = run(&["sync"], &format!("{mine}/2,3"));
+    assert_eq!(code(&o), Some(0), "{}", err(&o));
+    // A different payload under the same op id (the memory holds another
+    // hash): reported.
+    let text = fs::read_to_string(&mem).unwrap();
+    let body = text.lines().nth(1).unwrap().to_string();
+    let hash = body.split(' ').find(|w| w.len() == 64).unwrap().to_string();
+    let other = "0".repeat(64);
+    let lines: Vec<String> = text
+        .lines()
+        .skip(1)
+        .map(|l| {
+            let b = l.split('\t').next().unwrap();
+            hub_cli::store::frame(&b.replace(&hash, &other))
+        })
+        .collect();
+    fs::write(
+        &mem,
+        format!("{}\n{}", hub_cli::reported::HEADER, lines.concat()),
+    )
+    .unwrap();
+    let o = run(&["sync"], &r2);
+    assert_eq!(code(&o), Some(3), "{}", err(&o));
+    assert!(err(&o).contains("rejected your op 2."));
+    // Clear (one remote, then all): reported again.
+    assert!(ok(&d, &["warnings", "--clear-reported", "origin"]).contains("forgot"));
+    let o = run(&["sync"], &r2);
+    assert_eq!(code(&o), Some(3));
+    assert!(ok(&d, &["warnings", "--clear-reported"]).contains("forgot"));
+    assert!(!ok(&d, &["warnings"]).contains("reported rejection"));
+    let o = run(&["sync"], &r2);
+    assert_eq!(code(&o), Some(3));
+    // duplicate-replica is never suppressed.
+    let dup = format!("{mine}/2/duplicate-replica");
+    for _ in 0..2 {
+        let o = run(&["sync"], &dup);
+        assert_eq!(code(&o), Some(3));
+        assert!(err(&o).contains("(duplicate-replica)"), "{}", err(&o));
+    }
+    // Crash safety: kill -9 at each write step of the memory.
+    for stage in ["reported-tmp", "reported-renamed"] {
+        ok(&d, &["warnings", "--clear-reported"]);
+        let r4 = format!("{mine}/2,3");
+        let o = run_env(&["sync"], &r4, &[("HUB_TEST_CRASH_STAGE", stage)]);
+        assert!(!o.status.success(), "{stage}: crash expected");
+        // The report was printed before the crash.
+        assert!(
+            err(&o).contains("rejected your op 3."),
+            "{stage}: {}",
+            err(&o)
+        );
+        // The memory is whole: old or new, never torn; `warnings` works.
+        ok(&d, &["warnings"]);
+        let o = run(&["sync"], &r4);
+        let c = code(&o);
+        match stage {
+            // Not renamed: nothing remembered, so reported again.
+            "reported-tmp" => assert_eq!(c, Some(3), "{}", err(&o)),
+            // Renamed: remembered (the report was shown).
+            _ => assert_eq!(c, Some(0), "{}", err(&o)),
+        }
+    }
+}
+
+/// Issue #50: `watch --json` emits a `rejected` event once per rejection,
+/// not on every sync cycle.
+#[test]
+fn watch_emits_each_rejection_once() {
+    let t = tmp("rej50w");
+    let d = t.join("c");
+    fs::create_dir_all(&d).unwrap();
+    ok(&d, &["init"]);
+    fs::write(d.join("f.txt"), "x\n").unwrap();
+    ok(&d, &["record"]);
+    let mine = format!("{:x}", replica_of(&d).0);
+    let ssh = t.join("fake-ssh");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nexec '{}' --exact zz_helper_scripted_server_over_stdio --nocapture --test-threads=1 3>&1 1>&2\n",
+            std::env::current_exe().unwrap().display()
+        ),
+    )
+    .unwrap();
+    Command::new("chmod").arg("+x").arg(&ssh).status().unwrap();
+    let cmd = |args: &[&str]| {
+        let mut c = Command::new(BIN);
+        c.args(args)
+            .current_dir(&d)
+            .env("HUB_SSH_COMMAND", &ssh)
+            .env("HUB45_SCRIPTED_SERVER", format!("{mine}/2"))
+            .env("BAROCSS_HUB_CONFIG_DIR", t.join("cfg"))
+            .env_remove("BAROCSS_HUB_SERVE_ROOT")
+            .env_remove("HUB_TEST_NO_REJECTION_DEDUP")
+            .stdin(Stdio::null());
+        c
+    };
+    let o = cmd(&["remote", "add", "origin", "ssh://localhost/srv"])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    // Run a watcher for >= 3 s; `nodedup` = the mutation check.
+    let watch = |nodedup: bool| {
+        let log = t.join(format!("watch-{nodedup}.out"));
+        let mut c = cmd(&["watch", "--json", "--sync", "100", "--poll", "50"]);
+        if nodedup {
+            c.env("HUB_TEST_NO_REJECTION_DEDUP", "1");
+        }
+        let mut child = c
+            .stdout(fs::File::create(&log).unwrap())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        while !(d.join(".hub/reported-rejections").exists()
+            && t0.elapsed() > Duration::from_secs(3))
+        {
+            assert!(t0.elapsed() < Duration::from_secs(60));
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let s = fs::read_to_string(&log).unwrap();
+        s.matches("\"event\":\"rejected\"").count()
+    };
+    assert_eq!(watch(false), 1);
+    // Already remembered: a new watcher stays quiet...
+    assert_eq!(watch(false), 0);
+    // ...and without the dedup every cycle repeats it.
+    assert!(watch(true) >= 2);
 }
