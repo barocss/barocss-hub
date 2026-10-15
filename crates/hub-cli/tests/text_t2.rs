@@ -735,10 +735,40 @@ fn v1_repo_is_byte_identical_under_old_and_new_binaries() {
         assert_eq!(ro.status.success(), rn.status.success(), "{args:?}");
         assert_eq!(ro.stdout, rn.stdout, "{args:?} output");
     }
+    // Review R2 (#54): `.hub/index` file entries are
+    // `f <path> <node> <blob> <size> <mtime ns>`. The last two are the
+    // working file's stat cache: the mtime differs between the two copies
+    // and runs, and the racy-git guard smudges an entry to `0 0` when the
+    // file's mtime is within RACY_NS of the save (timing-dependent under
+    // load). Only those two fields of `f` lines are masked; every other
+    // byte of every `.hub/` file (index header, base, paths, node ids,
+    // blob ids, and all other files) is compared exactly.
+    let mask_index = |b: Vec<u8>| -> Vec<u8> {
+        let t = String::from_utf8(b).unwrap();
+        t.lines()
+            .map(|l| match l.strip_prefix("f ") {
+                Some(rest) => {
+                    let f: Vec<&str> = rest.rsplitn(3, ' ').collect();
+                    format!("f {} <size> <mtime>", f[2])
+                }
+                None => l.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes()
+    };
     let strip = |d: &Path| -> BTreeMap<PathBuf, Vec<u8>> {
         all_bytes(&d.join(".hub"))
             .into_iter()
-            .map(|(p, b)| (p.strip_prefix(d).unwrap().to_path_buf(), b))
+            .map(|(p, b)| {
+                let rel = p.strip_prefix(d).unwrap().to_path_buf();
+                let b = if rel == Path::new(".hub/index") {
+                    mask_index(b)
+                } else {
+                    b
+                };
+                (rel, b)
+            })
             .collect()
     };
     assert_eq!(

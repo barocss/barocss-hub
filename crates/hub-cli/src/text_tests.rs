@@ -166,3 +166,92 @@ fn oversized_record_is_refused_and_a_chain_fits() {
     assert_eq!(r.state()[&create.id].content, Some(BlobId::of(&big)));
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Review R1 (#54): a received `TextEdit` whose deps are missing lands
+/// only in `pending.log`. The persist step switches the header to v2
+/// before that `T` record is written (A.2.9), so a pre-#54 binary refuses
+/// at `replica` and never reads `pending.log`.
+#[test]
+fn pending_only_text_edit_switches_the_header_first() {
+    let root = tmp("pendonly");
+    let mut repo = Repo::init(&root).unwrap();
+    let dir = repo.dir.clone();
+    let mut s = sync::load(&repo).unwrap();
+    let peer = hub_core::tree::ReplicaId(0x77);
+    let missing = NodeId::new(40, 0x77);
+    let te = Op {
+        id: NodeId::new(41, 0x77),
+        deps: [missing].into(),
+        payload: Payload::TextEdit(TextEdit {
+            node: missing,
+            epoch: missing,
+            seen: BTreeSet::new(),
+            del: vec![],
+            ins: vec![Ins {
+                left: None,
+                right: None,
+                bytes: b"pending\n".to_vec(),
+            }],
+        }),
+    };
+    s.receive(peer, te.clone());
+    assert_eq!(s.pending_len(), 1);
+    let mut n = 0;
+    sync::persist_with(&mut repo, &s, &Default::default(), &mut n, None).unwrap();
+    drop(repo);
+    let pending = fs::read_to_string(dir.join("pending.log")).unwrap();
+    assert!(pending.contains(" T "), "{pending}");
+    assert!(!fs::read_to_string(dir.join("ops.log"))
+        .unwrap()
+        .contains(" T "));
+    assert!(fs::read_to_string(dir.join("replica"))
+        .unwrap()
+        .starts_with("barocss-hub/replica/v2\n"));
+    assert_eq!(
+        fs::read_to_string(dir.join("format")).unwrap(),
+        store::FORMAT_V2
+    );
+    assert_eq!(sync::read_pending(&dir).unwrap(), vec![(te, peer)]);
+    // The real pre-#54 binary refuses at the header, writing nothing.
+    if let Some(old) = std::env::var_os("HUB_TEST_OLD_BIN") {
+        let before: Vec<(PathBuf, Vec<u8>)> = walk(&dir);
+        for args in [&["status"][..], &["sync"], &["record"], &["log"]] {
+            let o = std::process::Command::new(&old)
+                .args(args)
+                .current_dir(&root)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(!o.status.success());
+            // (`sync` with no remote stops on the config before opening.)
+            assert!(
+                args == ["sync"]
+                    || String::from_utf8_lossy(&o.stderr)
+                        .contains("unsupported repository format 'v2'"),
+                "{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            assert_eq!(walk(&dir), before, "old {args:?} wrote");
+        }
+    } else {
+        eprintln!("HUB_TEST_OLD_BIN unset: old-binary half skipped");
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn walk(d: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut st = vec![d.to_path_buf()];
+    while let Some(x) = st.pop() {
+        for e in fs::read_dir(&x).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                st.push(e.path());
+            } else {
+                out.push((e.path(), fs::read(e.path()).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
