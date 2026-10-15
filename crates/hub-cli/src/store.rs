@@ -15,7 +15,8 @@
 //!
 //! Op body: `O <id> <deps> <payload>`; id = `<counter>.<replica 32 hex>`;
 //! deps = `-` or comma-joined ids; payload = `C d|f <parent> <str>`,
-//! `M <node> <parent> <str>` or `D <node>`.
+//! `M <node> <parent> <str>`, `D <node>`, `S <node> <blob>` or (Issue #54,
+//! format v2) `T <node> <epoch> s=.. d=.. i=..` ([`encode_op`]).
 //! Checkpoint body: `K <author 32 hex> <frontier> <str message> <str note|->`.
 //! A string token is `s` followed by the escaped bytes (`s` alone = "").
 //!
@@ -39,6 +40,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use hub_core::checkpoint::{Checkpoint, FrontierCheck};
+use hub_core::text::{ElemId, Ins, TextEdit};
 use hub_core::tree::{BlobId, Kind, NodeId, Op, Payload, ReplicaId};
 #[cfg(test)]
 use hub_core::version::Store;
@@ -59,6 +61,23 @@ pub const REPLICA_HEADER_PREFIX: &str = "barocss-hub/replica/";
 pub const REPLICA_HEADER_RESCUE: &str = "barocss-hub/replica/v1-rescue";
 /// `.hub/format` contents in v1.
 pub const FORMAT_V1: &str = "barocss-hub/format/v1\n";
+/// Format v2 (Issue #54, Text-CRDT 7.9): v1 + `T` records + text state in
+/// the snapshot. Set lazily at the first `TextEdit` appended.
+pub const REPLICA_HEADER_V2: &str = "barocss-hub/replica/v2";
+/// v2 while `reid --rescue` is in progress (replaces `v1-rescue`).
+pub const REPLICA_HEADER_V2_RESCUE: &str = "barocss-hub/replica/v2-rescue";
+/// `.hub/format` contents in v2.
+pub const FORMAT_V2: &str = "barocss-hub/format/v2\n";
+
+/// The replica header of format v1 or v2 (`v2`), with the rescue marker.
+pub fn replica_header(v2: bool, rescue: bool) -> &'static str {
+    match (v2, rescue) {
+        (false, false) => REPLICA_HEADER,
+        (false, true) => REPLICA_HEADER_RESCUE,
+        (true, false) => REPLICA_HEADER_V2,
+        (true, true) => REPLICA_HEADER_V2_RESCUE,
+    }
+}
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -172,25 +191,192 @@ pub fn parse_blob(t: &str) -> Result<BlobId, String> {
     Ok(BlobId(out))
 }
 
-/// Issue #53 (T1): message of the typed refusal for a text op, which has
-/// no v1 log record (the `T` record is T2).
-pub const TEXT_OPS_NEED_T2: &str = "unsupported: text ops need T2 (no v1 log record for TextEdit)";
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// [`encode_op`], refusing ops that have no v1 record (Issue #53: a
-/// `TextEdit` before T2) instead of encoding a placeholder.
-pub fn try_encode_op(op: &Op) -> Result<String, &'static str> {
-    match op.payload {
-        Payload::TextEdit(_) => Err(TEXT_OPS_NEED_T2),
-        _ => Ok(encode_op(op)),
+/// Standard base64 with padding (RFC 4648 §4); empty input = "".
+pub fn b64(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for k in 0..4 {
+            if k <= c.len() {
+                out.push(B64[(n >> (18 - 6 * k)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
     }
+    out
 }
 
-/// One op record. A `TextEdit` (no v1 record before T2, Issue #53) encodes
-/// to a marker record that [`decode_op`] rejects, so it can never be read
-/// back as an op. The ops.log append uses [`try_encode_op`] and refuses
-/// it; other writers (pending.log, rescue manifest, wire `Ops`, reported)
-/// still call this and would write the marker: unreachable in T1 (nothing
-/// constructs a `TextEdit`); T2 routes every path through the `T` record.
+/// Strict inverse of [`b64`]: padding required, unused bits zero, so
+/// every byte string has exactly one accepted spelling (canonical).
+pub fn unb64(t: &str) -> Result<Vec<u8>, String> {
+    let b = t.as_bytes();
+    if b.len() % 4 != 0 {
+        return Err("bad base64 length".into());
+    }
+    let val = |c: u8| -> Result<u32, String> {
+        Ok(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return Err("bad base64 character".into()),
+        } as u32)
+    };
+    let mut out = Vec::with_capacity(b.len() / 4 * 3);
+    for (i, q) in b.chunks(4).enumerate() {
+        let last = i + 1 == b.len() / 4;
+        let pad = q.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return Err("bad base64 padding".into());
+        }
+        let mut n = 0u32;
+        for &c in &q[..4 - pad] {
+            n = n << 6 | val(c)?;
+        }
+        n <<= 6 * pad as u32;
+        let keep = 3 - pad;
+        if n & ((1u32 << (8 * pad as u32)) - 1) != 0 {
+            return Err("non-canonical base64".into());
+        }
+        out.extend_from_slice(&n.to_be_bytes()[1..1 + keep]);
+    }
+    Ok(out)
+}
+
+/// A canonical decimal (no sign, no leading zero).
+fn canon_num<T: std::str::FromStr + std::fmt::Display>(t: &str) -> Result<T, String> {
+    let v: T = t.parse().map_err(|_| format!("bad number '{t}'"))?;
+    if v.to_string() != t {
+        return Err(format!("non-canonical number '{t}'"));
+    }
+    Ok(v)
+}
+
+fn fmt_elem(e: ElemId) -> String {
+    format!("{}:{}", fmt_id(e.op), e.off)
+}
+
+fn parse_elem(t: &str) -> Result<ElemId, String> {
+    let (op, off) = t.split_once(':').ok_or("bad element id")?;
+    Ok(ElemId {
+        op: canon_id(op)?,
+        off: canon_num(off)?,
+    })
+}
+
+/// [`parse_id`] accepting only the [`fmt_id`] spelling.
+fn canon_id(t: &str) -> Result<NodeId, String> {
+    let n = parse_id(t)?;
+    if fmt_id(n) != t {
+        return Err(format!("non-canonical id '{t}'"));
+    }
+    Ok(n)
+}
+
+/// Body of a `T` record (Text-CRDT 7.4.1, Issue #54), after `T `:
+/// `<node> <epoch> s=<seen> d=<del> i=<ins>`.
+/// - `seen`: `-` or comma-joined op ids, strictly ascending;
+/// - `del`: `-` or comma-joined `<op>:<off>+<len>`, in payload order;
+/// - `ins`: `-` or `;`-joined `<left>|<right>|<base64>`, in payload order,
+///   with `left` = `^` (START) or `<op>:<off>`, `right` = `$` (END) or
+///   `<op>:<off>`, and the run's bytes in strict padded base64.
+///
+/// Numbers are canonical decimals. Exactly one spelling per `TextEdit`:
+/// `decode(encode(t)) == t` and `encode(decode(s)) == s`.
+fn encode_text(t: &TextEdit) -> String {
+    let seen = fmt_ids(t.seen.iter().copied());
+    let del = if t.del.is_empty() {
+        "-".to_string()
+    } else {
+        t.del
+            .iter()
+            .map(|&(e, n)| format!("{}+{n}", fmt_elem(e)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let ins = if t.ins.is_empty() {
+        "-".to_string()
+    } else {
+        t.ins
+            .iter()
+            .map(|i| {
+                format!(
+                    "{}|{}|{}",
+                    i.left.map_or("^".into(), fmt_elem),
+                    i.right.map_or("$".into(), fmt_elem),
+                    b64(&i.bytes)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    format!(
+        "T {} {} s={seen} d={del} i={ins}",
+        fmt_id(t.node),
+        fmt_id(t.epoch)
+    )
+}
+
+fn decode_text(node: &str, epoch: &str, s: &str, d: &str, i: &str) -> Result<TextEdit, String> {
+    let s = s.strip_prefix("s=").ok_or("bad seen field")?;
+    let d = d.strip_prefix("d=").ok_or("bad del field")?;
+    let i = i.strip_prefix("i=").ok_or("bad ins field")?;
+    let seen_v = if s == "-" {
+        Vec::new()
+    } else {
+        s.split(',').map(canon_id).collect::<Result<Vec<_>, _>>()?
+    };
+    if seen_v.windows(2).any(|w| w[0] >= w[1]) {
+        return Err("seen ids not strictly ascending".into());
+    }
+    let mut del = Vec::new();
+    if d != "-" {
+        for x in d.split(',') {
+            let (e, n) = x.rsplit_once('+').ok_or("bad delete range")?;
+            del.push((parse_elem(e)?, canon_num(n)?));
+        }
+    }
+    let mut ins = Vec::new();
+    if i != "-" {
+        for x in i.split(';') {
+            let p: Vec<&str> = x.split('|').collect();
+            let [l, r, b] = p.as_slice() else {
+                return Err("bad insert run".into());
+            };
+            ins.push(Ins {
+                left: if *l == "^" {
+                    None
+                } else {
+                    Some(parse_elem(l)?)
+                },
+                right: if *r == "$" {
+                    None
+                } else {
+                    Some(parse_elem(r)?)
+                },
+                bytes: unb64(b)?,
+            });
+        }
+    }
+    Ok(TextEdit {
+        node: canon_id(node)?,
+        epoch: canon_id(epoch)?,
+        seen: seen_v.into_iter().collect(),
+        del,
+        ins,
+    })
+}
+
+/// One op record (`O <id> <deps> <payload>`). Every writer (ops.log,
+/// pending.log, the rescue manifest, the wire `Ops` body, the reported-
+/// rejections hash) uses this one encoding, `TextEdit`s as `T` records
+/// (Issue #54).
 pub fn encode_op(op: &Op) -> String {
     let p = match &op.payload {
         Payload::Create { kind, parent, name } => {
@@ -212,9 +398,7 @@ pub fn encode_op(op: &Op) -> String {
         ),
         Payload::Delete { node } => format!("D {}", fmt_id(*node)),
         Payload::SetContent { node, blob } => format!("S {} {}", fmt_id(*node), blob.hex()),
-        // Issue #53 (T1): the `T` record lands with T2; nothing authors
-        // or decodes a TextEdit before then.
-        Payload::TextEdit(_) => "X text-ops-need-T2".to_string(),
+        Payload::TextEdit(t) => encode_text(t),
     };
     format!(
         "O {} {} {p}",
@@ -251,6 +435,7 @@ pub fn decode_op(body: &str) -> Result<Op, String> {
             node: parse_id(node)?,
             blob: parse_blob(blob)?,
         },
+        ["T", node, epoch, s, d, i] => Payload::TextEdit(decode_text(node, epoch, s, d, i)?),
         _ => return Err("bad payload".into()),
     };
     Ok(Op {

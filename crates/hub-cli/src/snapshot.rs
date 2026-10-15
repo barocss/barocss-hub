@@ -13,6 +13,9 @@ use crate::durable;
 use crate::store::{LogPos, OPLOG_HEADER};
 
 pub const MAGIC: &[u8] = b"barocss-hub/snapshot/v1\n";
+/// Snapshot v2 (Issue #54, Text-CRDT 7.11): the replica holds text ops
+/// (payload `RSNAP2`). Same framing; a replica without text ops keeps v1.
+pub const MAGIC_V2: &[u8] = b"barocss-hub/snapshot/v2\n";
 pub const FILE: &str = "snapshot";
 pub const TMP: &str = ".snapshot.tmp";
 
@@ -85,7 +88,11 @@ pub struct Head {
 pub fn encode(replica: &Replica, pos: &LogPos, head: &Head) -> Option<Vec<u8>> {
     let payload = replica.encode_snapshot()?;
     let mut out = Vec::with_capacity(payload.len() + 128);
-    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(if payload.starts_with(b"RSNAP2") {
+        MAGIC_V2
+    } else {
+        MAGIC
+    });
     out.extend_from_slice(&pos.offset.to_le_bytes());
     out.extend_from_slice(&pos.seq.to_le_bytes());
     out.extend_from_slice(&pos.count.to_le_bytes());
@@ -111,7 +118,8 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
 /// Decode and check a snapshot image by itself (no log binding yet).
 pub fn decode(b: &[u8]) -> Result<(Replica, LogPos, Head), String> {
     let fixed = MAGIC.len() + 8 * 3 + 16 + 8 * 2;
-    if !b.starts_with(MAGIC) {
+    let v2 = b.starts_with(MAGIC_V2);
+    if !b.starts_with(MAGIC) && !v2 {
         return Err("wrong magic or version".into());
     }
     if b.len() < fixed + 8 {
@@ -142,7 +150,11 @@ pub fn decode(b: &[u8]) -> Result<(Replica, LogPos, Head), String> {
         .checked_add(fixed)
         .filter(|e| *e + 16 <= body.len())
         .ok_or("payload length mismatch")?;
-    let replica = Replica::decode_snapshot(&body[fixed..pend])?;
+    let payload = &body[fixed..pend];
+    if v2 != payload.starts_with(b"RSNAP2") {
+        return Err("snapshot version does not match its payload".into());
+    }
+    let replica = Replica::decode_snapshot(payload)?;
     let nf = u64_at(body, pend) as usize;
     if nf.checked_mul(24).and_then(|x| x.checked_add(pend + 16)) != Some(body.len()) {
         return Err("payload length mismatch".into());

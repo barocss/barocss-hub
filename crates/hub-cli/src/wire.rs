@@ -972,7 +972,7 @@ pub fn groups<T>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use hub_core::tree::{Kind, NodeId, Payload, ROOT};
 
@@ -1194,73 +1194,188 @@ mod tests {
         );
     }
 
-    /// Issue #53 (T1): no input path can construct a `TextEdit` before T2.
-    /// The log and wire decoders have no `T` record: crafted records that
-    /// try to name one are rejected (corrupt / protocol), and the marker
-    /// that `encode_op` writes for a text op never decodes; durable writes
-    /// refuse a text op with a typed `unsupported` error.
-    #[test]
-    fn text_ops_unreachable_before_t2() {
+    /// The golden `TextEdit` of the `T` record tests (Issue #54).
+    pub(crate) fn golden_text_op() -> Op {
         use hub_core::text::{ElemId, Ins, TextEdit};
-        let id = NodeId::new(5, 0xabc);
-        let te = Op {
-            id,
-            deps: BTreeSet::new(),
+        let r = 0xabc;
+        Op {
+            id: NodeId::new(9, r),
+            deps: [NodeId::new(4, r), NodeId::new(7, 0xdef)].into(),
             payload: Payload::TextEdit(TextEdit {
-                node: NodeId::new(2, 0xabc),
-                epoch: NodeId::new(3, 0xabc),
-                seen: BTreeSet::new(),
-                del: vec![(
-                    ElemId {
-                        op: NodeId::new(3, 0xabc),
-                        off: 0,
+                node: NodeId::new(2, r),
+                epoch: NodeId::new(3, r),
+                seen: [NodeId::new(3, r), NodeId::new(7, 0xdef)].into(),
+                del: vec![
+                    (
+                        ElemId {
+                            op: NodeId::new(3, r),
+                            off: 0,
+                        },
+                        2,
+                    ),
+                    (
+                        ElemId {
+                            op: NodeId::new(7, 0xdef),
+                            off: 5,
+                        },
+                        1,
+                    ),
+                ],
+                ins: vec![
+                    Ins {
+                        left: None,
+                        right: Some(ElemId {
+                            op: NodeId::new(3, r),
+                            off: 2,
+                        }),
+                        bytes: "x\n".into(),
                     },
-                    2,
-                )],
-                ins: vec![Ins {
-                    left: None,
-                    right: None,
-                    bytes: b"x\n".to_vec(),
-                }],
+                    Ins {
+                        left: Some(ElemId {
+                            op: NodeId::new(7, 0xdef),
+                            off: 4,
+                        }),
+                        right: None,
+                        bytes: "한 é🙂\r\n".into(),
+                    },
+                ],
             }),
+        }
+    }
+
+    /// Issue #54 (inverts T1's `text_ops_unreachable_before_t2`): the `T`
+    /// record and `h(o)` tag 4 carry `seen`, `del` and `ins` exactly.
+    /// Golden vectors fix the record text and the hash; the record round-
+    /// trips through `decode_op` and through a wire `Ops` frame; every
+    /// non-canonical or malformed spelling is rejected.
+    #[test]
+    fn text_record_round_trips_with_golden_vectors() {
+        let te = golden_text_op();
+        let line = store::encode_op(&te);
+        let r = "0000000000000000000000000000abc";
+        let q = "0000000000000000000000000000def";
+        assert_eq!(
+            line,
+            format!(
+                "O 9.0{r} 4.0{r},7.0{q} T 2.0{r} 3.0{r} s=3.0{r},7.0{q} \
+                 d=3.0{r}:0+2,7.0{q}:5+1 i=^|3.0{r}:2|eAo=;7.0{q}:4|$|7ZWcIMOp8J+Zgg0K"
+            )
+        );
+        assert_eq!(store::decode_op(&line).unwrap(), te);
+        let hex: String = crate::digest::op_hash(&te)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "2faece6bb132b489014fe8260fafd9d969ba1e77cb4bf314975816faef00b86a"
+        );
+        // Each field is in the hash: changing any one changes it.
+        let Payload::TextEdit(t) = &te.payload else {
+            unreachable!()
         };
-        assert_eq!(store::try_encode_op(&te), Err(store::TEXT_OPS_NEED_T2));
-        let marker = store::encode_op(&te);
-        let fid = store::fmt_id(id);
-        let crafted = [
-            marker.clone(),
-            format!(
-                "O {fid} - T {} {} d={}:0+2 i=||eAo=",
-                store::fmt_id(NodeId::new(2, 0xabc)),
-                store::fmt_id(NodeId::new(3, 0xabc)),
-                store::fmt_id(NodeId::new(3, 0xabc))
-            ),
-            format!("O {fid} - T"),
-            format!(
-                "O {fid} - TextEdit {}",
-                store::fmt_id(NodeId::new(2, 0xabc))
-            ),
-            format!("O {fid} - X text-ops-need-T2"),
+        let mut vars = Vec::new();
+        let mut v = t.clone();
+        v.seen.clear();
+        vars.push(v);
+        let mut v = t.clone();
+        v.del[1].1 = 2;
+        vars.push(v);
+        let mut v = t.clone();
+        v.ins[0].right = None;
+        vars.push(v);
+        let mut v = t.clone();
+        v.ins[1].bytes.pop();
+        vars.push(v);
+        let mut v = t.clone();
+        v.ins.swap(0, 1);
+        vars.push(v);
+        for v in vars {
+            let o = Op {
+                payload: Payload::TextEdit(v),
+                ..te.clone()
+            };
+            assert_ne!(crate::digest::op_hash(&o), crate::digest::op_hash(&te));
+            let l = store::encode_op(&o);
+            assert_ne!(l, line);
+            assert_eq!(store::decode_op(&l).unwrap(), o);
+        }
+        // Wire: an Ops frame carries it unchanged.
+        let f = Frame::Ops {
+            frontier: vec![te.id],
+            done: true,
+            ops: vec![te.clone()],
+        };
+        let e = encode(&f);
+        assert_eq!(decode(e[0], &e[1..], &Limits::default()).unwrap(), f);
+        // Rejected spellings: non-canonical numbers/ids/base64, unsorted
+        // or duplicated seen, wrong field markers, bad shapes.
+        let bad = [
+            line.replace("s=3.0", "s=03.0"),
+            line.replace(":0+2", ":00+2"),
+            line.replace("+2,", "+02,"),
+            line.replace(&format!("s=3.0{r},7.0{q}"), &format!("s=7.0{q},3.0{r}")),
+            line.replace(&format!("s=3.0{r},7.0{q}"), &format!("s=3.0{r},3.0{r}")),
+            line.replace("eAo=", "eAp="),
+            line.replace("eAo=", "eAo"),
+            line.replace("eAo=", "e Ao="),
+            line.replace("i=^", "i=*"),
+            line.replace("|$|", "|^|"),
+            line.replace(" s=", " seen="),
+            line.replace(" d=", " d=-,"),
+            line.replace("abc", "ABC"),
+            line.replace(" i=", " x "),
+            format!("O 9.0{r} - T"),
+            format!("O 9.0{r} - T 2.0{r} 3.0{r} s=- d=- i=-;"),
+            format!("O 9.0{r} - T 2.0{r} 3.0{r} s=- d=- i=^|$"),
+            format!("O 9.0{r} - X text-ops-need-T2"),
         ];
-        for line in &crafted {
-            match store::decode_op(line) {
-                Err(_) => {}
-                Ok(o) => panic!("decoded {line:?} into {:?}", o.payload),
-            }
-            // The same record inside a wire Ops frame is a protocol error.
-            let body = format!("- 0\n{line}");
+        for l in &bad {
+            assert_ne!(l, &line);
+            assert!(store::decode_op(l).is_err(), "accepted {l:?}");
+            let body = format!("- 0\n{l}");
             let mut e = vec![OPS];
             e.extend_from_slice(body.as_bytes());
             let err = decode(e[0], &e[1..], &Limits::default()).unwrap_err();
-            assert_eq!(err.code(), Code::Protocol, "{line:?}");
+            assert_eq!(err.code(), Code::Protocol, "{l:?}");
         }
-        // And the op hash of a text op never equals the hash of a v1 op.
-        assert_ne!(
-            crate::digest::op_hash(&te),
-            crate::digest::op_hash(&Op {
-                payload: Payload::Delete { node: ROOT },
-                ..te.clone()
-            })
-        );
+        // The empty TextEdit has one spelling too.
+        let empty = Op {
+            payload: Payload::TextEdit(hub_core::text::TextEdit {
+                node: t.node,
+                epoch: t.epoch,
+                seen: Default::default(),
+                del: vec![],
+                ins: vec![],
+            }),
+            ..te.clone()
+        };
+        let l = store::encode_op(&empty);
+        assert!(l.ends_with(" s=- d=- i=-"), "{l}");
+        assert_eq!(store::decode_op(&l).unwrap(), empty);
+    }
+
+    /// base64 is canonical: every byte string round-trips, and only the
+    /// [`store::b64`] spelling decodes.
+    #[test]
+    fn base64_is_canonical() {
+        for n in 0..40usize {
+            let b: Vec<u8> = (0..n).map(|i| (i * 37 + n) as u8).collect();
+            let t = store::b64(&b);
+            assert_eq!(store::unb64(&t).unwrap(), b);
+        }
+        assert_eq!(store::b64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(store::b64(b"fo"), "Zm8=");
+        for bad in [
+            "Zm9=",
+            "Zm8",
+            "Z===",
+            "Zm8=Zm8=",
+            "Zg==x",
+            "Zh==",
+            "Zm9v YmFy",
+        ] {
+            assert!(store::unb64(bad).is_err(), "{bad}");
+        }
     }
 }

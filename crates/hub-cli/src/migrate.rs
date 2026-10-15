@@ -5,6 +5,10 @@
 //! leaves a working v0 repository and the next v1 open starts over. After
 //! the switch, [`finish`] rolls the remaining steps forward on every open
 //! until they are done.
+//!
+//! Format v2 (Issue #54, Text-CRDT 7.9, D-053 E-T5): [`upgrade_v2`]
+//! switches the `replica` header to v2 (header only, no log rewrite) at
+//! the first `TextEdit` appended, and [`finish_v2`] rolls `format` forward.
 
 use crate::{errc, Code};
 use std::fs::{self, File, OpenOptions};
@@ -23,6 +27,8 @@ pub const OPLOG_V1_TMP: &str = "ops.log.v1";
 pub enum Format {
     V0,
     V1,
+    /// v1 + `T` records + snapshot v2 (Issue #54).
+    V2,
 }
 
 /// Parse `.hub/replica`: format and replica id.
@@ -33,10 +39,13 @@ pub fn read_replica(dir: &Path) -> Result<(Format, u128), Error> {
     let lines: Vec<&str> = rtext.lines().collect();
     let fmt = match lines.first() {
         Some(h) if *h == store::REPLICA_HEADER || *h == store::REPLICA_HEADER_RESCUE => Format::V1,
+        Some(h) if *h == store::REPLICA_HEADER_V2 || *h == store::REPLICA_HEADER_V2_RESCUE => {
+            Format::V2
+        }
         Some(h) if *h == store::REPLICA_HEADER_V0 => Format::V0,
         Some(h) if h.starts_with(store::REPLICA_HEADER_PREFIX) => {
             return errc(Code::Corrupt, format!(
-                "unsupported repository format '{}' in {} (this hub understands v0 and v1; use a newer hub)",
+                "unsupported repository format '{}' in {} (this hub understands v0, v1 and v2; use a newer hub)",
                 &h[store::REPLICA_HEADER_PREFIX.len()..],
                 rp.display()
             ))
@@ -53,19 +62,39 @@ pub fn read_replica(dir: &Path) -> Result<(Format, u128), Error> {
     }
 }
 
-/// Roll-forward work left after the switch (a crash mid-migration).
+/// Roll-forward work left after the switch (a crash mid-migration, or
+/// mid v2 upgrade: replica v2, `format` not yet v2).
 pub fn needs_finish(dir: &Path) -> bool {
     dir.join(OPLOG_V1_TMP).exists()
         || !dir.join(watch::LOCK_FILE).exists()
         || !dir.join("format").exists()
+        || (matches!(read_replica(dir), Ok((Format::V2, _)))
+            && fs::read_to_string(dir.join("format")).ok().as_deref() != Some(store::FORMAT_V2))
 }
 
-/// Check `.hub/format` if present (must say v1).
+/// Check `.hub/format` if present: v1 under a v1 `replica`; v1 or v2 under
+/// a v2 `replica` (v1 = the v2 upgrade's roll-forward is pending).
+pub fn check_format_for(dir: &Path, fmt: &Format) -> Result<(), Error> {
+    match fs::read_to_string(dir.join("format")) {
+        Ok(t) if t == store::FORMAT_V2 && *fmt == Format::V2 => Ok(()),
+        Ok(t) if t == store::FORMAT_V2 => errc(
+            Code::Corrupt,
+            format!(
+                "corrupt {}: format v2 under a v1 replica header",
+                dir.join("format").display()
+            ),
+        ),
+        _ => check_format(dir),
+    }
+}
+
+/// Check `.hub/format` if present (must say v1; v2 is checked by
+/// [`check_format_for`]).
 pub fn check_format(dir: &Path) -> Result<(), Error> {
     match fs::read_to_string(dir.join("format")) {
         Ok(t) if t == store::FORMAT_V1 => Ok(()),
         Ok(t) => errc(Code::Corrupt, format!(
-            "unsupported repository format '{}' in {} (this hub understands v0 and v1; use a newer hub)",
+            "unsupported repository format '{}' in {} (this hub understands v0, v1 and v2; use a newer hub)",
             t.trim(),
             dir.join("format").display()
         )),
@@ -163,12 +192,53 @@ pub fn finish(dir: &Path) -> Result<(), Error> {
             .truncate(false)
             .open(dir.join(watch::LOCK_FILE))?;
     }
-    if fs::read_to_string(dir.join("format")).ok().as_deref() != Some(store::FORMAT_V1) {
-        check_format(dir)?;
-        store::write_atomic(&dir.join("format"), store::FORMAT_V1.as_bytes())?;
+    let want = match read_replica(dir)?.0 {
+        Format::V2 => store::FORMAT_V2,
+        _ => store::FORMAT_V1,
+    };
+    let have = fs::read_to_string(dir.join("format")).ok();
+    if have.as_deref() != Some(want) {
+        if have.as_deref() != Some(store::FORMAT_V1) {
+            check_format(dir)?;
+        }
+        store::write_atomic(&dir.join("format"), want.as_bytes())?;
+        if want == store::FORMAT_V2 {
+            durable::crash_point(durable::V2_FORMAT);
+        }
     } else {
         dsync(dir)?;
     }
     durable::crash_point(durable::MIG_FORMAT);
     Ok(())
+}
+
+/// Format v1 -> v2 (Issue #54, Text-CRDT 7.9): header only, under the
+/// exclusive lock, before the first `TextEdit` is written anywhere in
+/// `.hub/`. `.replica.tmp` (v2 header, same id, `v2-rescue` if a rescue
+/// is in progress) → flush → [`v2-replica-tmp`] → barrier → rename over
+/// `replica` → `dsync(.hub/)` → [`v2-switched`] (from here pre-#54
+/// binaries refuse the repository) → `format` v2 ([`finish`]) →
+/// [`v2-format`]. A crash before the rename leaves a v1 repository (old
+/// binaries keep working; the next text append starts over); after it,
+/// every open rolls `format` forward. Idempotent.
+pub fn upgrade_v2(dir: &Path) -> Result<(), Error> {
+    let (fmt, rid) = read_replica(dir)?;
+    match fmt {
+        Format::V2 => return finish(dir),
+        Format::V1 => {}
+        Format::V0 => return err("internal: v2 upgrade of a v0 repository"),
+    }
+    let rescue = crate::rescue::marked(dir);
+    let rtmp = dir.join(".replica.tmp");
+    {
+        let mut f = File::create(&rtmp)?;
+        f.write_all(format!("{}\n{rid:032x}\n", store::replica_header(true, rescue)).as_bytes())?;
+        durable::flush(&f)?;
+        durable::crash_point(durable::V2_REPLICA_TMP);
+        durable::barrier(&f)?;
+    }
+    fs::rename(&rtmp, dir.join("replica"))?;
+    dsync(dir)?;
+    durable::crash_point(durable::V2_SWITCHED);
+    finish(dir)
 }
