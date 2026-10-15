@@ -14,6 +14,18 @@ use super::{
 
 /// The specification: sorted fold (§2.3) plus derived conflicts (§2.4, §2.5).
 pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
+    evaluate_text_aware(ops, &BTreeSet::new())
+}
+
+/// [`evaluate`] for op sets with text ops (Issue #53 oracle): `valid` =
+/// the TextEdits valid per Text-CRDT 7.4.1/7.4.2 (decided by the caller);
+/// every other structurally applicable TextEdit is `invalid-op`; valid
+/// ones are edits for the D-014 revive; nodes with valid ones get no
+/// SetContent-only content conflicts (the caller derives 7.4.3).
+pub fn evaluate_text_aware<'a>(
+    ops: impl IntoIterator<Item = &'a Op>,
+    valid: &BTreeSet<OpId>,
+) -> Evaluation {
     let ops: BTreeMap<OpId, Op> = ops.into_iter().map(|o| (o.id, o.clone())).collect();
     let past = causal_past(&ops);
     let concurrent = |a: OpId, b: OpId| !past[&a].contains(&b) && !past[&b].contains(&a);
@@ -26,7 +38,13 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
         if op.moved_node().is_some() {
             before.insert(*id, w.state.clone());
         }
-        let (out, _) = w.apply(op);
+        let (mut out, _) = w.apply(op);
+        if matches!(op.payload, Payload::TextEdit(_))
+            && out == Outcome::Applied
+            && !valid.contains(id)
+        {
+            out = Outcome::Invalid;
+        }
         match &out {
             Outcome::Invalid => {
                 conflicts.insert(Conflict::InvalidOp { op: *id });
@@ -74,7 +92,17 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
             sets.entry(*node).or_default().push((*id, *blob));
         }
     }
+    let text_nodes: BTreeSet<NodeId> = valid
+        .iter()
+        .filter_map(|v| match &ops.get(v)?.payload {
+            Payload::TextEdit(t) => Some(t.node),
+            _ => None,
+        })
+        .collect();
     for (n, es) in &sets {
+        if text_nodes.contains(n) {
+            continue;
+        }
         let (winner, winner_blob) = *es.last().unwrap();
         for &(e, loser_blob) in &es[..es.len() - 1] {
             if !es.iter().any(|&(e2, _)| past[&e2].contains(&e)) {
@@ -93,6 +121,13 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
         .iter()
         .flat_map(|(n, es)| es.iter().map(move |&(e, _)| (e, *n)))
         .collect();
+    for v in valid {
+        if let Some(Payload::TextEdit(t)) = ops.get(v).map(|o| &o.payload) {
+            if outcomes.get(v) == Some(&Outcome::Applied) {
+                edits.push((*v, t.node));
+            }
+        }
+    }
     edits.sort();
     let mut pre = BTreeMap::new();
     for (id, st) in &before {
@@ -145,6 +180,7 @@ pub fn evaluate<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Evaluation {
         state: w.state,
         conflicts,
         outcomes,
+        text: Default::default(),
     }
 }
 

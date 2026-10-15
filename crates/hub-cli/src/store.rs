@@ -172,6 +172,25 @@ pub fn parse_blob(t: &str) -> Result<BlobId, String> {
     Ok(BlobId(out))
 }
 
+/// Issue #53 (T1): message of the typed refusal for a text op, which has
+/// no v1 log record (the `T` record is T2).
+pub const TEXT_OPS_NEED_T2: &str = "unsupported: text ops need T2 (no v1 log record for TextEdit)";
+
+/// [`encode_op`], refusing ops that have no v1 record (Issue #53: a
+/// `TextEdit` before T2) instead of encoding a placeholder.
+pub fn try_encode_op(op: &Op) -> Result<String, &'static str> {
+    match op.payload {
+        Payload::TextEdit(_) => Err(TEXT_OPS_NEED_T2),
+        _ => Ok(encode_op(op)),
+    }
+}
+
+/// One op record. A `TextEdit` (no v1 record before T2, Issue #53) encodes
+/// to a marker record that [`decode_op`] rejects, so it can never be read
+/// back as an op. The ops.log append uses [`try_encode_op`] and refuses
+/// it; other writers (pending.log, rescue manifest, wire `Ops`, reported)
+/// still call this and would write the marker: unreachable in T1 (nothing
+/// constructs a `TextEdit`); T2 routes every path through the `T` record.
 pub fn encode_op(op: &Op) -> String {
     let p = match &op.payload {
         Payload::Create { kind, parent, name } => {
@@ -193,6 +212,9 @@ pub fn encode_op(op: &Op) -> String {
         ),
         Payload::Delete { node } => format!("D {}", fmt_id(*node)),
         Payload::SetContent { node, blob } => format!("S {} {}", fmt_id(*node), blob.hex()),
+        // Issue #53 (T1): the `T` record lands with T2; nothing authors
+        // or decodes a TextEdit before then.
+        Payload::TextEdit(_) => "X text-ops-need-T2".to_string(),
     };
     format!(
         "O {} {} {p}",

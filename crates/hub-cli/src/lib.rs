@@ -800,8 +800,12 @@ impl Repo {
             Err(e) => return (0, Err(e.into())),
         };
         for op in ops {
-            let r = before(done.len())
-                .and_then(|()| log.write(&store::encode_op(&op)).map_err(Error::from));
+            let r = before(done.len()).and_then(|()| {
+                // Issue #53: a text op has no v1 record before T2.
+                let line =
+                    store::try_encode_op(&op).map_err(|m| Error::new(Code::Unsupported, m))?;
+                log.write(&line).map_err(Error::from)
+            });
             if let Err(e) = r {
                 res = Err(e);
                 break;

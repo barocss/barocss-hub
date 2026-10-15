@@ -134,6 +134,13 @@ pub fn describe_payload(p: &Payload) -> String {
         Payload::SetContent { node, blob } => {
             format!("set content of {} to blob {}", fmt_node(*node), blob.hex())
         }
+        Payload::TextEdit(t) => format!(
+            "edit text of {} in epoch {} ({} deleted range(s), {} inserted run(s))",
+            fmt_node(t.node),
+            fmt_node(t.epoch),
+            t.del.len(),
+            t.ins.len()
+        ),
     }
 }
 

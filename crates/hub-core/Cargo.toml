@@ -21,3 +21,8 @@ oracle = []
 [dev-dependencies]
 proptest = "1"
 hub-core = { package = "barocss-hub-core", path = ".", features = ["oracle"] }
+
+# Issue #53: Text-CRDT §7.11 B1/B3 (`cargo bench -p barocss-hub-core --bench text`).
+[[bench]]
+name = "text"
+harness = false

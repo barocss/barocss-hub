@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dfb3a9efd367371c5a21806457ce9f82557d80ae6ec9257048bf2d78dcef830d # shrinks to (nrep, seed, script, seeds) = (2, 0, [(0, 192, 244, 0)], [0, 0, 0])
+cc 249c8f318b19ccff76ff25f42241647c90c814af4d82f756c1175e0e9d362e3b # shrinks to (nrep, seed, script, seeds) = (2, 0, [(0, 128, 248, 0)], [0, 0, 0])
+cc 2fb7e0c112d94637d42f20191990f34639989633fcb5dcc596c44e7b7ba34efe # shrinks to (nrep, seed, script, seeds) = (2, 0, [(0, 80, 251, 0)], [0, 0, 0])
+cc be62415730e186bb884426c3972f6937363938af1c130bb2b73721ddf1ab8f3e # shrinks to (nrep, seed, script, _) = (2, 0, [(0, 80, 251, 0)], [0, 0, 0])
+cc 241b7c1d23bb4a9721096fe57cf4296d67f161e4e643ff9d58d5d1e91ecac35e # shrinks to (nrep, seed, script, seeds) = (2, 0, [(0, 176, 245, 0)], [0, 0, 0])
+cc fc8488c9c71aac72607dca5d805f0f4ae5e05e5afdc1b8d432446ab2e5ddaa72 # shrinks to (nrep, seed, script, seeds) = (3, 0, [(0, 176, 245, 0)], [0, 0, 0])

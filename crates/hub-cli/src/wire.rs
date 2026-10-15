@@ -1193,4 +1193,74 @@ mod tests {
             Code::Protocol
         );
     }
+
+    /// Issue #53 (T1): no input path can construct a `TextEdit` before T2.
+    /// The log and wire decoders have no `T` record: crafted records that
+    /// try to name one are rejected (corrupt / protocol), and the marker
+    /// that `encode_op` writes for a text op never decodes; durable writes
+    /// refuse a text op with a typed `unsupported` error.
+    #[test]
+    fn text_ops_unreachable_before_t2() {
+        use hub_core::text::{ElemId, Ins, TextEdit};
+        let id = NodeId::new(5, 0xabc);
+        let te = Op {
+            id,
+            deps: BTreeSet::new(),
+            payload: Payload::TextEdit(TextEdit {
+                node: NodeId::new(2, 0xabc),
+                epoch: NodeId::new(3, 0xabc),
+                seen: BTreeSet::new(),
+                del: vec![(
+                    ElemId {
+                        op: NodeId::new(3, 0xabc),
+                        off: 0,
+                    },
+                    2,
+                )],
+                ins: vec![Ins {
+                    left: None,
+                    right: None,
+                    bytes: b"x\n".to_vec(),
+                }],
+            }),
+        };
+        assert_eq!(store::try_encode_op(&te), Err(store::TEXT_OPS_NEED_T2));
+        let marker = store::encode_op(&te);
+        let fid = store::fmt_id(id);
+        let crafted = [
+            marker.clone(),
+            format!(
+                "O {fid} - T {} {} d={}:0+2 i=||eAo=",
+                store::fmt_id(NodeId::new(2, 0xabc)),
+                store::fmt_id(NodeId::new(3, 0xabc)),
+                store::fmt_id(NodeId::new(3, 0xabc))
+            ),
+            format!("O {fid} - T"),
+            format!(
+                "O {fid} - TextEdit {}",
+                store::fmt_id(NodeId::new(2, 0xabc))
+            ),
+            format!("O {fid} - X text-ops-need-T2"),
+        ];
+        for line in &crafted {
+            match store::decode_op(line) {
+                Err(_) => {}
+                Ok(o) => panic!("decoded {line:?} into {:?}", o.payload),
+            }
+            // The same record inside a wire Ops frame is a protocol error.
+            let body = format!("- 0\n{line}");
+            let mut e = vec![OPS];
+            e.extend_from_slice(body.as_bytes());
+            let err = decode(e[0], &e[1..], &Limits::default()).unwrap_err();
+            assert_eq!(err.code(), Code::Protocol, "{line:?}");
+        }
+        // And the op hash of a text op never equals the hash of a v1 op.
+        assert_ne!(
+            crate::digest::op_hash(&te),
+            crate::digest::op_hash(&Op {
+                payload: Payload::Delete { node: ROOT },
+                ..te.clone()
+            })
+        );
+    }
 }

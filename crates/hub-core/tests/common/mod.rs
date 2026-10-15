@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use hub_core::tree::*;
 use proptest::prelude::*;
 
+pub mod text;
+
 // ---------- authoring simulator ----------
 
 struct Author {
