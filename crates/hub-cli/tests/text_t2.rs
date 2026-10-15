@@ -173,8 +173,10 @@ fn edit(d: &Path, node: NodeId, text: &str) -> Op {
 
 /// Head text of `node` from the replica (and equal to `evaluate_with`).
 fn text(d: &Path, node: NodeId) -> String {
-    let r = Repo::open_dir_with(d.join(".hub"), LockMode::Shared).unwrap();
+    let mut r = Repo::open_dir_with(d.join(".hub"), LockMode::Shared).unwrap();
     let blobs = blobs_of(&r);
+    // Docs from a snapshot v2 reference their seeds: load them.
+    r.replica.load_text_docs(&blobs).unwrap();
     let ev = evaluate_with(r.store.values(), &blobs);
     assert_eq!(r.state(), &ev.state, "replica state = evaluate");
     assert_eq!(r.conflicts(), ev.conflicts, "replica conflicts = evaluate");
@@ -819,7 +821,9 @@ fn sync_cases() -> u32 {
 }
 
 fn text_or_seed(d: &Path, n: NodeId) -> String {
-    let r = Repo::open_dir_with(d.join(".hub"), LockMode::Shared).unwrap();
+    let mut r = Repo::open_dir_with(d.join(".hub"), LockMode::Shared).unwrap();
+    let blobs = blobs_of(&r);
+    r.replica.load_text_docs(&blobs).unwrap();
     match r.replica.text_content().get(&n) {
         Some(&(e, _)) => {
             String::from_utf8(r.replica.text_doc(n, e).unwrap().materialize_head()).unwrap()
