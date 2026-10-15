@@ -174,14 +174,14 @@ impl TextEval {
 
 // ---------------------------------------------------------------- TextDoc
 
-const NIL: u32 = u32::MAX;
+pub(crate) const NIL: u32 = u32::MAX;
 const START_F: u32 = 0;
 const CHUNK: usize = 128;
 /// Tag of an inline one-deleter set in `Frag::del`.
-const ONE: u32 = 1 << 31;
+pub(crate) const ONE: u32 = 1 << 31;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Side {
+pub(crate) enum Side {
     L,
     R,
 }
@@ -192,22 +192,22 @@ enum Side {
 /// memory): ops are interned indices, children are sorted sibling lists
 /// (`first_l` / `first_r` / `next`), deleter sets are interned.
 #[derive(Clone, Debug)]
-struct Frag {
-    op: u32,
-    off: u32,
-    len: u32,
-    parent: u32,
-    chunk: u32,
-    first_l: u32,
-    first_r: u32,
-    next: u32,
+pub(crate) struct Frag {
+    pub(crate) op: u32,
+    pub(crate) off: u32,
+    pub(crate) len: u32,
+    pub(crate) parent: u32,
+    pub(crate) chunk: u32,
+    pub(crate) first_l: u32,
+    pub(crate) first_r: u32,
+    pub(crate) next: u32,
     /// The run's right origin (FugueMax right-sibling key): op index and
     /// offset, `ro_op == NIL` for END.
-    ro_op: u32,
-    ro_off: u32,
+    pub(crate) ro_op: u32,
+    pub(crate) ro_off: u32,
     /// Interned set of deleting ops (0 = none).
-    del: u32,
-    side: Side,
+    pub(crate) del: u32,
+    pub(crate) side: Side,
 }
 
 #[derive(Clone, Copy)]
@@ -221,25 +221,25 @@ enum Place {
 /// op; versions are filters ([`TextDoc::materialize`], 7.3.4).
 #[derive(Clone, Debug)]
 pub struct TextDoc {
-    epoch: OpId,
-    ops: Vec<OpId>,
-    op_ix: HashMap<OpId, u32>,
+    pub(crate) epoch: OpId,
+    pub(crate) ops: Vec<OpId>,
+    pub(crate) op_ix: HashMap<OpId, u32>,
     /// Per op index: start in `arena` and byte length.
-    op_bytes: Vec<(u64, u32)>,
-    arena: Vec<u8>,
+    pub(crate) op_bytes: Vec<(u64, u32)>,
+    pub(crate) arena: Vec<u8>,
     /// Per op index: its fragment at offset 0, or `NIL`.
-    op_first: Vec<u32>,
+    pub(crate) op_first: Vec<u32>,
     /// Ops split into several fragments: `(start offset, fragment)`.
-    split: HashMap<u32, Vec<(u32, u32)>>,
-    frags: Vec<Frag>,
+    pub(crate) split: HashMap<u32, Vec<(u32, u32)>>,
+    pub(crate) frags: Vec<Frag>,
     /// Interned sorted deleter sets (op indices) of two or more ops;
     /// `delsets[0]` is empty. A one-op set is stored inline in
     /// `Frag::del` as `ONE | op index`.
-    delsets: Vec<Vec<u32>>,
-    delset_ix: HashMap<Vec<u32>, u32>,
-    chunks: Vec<Vec<u32>>,
-    order: Vec<u32>,
-    rank: Vec<u32>,
+    pub(crate) delsets: Vec<Vec<u32>>,
+    pub(crate) delset_ix: HashMap<Vec<u32>, u32>,
+    pub(crate) chunks: Vec<Vec<u32>>,
+    pub(crate) order: Vec<u32>,
+    pub(crate) rank: Vec<u32>,
 }
 
 fn char_len(b: u8) -> u32 {
@@ -311,6 +311,11 @@ impl TextDoc {
 
     pub fn epoch(&self) -> OpId {
         self.epoch
+    }
+
+    /// The epoch's seed bytes (its blob, 7.4.2).
+    pub fn seed(&self) -> &[u8] {
+        self.op_slice(0)
     }
 
     /// Whether `op` has been integrated (or is the epoch).
@@ -934,53 +939,69 @@ pub(crate) fn text_pass(
         if outcomes.get(&id) != Some(&Outcome::Applied) {
             continue;
         }
+        let eb = epoch_blob(ops, outcomes, t.node, t.epoch);
         let in_deps = |x: OpId| causal.precedes(x, id);
-        let ok = (|| {
-            let blob = epoch_blob(ops, outcomes, t.node, t.epoch)?;
-            if !in_deps(t.epoch) || !t.seen.iter().all(|&s| in_deps(s)) {
-                return None;
-            }
-            let slot =
-                tv.docs
-                    .entry((t.node, t.epoch))
-                    .or_insert_with(|| match fetch(blobs, &blob) {
-                        Some(b) if std::str::from_utf8(b).is_ok() => {
-                            DocSlot::Doc(Box::new(TextDoc::new(t.epoch, b)))
-                        }
-                        Some(_) => DocSlot::Deferred,
-                        None => DocSlot::Deferred,
-                    });
-            match slot {
-                DocSlot::Doc(d) => {
-                    if !d.check(t, &in_deps) {
-                        return None;
-                    }
-                    d.apply(id, t);
-                }
-                DocSlot::Deferred => {
-                    // A blob that is present but not UTF-8 is a bytes
-                    // epoch: no TextEdit on it is valid.
-                    if fetch(blobs, &blob).is_some()
-                        || !t
-                            .ins
-                            .iter()
-                            .all(|i| !i.bytes.is_empty() && std::str::from_utf8(&i.bytes).is_ok())
-                    {
-                        return None;
-                    }
-                }
-            }
-            Some(())
-        })();
-        match ok {
-            Some(()) => {
-                tv.valid.insert(id);
-            }
-            None => invalid.push(id),
+        if text_step(id, t, eb, &in_deps, &mut tv.docs, blobs) {
+            tv.valid.insert(id);
+        } else {
+            invalid.push(id);
         }
     }
     invalid.sort();
     (tv, invalid)
+}
+
+/// 7.4.1/7.4.2 validity of one structurally Applied `TextEdit` `id` and,
+/// if valid, its integration into its epoch's doc (created from the epoch
+/// blob on first use). `epoch_blob` = [`epoch_blob`] of its epoch;
+/// `in_deps(x)` = `x ∈ deps*(id)`. Validity depends only on the op's
+/// causal past, so any causal order of calls gives the same docs (Issue
+/// #54: the incremental [`crate::tree::Replica`] calls it per new op).
+pub(crate) fn text_step(
+    id: OpId,
+    t: &TextEdit,
+    epoch_blob: Option<BlobId>,
+    in_deps: &dyn Fn(OpId) -> bool,
+    docs: &mut BTreeMap<(NodeId, OpId), DocSlot>,
+    blobs: &dyn BlobSource,
+) -> bool {
+    let ok = (|| {
+        let blob = epoch_blob?;
+        if !in_deps(t.epoch) || !t.seen.iter().all(|&s| in_deps(s)) {
+            return None;
+        }
+        let slot = docs
+            .entry((t.node, t.epoch))
+            .or_insert_with(|| match fetch(blobs, &blob) {
+                Some(b) if std::str::from_utf8(b).is_ok() => {
+                    DocSlot::Doc(Box::new(TextDoc::new(t.epoch, b)))
+                }
+                Some(_) => DocSlot::Deferred,
+                None => DocSlot::Deferred,
+            });
+        match slot {
+            DocSlot::Doc(d) => {
+                if !d.check(t, in_deps) {
+                    return None;
+                }
+                d.apply(id, t);
+            }
+            DocSlot::Deferred => {
+                // A blob that is present but not UTF-8 is a bytes
+                // epoch: no TextEdit on it is valid.
+                if fetch(blobs, &blob).is_some()
+                    || !t
+                        .ins
+                        .iter()
+                        .all(|i| !i.bytes.is_empty() && std::str::from_utf8(&i.bytes).is_ok())
+                {
+                    return None;
+                }
+            }
+        }
+        Some(())
+    })();
+    ok.is_some()
 }
 
 fn text_of(op: &Op) -> Option<&TextEdit> {
@@ -1008,108 +1029,142 @@ pub(crate) fn derive(
     blobs: &dyn BlobSource,
     tv: &mut TextEval,
 ) -> Vec<Conflict> {
-    let mut conflicts = Vec::new();
     let nodes: BTreeSet<NodeId> = tv
         .valid
         .iter()
         .map(|v| text_of(&ops[v]).unwrap().node)
         .collect();
-    for node in nodes {
-        // Content ops of `node`, ascending.
-        let cs: Vec<OpId> = ops
-            .iter()
-            .filter(|(id, o)| match &o.payload {
-                Payload::SetContent { node: n, .. } => {
-                    *n == node && outcomes[*id] == Outcome::Applied
-                }
-                Payload::TextEdit(t) => t.node == node && tv.valid.contains(id),
-                _ => false,
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        let w = *cs.last().unwrap();
-        let we = epoch_of(&ops[&w]);
-        let epoch_blob_id = |e: OpId| match &ops[&e].payload {
-            Payload::SetContent { blob, .. } => *blob,
-            _ => BlobId::empty(),
+    // Content ops per text node, ascending (one pass, Issue #54).
+    let mut by_node: BTreeMap<NodeId, Vec<OpId>> = BTreeMap::new();
+    for (id, o) in ops {
+        let n = match &o.payload {
+            Payload::SetContent { node, .. } if outcomes[id] == Outcome::Applied => *node,
+            Payload::TextEdit(t) if tv.valid.contains(id) => t.node,
+            _ => continue,
         };
-        // Blob of a content op (7.4.3): a SetContent's blob; for a text
-        // op, its epoch materialized at deps*(x) ∪ {x}.
-        let op_blob = |x: OpId, tv: &mut TextEval| -> BlobId {
-            match &ops[&x].payload {
-                Payload::SetContent { blob, .. } => *blob,
-                Payload::TextEdit(t) => match tv.doc(node, t.epoch) {
-                    Some(d) => {
-                        let b = d.materialize(&|o| o == x || causal.precedes(o, x));
-                        let id = BlobId::of(&b);
-                        tv.blobs.insert(id, b);
-                        id
-                    }
-                    None => epoch_blob_id(t.epoch),
-                },
-                _ => unreachable!(),
-            }
-        };
-        let (blob, bytes) = match tv.docs.get(&(node, we)) {
-            Some(DocSlot::Doc(d)) => {
-                let b = d.materialize_head();
-                let id = BlobId::of(&b);
-                tv.blobs.insert(id, b.clone());
-                (id, Some(b))
-            }
-            Some(DocSlot::Deferred) => (epoch_blob_id(we), None),
-            None => {
-                let id = epoch_blob_id(we);
-                (id, fetch(blobs, &id).map(|b| b.to_vec()))
-            }
-        };
-        tv.content.insert(
-            node,
-            NodeText {
-                epoch: we,
-                blob,
-                bytes,
-            },
-        );
-        // Winner blob = the merged head of the winning epoch (Issue #53
-        // repair R2): "keep winner" never drops concurrent merged edits.
-        let winner_blob = blob;
-        for &e in &cs[..cs.len() - 1] {
-            if epoch_of(&ops[&e]) == we {
-                continue;
-            }
-            let over = cs.iter().any(|&c| {
-                c != e
-                    && causal.precedes(e, c)
-                    && match &ops[&c].payload {
-                        Payload::TextEdit(t) => {
-                            t.seen.iter().any(|&s| s == e || causal.precedes(e, s))
-                        }
-                        _ => true,
-                    }
-            });
-            if !over {
-                let loser_blob = op_blob(e, tv);
-                conflicts.push(Conflict::Content {
-                    node,
-                    winner: w,
-                    loser: e,
-                    winner_blob,
-                    loser_blob,
-                });
-            }
-        }
-        if let Some(d) = tv.doc(node, we) {
-            let group: Vec<OpId> = cs
-                .iter()
-                .copied()
-                .filter(|c| text_of(&ops[c]).is_some_and(|t| t.epoch == we))
-                .collect();
-            let ns = notices(ops, causal, d, node, &group, &cs);
-            tv.notices.extend(ns);
+        if nodes.contains(&n) {
+            by_node.entry(n).or_default().push(*id);
         }
     }
+    let mut conflicts = Vec::new();
+    for (node, cs) in by_node {
+        let d = derive_node(node, &cs, &|x| &ops[&x], causal, blobs, &tv.docs);
+        tv.content.insert(node, d.content);
+        tv.notices.extend(d.notices);
+        tv.blobs.extend(d.blobs);
+        conflicts.extend(d.conflicts);
+    }
     conflicts
+}
+
+/// What [`derive_node`] derives for one text node.
+pub(crate) struct NodeDerived {
+    pub content: NodeText,
+    pub conflicts: Vec<Conflict>,
+    pub notices: Vec<Notice>,
+    pub blobs: Vec<(BlobId, Vec<u8>)>,
+}
+
+/// 7.4.3/7.8 for one node: `cs` = its content ops (Applied `SetContent`s
+/// and valid `TextEdit`s), ascending; `get` resolves any op id named by
+/// them (content ops and epochs).
+pub(crate) fn derive_node<'o>(
+    node: NodeId,
+    cs: &[OpId],
+    get: &dyn Fn(OpId) -> &'o Op,
+    causal: &Causality,
+    blobs: &dyn BlobSource,
+    docs: &BTreeMap<(NodeId, OpId), DocSlot>,
+) -> NodeDerived {
+    let mut conflicts = Vec::new();
+    let mut out_blobs = Vec::new();
+    let doc = |e: OpId| match docs.get(&(node, e)) {
+        Some(DocSlot::Doc(d)) => Some(&**d),
+        _ => None,
+    };
+    let w = *cs.last().unwrap();
+    let we = epoch_of(get(w));
+    let epoch_blob_id = |e: OpId| match &get(e).payload {
+        Payload::SetContent { blob, .. } => *blob,
+        _ => BlobId::empty(),
+    };
+    // Blob of a content op (7.4.3): a SetContent's blob; for a text
+    // op, its epoch materialized at deps*(x) ∪ {x}.
+    let mut op_blob = |x: OpId| -> BlobId {
+        match &get(x).payload {
+            Payload::SetContent { blob, .. } => *blob,
+            Payload::TextEdit(t) => match doc(t.epoch) {
+                Some(d) => {
+                    let b = d.materialize(&|o| o == x || causal.precedes(o, x));
+                    let id = BlobId::of(&b);
+                    out_blobs.push((id, b));
+                    id
+                }
+                None => epoch_blob_id(t.epoch),
+            },
+            _ => unreachable!(),
+        }
+    };
+    let (blob, bytes) = match docs.get(&(node, we)) {
+        Some(DocSlot::Doc(d)) => {
+            let b = d.materialize_head();
+            let id = BlobId::of(&b);
+            (id, Some(b))
+        }
+        Some(DocSlot::Deferred) => (epoch_blob_id(we), None),
+        None => {
+            let id = epoch_blob_id(we);
+            (id, fetch(blobs, &id).map(|b| b.to_vec()))
+        }
+    };
+    // Winner blob = the merged head of the winning epoch (Issue #53
+    // repair R2): "keep winner" never drops concurrent merged edits.
+    let winner_blob = blob;
+    for &e in &cs[..cs.len() - 1] {
+        if epoch_of(get(e)) == we {
+            continue;
+        }
+        let over = cs.iter().any(|&c| {
+            c != e
+                && causal.precedes(e, c)
+                && match &get(c).payload {
+                    Payload::TextEdit(t) => t.seen.iter().any(|&s| s == e || causal.precedes(e, s)),
+                    _ => true,
+                }
+        });
+        if !over {
+            let loser_blob = op_blob(e);
+            conflicts.push(Conflict::Content {
+                node,
+                winner: w,
+                loser: e,
+                winner_blob,
+                loser_blob,
+            });
+        }
+    }
+    let mut ns = Vec::new();
+    if let Some(d) = doc(we) {
+        let group: Vec<OpId> = cs
+            .iter()
+            .copied()
+            .filter(|c| text_of(get(*c)).is_some_and(|t| t.epoch == we))
+            .collect();
+        ns = notices(get, causal, d, node, &group, cs);
+    }
+    if let (Some(DocSlot::Doc(_)), Some(b)) = (docs.get(&(node, we)), &bytes) {
+        out_blobs.push((blob, b.clone()));
+    }
+    NodeDerived {
+        content: NodeText {
+            epoch: we,
+            blob,
+            bytes,
+        },
+        conflicts,
+        notices: ns,
+        blobs: out_blobs,
+    }
 }
 
 /// Touch set of a text op (7.8) as byte ranges `(op, start, end)`.
@@ -1148,8 +1203,8 @@ fn find_root(p: &mut [usize], mut x: usize) -> usize {
 
 /// `concurrent-edit` notices of one node's winning epoch (7.8, D-053
 /// E-T2: on; identical concurrent edits are not flagged).
-fn notices(
-    ops: &BTreeMap<OpId, Op>,
+fn notices<'o>(
+    get: &dyn Fn(OpId) -> &'o Op,
     causal: &Causality,
     d: &TextDoc,
     node: NodeId,
@@ -1161,7 +1216,7 @@ fn notices(
     }
     let mut pts: Vec<(OpId, u32, u32, usize)> = Vec::new();
     for (k, &g) in group.iter().enumerate() {
-        for (o, s, e) in touch(d, g, text_of(&ops[&g]).unwrap()) {
+        for (o, s, e) in touch(d, g, text_of(get(g)).unwrap()) {
             pts.push((o, s, e, k));
         }
     }
@@ -1180,8 +1235,8 @@ fn notices(
     let mut parent: Vec<usize> = (0..group.len()).collect();
     for (a, b) in pairs {
         let (ta, tb) = (
-            text_of(&ops[&group[a]]).unwrap(),
-            text_of(&ops[&group[b]]).unwrap(),
+            text_of(get(group[a])).unwrap(),
+            text_of(get(group[b])).unwrap(),
         );
         if ta.del == tb.del && ta.ins == tb.ins {
             continue;

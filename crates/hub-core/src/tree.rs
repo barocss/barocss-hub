@@ -524,7 +524,16 @@ pub struct Causality {
 impl Causality {
     /// Build over `ops` (keys are the op ids, ascending).
     pub fn new(ops: &BTreeMap<OpId, Op>) -> Self {
-        let ids: Vec<OpId> = ops.keys().copied().collect();
+        Self::of_sorted(ops.values())
+    }
+
+    /// [`Causality::new`] over ops given in ascending id order (Issue #54:
+    /// the replica's log, without building a map).
+    pub fn of_sorted<'a, I>(ops: I) -> Self
+    where
+        I: Iterator<Item = &'a Op> + Clone,
+    {
+        let ids: Vec<OpId> = ops.clone().map(|o| o.id).collect();
         let mut slot: HashMap<ReplicaId, usize> = HashMap::new();
         let mut op_slot = Vec::with_capacity(ids.len());
         let mut cache: Option<(ReplicaId, usize)> = None;
@@ -548,7 +557,7 @@ impl Causality {
         let mut dep_list: Vec<u32> = Vec::with_capacity(ids.len());
         dep_off.push(0u32);
         let mut ds: Vec<usize> = Vec::new();
-        for (i, op) in ops.values().enumerate() {
+        for (i, op) in ops.enumerate() {
             ds.clear();
             for d in &op.deps {
                 // Fast path: the previous op; else a search below `i`.
@@ -1044,6 +1053,60 @@ pub struct Replica {
     /// The `(node, edit, delete)` triples the last view refresh revived
     /// (the `EditRevived` conflicts of [`evaluate`]).
     revived: BTreeSet<(NodeId, OpId, OpId)>,
+    /// Text-CRDT state (Issue #54); empty while no `TextEdit` is applied.
+    text: TextPart,
+}
+
+/// Text part of a [`Replica`] (Issue #54, Text-CRDT 7.4): the per-epoch
+/// docs and the 7.4.3/7.8 results per text node, maintained
+/// incrementally: a new `TextEdit` is validated and integrated into its
+/// doc on arrival (validity depends only on its causal past), and only
+/// the nodes with new content ops are re-derived. When a batch changes the
+/// fold outcome of an already applied text op or epoch op (an undo/redo
+/// below them), the text part is rebuilt from the log.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TextPart {
+    pub(crate) docs: BTreeMap<(NodeId, OpId), crate::text::DocSlot>,
+    /// Valid (Applied) and text-invalid (structurally Applied) `TextEdit`s.
+    pub(crate) valid: BTreeSet<OpId>,
+    pub(crate) invalid: BTreeSet<OpId>,
+    /// Per text node: winning epoch and head content id.
+    pub(crate) content: BTreeMap<NodeId, (OpId, BlobId)>,
+    pub(crate) conflicts: BTreeMap<NodeId, Vec<Conflict>>,
+    pub(crate) notices: BTreeMap<NodeId, Vec<crate::text::Notice>>,
+    /// Fold content of each node whose state content is its text head
+    /// (restored before every fold step, so undo records stay fold values).
+    pub(crate) fold: BTreeMap<NodeId, Option<BlobId>>,
+    /// Some `TextEdit` is in the log (ops never leave it).
+    pub(crate) any: bool,
+}
+
+impl TextPart {
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.any
+    }
+}
+
+/// Blob bytes from epoch seeds already held, then from `next`.
+struct SeedChain<'a> {
+    seeds: HashMap<BlobId, Vec<u8>>,
+    next: &'a dyn crate::text::BlobSource,
+}
+
+impl crate::text::BlobSource for SeedChain<'_> {
+    fn blob_bytes(&self, id: &BlobId) -> Option<&[u8]> {
+        match self.seeds.get(id) {
+            Some(b) => Some(b),
+            None => self.next.blob_bytes(id),
+        }
+    }
+}
+
+fn is_text_relevant(o: &Op) -> bool {
+    matches!(
+        o.payload,
+        Payload::TextEdit(_) | Payload::SetContent { .. } | Payload::Create { .. }
+    )
 }
 
 impl Default for Replica {
@@ -1063,6 +1126,7 @@ impl Replica {
             missing: HashMap::new(),
             view: None,
             revived: BTreeSet::new(),
+            text: TextPart::default(),
         }
     }
 
@@ -1076,7 +1140,8 @@ impl Replica {
         self.view = None;
         // Fast path: no Applied SetContent of a non-live file, nothing to do.
         let st = &self.work.state;
-        if !needs_revive(st, self.log.iter().map(|(o, u, _)| (o, u))) {
+        let text_dead = self.text.content.keys().any(|n| !is_live(st, *n));
+        if !text_dead && !needs_revive(st, self.log.iter().map(|(o, u, _)| (o, u))) {
             self.revived.clear();
             return;
         }
@@ -1093,6 +1158,10 @@ impl Replica {
                 }
                 (Payload::SetContent { node, .. }, Undo::Content { .. }) => {
                     edits.push((o.id, *node));
+                }
+                // A valid TextEdit is an edit (Text-CRDT 7.4.4).
+                (Payload::TextEdit(t), _) if self.text.valid.contains(&o.id) => {
+                    edits.push((o.id, t.node));
                 }
                 _ => {}
             }
@@ -1137,15 +1206,6 @@ impl Replica {
         if ops.len() != self.log.len() || !ops.keys().eq(self.log.iter().map(|(o, _, _)| &o.id)) {
             return None;
         }
-        // Issue #53: the incremental replica is text-unaware in T1; text
-        // op sets go through `evaluate_with`.
-        if self
-            .log
-            .iter()
-            .any(|(o, _, _)| matches!(o.payload, Payload::TextEdit(_)))
-        {
-            return None;
-        }
         let state = self.state();
         let causal = std::cell::OnceCell::new();
         let causal = || causal.get_or_init(|| Causality::new(ops));
@@ -1168,11 +1228,17 @@ impl Replica {
                         node: op.moved_node().unwrap(),
                     });
                 }
+                Outcome::Applied if self.text.invalid.contains(&op.id) => {
+                    conflicts.insert(Conflict::InvalidOp { op: op.id });
+                }
                 Outcome::Applied => {
                     if let Some(n) = op.moved_node() {
                         applied.entry(n).or_default().push((op.id, pos));
                     }
                     match &op.payload {
+                        // Text nodes: 7.4.3 conflicts (Issue #54).
+                        Payload::SetContent { node, .. }
+                            if self.text.content.contains_key(node) => {}
                         Payload::SetContent { node, blob } => {
                             sets.entry(*node).or_default().push((op.id, *blob, pos))
                         }
@@ -1217,6 +1283,9 @@ impl Replica {
                     });
                 }
             }
+        }
+        for cs in self.text.conflicts.values() {
+            conflicts.extend(cs.iter().cloned());
         }
         for &(x, e, d) in &self.revived {
             conflicts.insert(Conflict::EditRevived {
@@ -1280,6 +1349,14 @@ impl Replica {
         }
         let mut last = self.log.last().map(|(o, _, _)| o.id);
         let mut seen: BTreeSet<OpId> = BTreeSet::new();
+        // Issue #54: a tail TextEdit needs the text pass (T3 authoring
+        // plans with `receive` on a clone instead).
+        if tail
+            .iter()
+            .any(|o| matches!(o.payload, Payload::TextEdit(_)))
+        {
+            return None;
+        }
         for o in tail {
             if last.is_some_and(|l| o.id <= l)
                 || !o
@@ -1302,7 +1379,7 @@ impl Replica {
             .iter()
             .map(|(o, u, _)| (o, u))
             .chain(tail.iter().zip(undo.iter()));
-        if needs_revive(&w.state, all) {
+        if needs_revive(&w.state, all) || self.text.content.keys().any(|n| !is_live(&w.state, *n)) {
             return None;
         }
         Some(w.state)
@@ -1320,12 +1397,223 @@ impl Replica {
     /// suffix and new ops in `<` order), so a batch of out-of-order ops
     /// costs O(suffix + batch) instead of O(suffix) per op.
     pub fn receive_all(&mut self, ops: impl IntoIterator<Item = Op>) {
+        self.receive_all_with(ops, &crate::text::NoBlobs);
+    }
+
+    /// [`Replica::receive_all`] with epoch blob bytes for text ops (Issue
+    /// #54, Text-CRDT 7.4.2): the seed of a new epoch doc is read from
+    /// `blobs` (seeds of docs already held are kept). Equal to
+    /// [`evaluate_with`] over the applied ops and the same blobs.
+    pub fn receive_all_with(
+        &mut self,
+        ops: impl IntoIterator<Item = Op>,
+        blobs: &dyn crate::text::BlobSource,
+    ) {
         let mut batch = Vec::new();
         for op in ops {
             self.buffer(op, &mut batch);
         }
-        self.integrate_all(batch);
+        let new: Vec<OpId> = batch.iter().map(|o| o.id).collect();
+        self.restore_fold();
+        let changed = self.integrate_all(batch);
+        self.update_text(&new, changed, blobs);
+        self.apply_fold();
         self.refresh_view();
+    }
+
+    /// Whether a doc for `(node, epoch)` exists (its seed is held).
+    pub fn has_text_doc(&self, node: NodeId, epoch: OpId) -> bool {
+        self.text.docs.contains_key(&(node, epoch))
+    }
+
+    /// The doc of one epoch (`None` if absent or deferred).
+    pub fn text_doc(&self, node: NodeId, epoch: OpId) -> Option<&crate::text::TextDoc> {
+        match self.text.docs.get(&(node, epoch)) {
+            Some(crate::text::DocSlot::Doc(d)) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Per text node: winning epoch and head content id (7.4.3).
+    pub fn text_content(&self) -> &BTreeMap<NodeId, (OpId, BlobId)> {
+        &self.text.content
+    }
+
+    /// `concurrent-edit` notices (7.8), as `evaluate(..).text.notices`.
+    pub fn text_notices(&self) -> BTreeSet<crate::text::Notice> {
+        self.text.notices.values().flatten().cloned().collect()
+    }
+
+    /// Valid (Applied) `TextEdit`s, as `evaluate(..).text.valid`.
+    pub fn text_valid(&self) -> &BTreeSet<OpId> {
+        &self.text.valid
+    }
+
+    fn logged(&self, id: OpId) -> Option<&(Op, Undo, Outcome)> {
+        self.log
+            .binary_search_by_key(&id, |(o, _, _)| o.id)
+            .ok()
+            .map(|i| &self.log[i])
+    }
+
+    /// [`crate::text::epoch_blob`] over the log.
+    fn epoch_blob_in(&self, node: NodeId, epoch: OpId) -> Option<BlobId> {
+        let (o, _, out) = self.logged(epoch)?;
+        if *out != Outcome::Applied {
+            return None;
+        }
+        match &o.payload {
+            Payload::Create {
+                kind: Kind::File, ..
+            } if epoch == node => Some(BlobId::empty()),
+            Payload::SetContent { node: n, blob } if *n == node => Some(*blob),
+            _ => None,
+        }
+    }
+
+    fn restore_fold(&mut self) {
+        for (n, v) in std::mem::take(&mut self.text.fold) {
+            if let Some(rec) = self.work.state.get_mut(&n) {
+                rec.content = v;
+            }
+        }
+    }
+
+    fn apply_fold(&mut self) {
+        for (n, &(_, blob)) in &self.text.content {
+            if let Some(rec) = self.work.state.get_mut(n) {
+                self.text.fold.insert(*n, rec.content);
+                rec.content = Some(blob);
+            }
+        }
+    }
+
+    /// Bring the text part up to date after integrating `new` (ids of
+    /// the ops just applied); `rebuild` = the fold outcome of an already
+    /// applied text-relevant op changed.
+    fn update_text(&mut self, new: &[OpId], rebuild: bool, blobs: &dyn crate::text::BlobSource) {
+        let new_text: Vec<OpId> = {
+            let mut v: Vec<OpId> = new
+                .iter()
+                .copied()
+                .filter(|id| {
+                    self.logged(*id)
+                        .is_some_and(|(o, _, _)| matches!(o.payload, Payload::TextEdit(_)))
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        if self.text.is_empty() && new_text.is_empty() {
+            return;
+        }
+        self.text.any = true;
+        let causal = Causality::of_sorted(self.log.iter().map(|(o, _, _)| o));
+        let mut affected: BTreeSet<NodeId> = BTreeSet::new();
+        let todo: Vec<OpId> = if rebuild {
+            // Keep the seeds of the docs held, then start over.
+            let mut seeds = HashMap::new();
+            for ((node, epoch), slot) in &self.text.docs {
+                if let (crate::text::DocSlot::Doc(d), Some(b)) =
+                    (slot, self.epoch_blob_in(*node, *epoch))
+                {
+                    seeds.insert(b, d.seed().to_vec());
+                }
+            }
+            self.text = TextPart {
+                any: true,
+                ..TextPart::default()
+            };
+            let src = SeedChain { seeds, next: blobs };
+            let all: Vec<OpId> = self
+                .log
+                .iter()
+                .filter(|(o, _, _)| matches!(o.payload, Payload::TextEdit(_)))
+                .map(|(o, _, _)| o.id)
+                .collect();
+            self.integrate_text(&all, &causal, &src, &mut affected);
+            Vec::new()
+        } else {
+            new_text
+        };
+        if !todo.is_empty() {
+            self.integrate_text(&todo, &causal, blobs, &mut affected);
+        }
+        // A new Applied SetContent of a text node changes its winner.
+        if !rebuild {
+            for id in new {
+                if let Some((
+                    Op {
+                        payload: Payload::SetContent { node, .. },
+                        ..
+                    },
+                    _,
+                    Outcome::Applied,
+                )) = self.logged(*id)
+                {
+                    if self.text.content.contains_key(node) {
+                        affected.insert(*node);
+                    }
+                }
+            }
+        }
+        if affected.is_empty() {
+            return;
+        }
+        let mut cs: BTreeMap<NodeId, Vec<OpId>> = BTreeMap::new();
+        for (o, _, out) in &self.log {
+            let n = match &o.payload {
+                Payload::SetContent { node, .. } if *out == Outcome::Applied => *node,
+                Payload::TextEdit(t) if self.text.valid.contains(&o.id) => t.node,
+                _ => continue,
+            };
+            if affected.contains(&n) {
+                cs.entry(n).or_default().push(o.id);
+            }
+        }
+        let get = |x: OpId| &self.logged(x).expect("op in log").0;
+        let mut out = Vec::new();
+        for (node, c) in &cs {
+            out.push((
+                *node,
+                crate::text::derive_node(*node, c, &get, &causal, blobs, &self.text.docs),
+            ));
+        }
+        for (node, d) in out {
+            self.text
+                .content
+                .insert(node, (d.content.epoch, d.content.blob));
+            self.text.conflicts.insert(node, d.conflicts);
+            self.text.notices.insert(node, d.notices);
+        }
+    }
+
+    /// [`crate::text::text_step`] for `ids` (ascending, so causal).
+    fn integrate_text(
+        &mut self,
+        ids: &[OpId],
+        causal: &Causality,
+        blobs: &dyn crate::text::BlobSource,
+        affected: &mut BTreeSet<NodeId>,
+    ) {
+        for &id in ids {
+            let (op, _, out) = self.logged(id).expect("op in log");
+            if *out != Outcome::Applied {
+                continue;
+            }
+            let Payload::TextEdit(t) = &op.payload else {
+                continue;
+            };
+            let t = t.clone();
+            let eb = self.epoch_blob_in(t.node, t.epoch);
+            let in_deps = |x: OpId| causal.precedes(x, id);
+            if crate::text::text_step(id, &t, eb, &in_deps, &mut self.text.docs, blobs) {
+                self.text.valid.insert(id);
+                affected.insert(t.node);
+            } else {
+                self.text.invalid.insert(id);
+            }
+        }
     }
 
     /// Buffer one op: pending until every dep is known. A ready op is
@@ -1368,16 +1656,23 @@ impl Replica {
 
     /// Integrate ready ops (ids new, deps known): undo the log above the
     /// smallest, then apply suffix and batch merged in `<` order.
-    fn integrate_all(&mut self, mut batch: Vec<Op>) {
+    /// Returns whether the fold outcome of a redone text-relevant op
+    /// (`TextEdit`, `SetContent`, `Create`) changed (Issue #54).
+    fn integrate_all(&mut self, mut batch: Vec<Op>) -> bool {
         if batch.is_empty() {
-            return;
+            return false;
         }
         batch.sort_by_key(|o| o.id);
         let pos = self.log.partition_point(|(o, _, _)| o.id < batch[0].id);
         let tail: Vec<(Op, Undo, Outcome)> = self.log.drain(pos..).collect();
         let mut redo = Vec::with_capacity(tail.len());
-        for (o, u, _) in tail.into_iter().rev() {
+        let track = !self.text.is_empty();
+        let mut before: HashMap<OpId, Outcome> = HashMap::new();
+        for (o, u, out) in tail.into_iter().rev() {
             self.work.undo(u);
+            if track && is_text_relevant(&o) {
+                before.insert(o.id, out);
+            }
             redo.push(o);
         }
         redo.reverse();
@@ -1401,6 +1696,9 @@ impl Replica {
             let (out, u) = self.work.apply(&next);
             self.log.push((next, u, out));
         }
+        before
+            .iter()
+            .any(|(id, out)| self.logged(*id).is_some_and(|(_, _, o)| o != out))
     }
 }
 
