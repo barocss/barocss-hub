@@ -245,7 +245,7 @@ describe('barocss-hub extension (real CLI, temp repos)', function () {
     const v1 = path.join(t, 'v1');
     fs.mkdirSync(v1); hub(v1, 'init');
     assert.match(hub(v1, 'sync', v2), /received [1-9]/);
-    assert.match(hub(v1, 'log'), /\S/);
+    assert.match(hub(v1, 'ls'), /notes\.md/);
     assert.match(hub(v1, 'status'), /^head [0-9a-f]{8}/m);
     const e = explain('upgrade-required', 'x');
     assert.strictEqual(e.severity, 'warning');
