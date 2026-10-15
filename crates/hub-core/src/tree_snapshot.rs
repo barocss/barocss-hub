@@ -901,8 +901,7 @@ impl Replica {
             revived.insert((r.id()?, r.id()?, r.id()?));
         }
         let text = if text {
-            let x = r.text(&log)?;
-            x
+            r.text(&log)?
         } else {
             if log
                 .iter()
