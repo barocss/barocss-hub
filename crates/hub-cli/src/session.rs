@@ -191,7 +191,22 @@ fn dup_error(why: &str) -> Error {
         Code::DuplicateReplica,
         format!(
             "sync aborted: {why} (duplicate replica id, D-022). One repository is probably a \
-             copy of the other's .hub/; run `barocss-hub reid` in one of them, then sync again"
+             copy of the other's .hub/; run `barocss-hub reid --rescue` in the copy (it keeps \
+             the copy's edits), then sync again"
+        ),
+    )
+}
+
+/// The `Hello` form (#49): nothing is persisted, so there is nothing for
+/// `reid --rescue` to re-author yet; a plain `reid` lets the sync run, and
+/// any op that then collides is rejected, remembered and rescuable.
+fn dup_hello_error(why: &str) -> Error {
+    Error::new(
+        Code::DuplicateReplica,
+        format!(
+            "sync aborted: {why} (duplicate replica id, D-022). One repository is probably a \
+             copy of the other's .hub/; run `barocss-hub reid` in the copy, then sync again \
+             (if that sync reports rejected ops, `barocss-hub reid --rescue` re-authors them)"
         ),
     )
 }
@@ -1054,7 +1069,7 @@ pub fn handshake(conn: &mut Conn, side: &Side) -> Result<Hello, Error> {
         }
     }
     if h.replica == side.id {
-        return Err(dup_error(&format!(
+        return Err(dup_hello_error(&format!(
             "the remote has our replica id {:032x}",
             side.id.0
         )));

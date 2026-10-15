@@ -11,6 +11,7 @@ pub mod json;
 pub mod migrate;
 pub mod remote;
 pub mod reported;
+pub mod rescue;
 pub mod session;
 pub mod snapshot;
 pub mod store;
@@ -289,6 +290,9 @@ pub struct Repo {
     /// and the `FrontierCheck::scan` result.
     head_memo: std::cell::RefCell<Option<(usize, HeadMemo)>>,
     fast_memo: std::cell::Cell<Option<(usize, bool)>>,
+    /// Lamport floor for new local ops (Issue #49: `reid --rescue` records
+    /// above every op it removed). In memory only; 0 = none.
+    pub counter_floor: u64,
 }
 
 #[derive(Clone)]
@@ -482,6 +486,9 @@ impl Repo {
         }
         if mode == LockMode::Exclusive {
             remote::migrate_peers(&dir)?;
+            // #50 follow-up: a stale reported-rejections temp (a crash before
+            // its rename) is swept under the exclusive lock.
+            reported::sweep_tmp(&dir);
         }
         let (fmt, rid) = migrate::read_replica(&dir)?;
         if fmt != migrate::Format::V1 {
@@ -635,6 +642,7 @@ impl Repo {
             snap_ops,
             head_memo: std::cell::RefCell::new(head_memo),
             fast_memo: std::cell::Cell::new(Some((st_len, fast))),
+            counter_floor: 0,
         };
         // Step 5 of a migration; otherwise the policy (writers only).
         if let Some(w) = repo.maybe_snapshot() {
@@ -834,7 +842,11 @@ impl Repo {
 
     /// Build a local op over explicit `deps` (ops already in the store).
     pub fn prepare_on(&self, deps: BTreeSet<NodeId>, payload: Payload) -> Op {
-        let counter = 1 + self.head_memo().max_counter.unwrap_or(1);
+        let counter = 1 + self
+            .head_memo()
+            .max_counter
+            .unwrap_or(1)
+            .max(self.counter_floor);
         Op {
             id: NodeId::new(counter, self.replica_id.0),
             deps,
@@ -1724,9 +1736,13 @@ Commands:
                        list sync warnings (D-008), pending ops and rejections
                        already reported (not warned again, no exit 3);
                        --clear-reported: forget those (all, or one remote's)
-  reid                 give this repo a fresh replica id (after copying a .hub/;
-                       run it BEFORE recording in the copy); clears saved
-                       duplicate-replica warnings (provisional default)
+  reid [--rescue [--dry-run] [--offline]]
+                       give this repo a fresh replica id (after copying a .hub/;
+                       plain reid: run it BEFORE recording in the copy); clears saved
+                       duplicate-replica warnings. --rescue: also re-author the
+                       copy's rejected or diverged ops by effect under the new id
+                       (backup in .hub/rescue/; --dry-run: show the plan only;
+                       then one sync confirms it unless --offline)
   help, --help, -h     show this help
   --version, -V        print the version
 
@@ -1803,6 +1819,43 @@ pub fn run(
             Code::Usage,
             format!("unknown command '{}' (see barocss-hub --help)", a[0]),
         );
+    }
+    if a[0] == "reid" && a.len() > 1 {
+        let mut o = rescue::Opts {
+            json,
+            ..rescue::Opts::default()
+        };
+        let mut rescue = false;
+        for x in &a[1..] {
+            match *x {
+                "--rescue" => rescue = true,
+                "--dry-run" => o.dry_run = true,
+                "--offline" => o.offline = true,
+                _ => return Err(usage("reid")),
+            }
+        }
+        if !rescue {
+            return Err(usage("reid"));
+        }
+        return rescue::cmd(cwd, o, out, warn);
+    }
+    if matches!(
+        a[0],
+        "record"
+            | "checkout"
+            | "mkdir"
+            | "touch"
+            | "mv"
+            | "rm"
+            | "commit"
+            | "publish"
+            | "sync"
+            | "watch"
+            | "reid"
+    ) {
+        if let Ok(hub) = sync::find_hub(cwd) {
+            rescue::refuse_if_in_progress(&hub, a[0])?;
+        }
     }
     if json && !json::STRUCTURED.contains(&a[0]) {
         // Commands without a structured form: their human lines, wrapped.

@@ -54,6 +54,9 @@ pub const REPLICA_HEADER_V0: &str = "barocss-hub/replica/v0";
 pub const REPLICA_HEADER: &str = "barocss-hub/replica/v1";
 /// Common prefix of every replica header (to name unknown versions).
 pub const REPLICA_HEADER_PREFIX: &str = "barocss-hub/replica/";
+/// v1 replica header while `reid --rescue` is in progress (Issue #49):
+/// pre-#49 binaries refuse it; a #49+ binary reads it as v1.
+pub const REPLICA_HEADER_RESCUE: &str = "barocss-hub/replica/v1-rescue";
 /// `.hub/format` contents in v1.
 pub const FORMAT_V1: &str = "barocss-hub/format/v1\n";
 

@@ -32,7 +32,7 @@ pub fn read_replica(dir: &Path) -> Result<(Format, u128), Error> {
         .map_err(|e| Error::new(Code::Io, format!("cannot read {}: {e}", rp.display())))?;
     let lines: Vec<&str> = rtext.lines().collect();
     let fmt = match lines.first() {
-        Some(h) if *h == store::REPLICA_HEADER => Format::V1,
+        Some(h) if *h == store::REPLICA_HEADER || *h == store::REPLICA_HEADER_RESCUE => Format::V1,
         Some(h) if *h == store::REPLICA_HEADER_V0 => Format::V0,
         Some(h) if h.starts_with(store::REPLICA_HEADER_PREFIX) => {
             return errc(Code::Corrupt, format!(

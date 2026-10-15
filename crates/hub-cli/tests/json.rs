@@ -543,3 +543,54 @@ fn watch_events_for_incoming_ops() {
     w.stop();
     assert_eq!(fs::read(b.join("n.txt")).unwrap(), b"x\n");
 }
+
+/// Issue #49: `reid --rescue --json` documents (dry run, result, no-op).
+#[test]
+fn rescue_goldens() {
+    let t = tmp("res49j");
+    let srv = t.join("srv");
+    ok(&t, &["init", "--bare", "srv"]);
+    let a = t.join("a");
+    fs::create_dir_all(&a).unwrap();
+    ok(&a, &["init"]);
+    set_replica(&a, 0xa1);
+    let url = format!("file://{}", fs::canonicalize(&srv).unwrap().display());
+    ok(&a, &["remote", "add", "origin", &url]);
+    fs::write(a.join("f"), "base\n").unwrap();
+    ok(&a, &["record"]);
+    ok(&a, &["sync"]);
+    let c = t.join("c");
+    assert!(std::process::Command::new("cp")
+        .args(["-R", a.to_str().unwrap(), c.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    ok(&c, &["remote", "trust", "origin"]);
+    fs::write(a.join("f"), "A").unwrap();
+    ok(&a, &["record"]);
+    ok(&a, &["sync"]);
+    fs::write(c.join("f"), "BB").unwrap();
+    ok(&c, &["record"]);
+    let (_, err, code) = raw(&c, &["sync"]);
+    assert_eq!(code, Some(1), "{err}");
+    let (dry, _, code) = raw(&c, &["reid", "--rescue", "--dry-run"]);
+    assert_eq!(code, Some(0));
+    golden(&c, "reid-rescue-dry-run", &dry);
+    let (res, _, code) = raw(&c, &["reid", "--rescue", "--offline"]);
+    assert_eq!(code, Some(0), "{res}");
+    let v = one_doc(&res);
+    let new = v.get("new_replica").str().to_string();
+    let backup = v.get("backup").str().to_string();
+    let ts = Path::new(&backup)
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let res = res.replace(&new, "<new>").replace(&ts, "<ts>");
+    golden(&c, "reid-rescue", &res);
+    let (noop, _, code) = raw(&c, &["reid", "--rescue"]);
+    assert_eq!(code, Some(0));
+    golden(&c, "reid-rescue-noop", &noop);
+}

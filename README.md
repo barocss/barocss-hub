@@ -67,6 +67,40 @@ duplicate-replica warnings are unaffected. `barocss-hub warnings` lists the
 remembered rejections; `barocss-hub warnings --clear-reported [<remote>]`
 forgets them (all, or one remote's) so they are reported again.
 
+## Troubleshooting: a copied repository (`reid --rescue`, D-049, Issue #49)
+
+If you copied a repository folder (with its `.hub/`) and recorded in both,
+sync stops with `duplicate-replica` or keeps reporting rejected ops
+(`equivocation`). Run, in the copy:
+
+    barocss-hub reid --rescue --dry-run   # shows the plan, changes nothing
+    barocss-hub reid --rescue             # does it
+
+Rescue gives the copy a fresh replica id and re-records its edits by
+effect: the copy's rejected ops (from the saved warnings and the
+reported-rejections memory, so it works offline) and everything built on
+them are removed from the copy's log, and the working directory as you see
+it (unrecorded edits included) is recorded on top under the new id. A file
+both copies changed keeps the copy's content at head and the server's in
+history. Every changed file is first backed up to
+`.hub/rescue/<timestamp>/files/`. Rescue is crash-safe (rerun it to finish;
+other commands refuse until then) and a rerun after success does nothing.
+Checkpoints (`record -m`, `commit -m`) that named the removed ops are kept
+in the rescue manifest and re-created as private checkpoints on the rescued
+version (same message and author); published ones are listed so you can
+re-publish them (nothing is published automatically). While a rescue is
+unfinished the repository's replica header is marked, so older barocss-hub
+binaries refuse it ("unsupported repository format") instead of touching
+it. With a default remote it then runs one sync to confirm (`--offline`
+skips it) and checks out the result if the working tree is unchanged since
+the rescue recorded it. The working directory must be at head
+(`barocss-hub checkout` first). Known limit: a third repository that built
+on the copy's rejected ops keeps those ops; after the rescue it can show a
+name collision (`g` / `g~…`) and stays diverged on the shared id (a
+follow-up Issue tracks it).
+In VS Code, the duplicate-replica error offers "Rescue…", which shows the
+plan and asks before running it.
+
 ## Trusted remotes store (D-046, Issue #45)
 
 First contact with a remote that came with a folder's `.hub/remotes`
