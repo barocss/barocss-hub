@@ -1509,8 +1509,12 @@ impl Replica {
                 }
             }
         }
-        (self.logged(node).is_some() && self.state().get(&node).is_some_and(|n| n.kind == Kind::File))
-            .then(|| (node, BlobId::empty()))
+        (self.logged(node).is_some()
+            && self
+                .state()
+                .get(&node)
+                .is_some_and(|n| n.kind == Kind::File))
+        .then(|| (node, BlobId::empty()))
     }
 
     /// Content heads of `node` at the applied head (7.4.1 `seen`), as
@@ -1586,6 +1590,42 @@ impl Replica {
             del,
             ins,
         })
+    }
+
+    /// Every derived text blob id with the `(node, epoch)` doc it comes
+    /// from (Issue #56): heads of text nodes and text-op loser blobs of
+    /// content conflicts. Some may equal a stored blob (an epoch seed).
+    pub fn derived_blob_ids(&self) -> Vec<(NodeId, OpId, BlobId)> {
+        let mut v: Vec<(NodeId, OpId, BlobId)> = self
+            .text
+            .content
+            .iter()
+            .map(|(n, (e, b))| (*n, *e, *b))
+            .collect();
+        for cs in self.text.conflicts.values() {
+            for c in cs {
+                if let Conflict::Content {
+                    node,
+                    loser,
+                    loser_blob,
+                    ..
+                } = c
+                {
+                    if let Some((
+                        Op {
+                            payload: Payload::TextEdit(t),
+                            ..
+                        },
+                        _,
+                        _,
+                    )) = self.logged(*loser)
+                    {
+                        v.push((*node, t.epoch, *loser_blob));
+                    }
+                }
+            }
+        }
+        v
     }
 
     /// Bytes of a derived text blob this replica holds (Issue #56): a text

@@ -157,7 +157,35 @@ fn clone_by_sync_edit_both_converge() {
 
 #[test]
 fn concurrent_edit_same_file_same_conflict_and_winner() {
+    // Binary saves (a NUL byte): whole-blob LWW and a content conflict
+    // (Issue #56: concurrent text saves merge instead, see below).
     let (_t, r) = repos("content", &["a", "b"]);
+    let (a, b) = (&r[0], &r[1]);
+    fs::write(a.join("f.txt"), "base\0\n").unwrap();
+    ok(a, &["record"]);
+    sync(b, a);
+    ok(b, &["checkout"]);
+    fs::write(a.join("f.txt"), "A edit\0\n").unwrap();
+    ok(a, &["record"]);
+    fs::write(b.join("f.txt"), "B edit\0\n").unwrap();
+    ok(b, &["record"]);
+    sync(a, b);
+    ok(a, &["checkout"]);
+    ok(b, &["checkout"]);
+    let (ca, cb) = (conflicts(a), conflicts(b));
+    assert!(ca.contains("content: f.txt"), "{ca}");
+    assert_eq!(ca, cb);
+    let wa = fs::read(a.join("f.txt")).unwrap();
+    assert_eq!(wa, fs::read(b.join("f.txt")).unwrap());
+    assert!(wa == b"A edit\0\n" || wa == b"B edit\0\n");
+    assert_eq!(head(a), head(b));
+}
+
+/// Issue #56: the same line edited concurrently in a text file: no
+/// conflict, both new lines, identical on both replicas.
+#[test]
+fn concurrent_text_edit_same_line_keeps_both() {
+    let (_t, r) = repos("text-same-line", &["a", "b"]);
     let (a, b) = (&r[0], &r[1]);
     fs::write(a.join("f.txt"), "base\n").unwrap();
     ok(a, &["record"]);
@@ -171,11 +199,14 @@ fn concurrent_edit_same_file_same_conflict_and_winner() {
     ok(a, &["checkout"]);
     ok(b, &["checkout"]);
     let (ca, cb) = (conflicts(a), conflicts(b));
-    assert!(ca.contains("content: f.txt"), "{ca}");
+    assert!(!ca.contains("content: f.txt"), "{ca}");
     assert_eq!(ca, cb);
     let wa = fs::read(a.join("f.txt")).unwrap();
     assert_eq!(wa, fs::read(b.join("f.txt")).unwrap());
-    assert!(wa == b"A edit\n" || wa == b"B edit\n");
+    assert!(
+        wa == b"A edit\nB edit\n" || wa == b"B edit\nA edit\n",
+        "{wa:?}"
+    );
     assert_eq!(head(a), head(b));
 }
 

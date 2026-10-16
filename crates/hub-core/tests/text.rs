@@ -675,7 +675,11 @@ fn replica_same(r: &Replica, ops: &[Op], blobs: &Blobs, file: NodeId) -> Result<
         prop_assert_eq!(r.content_heads(file), content_heads(&map, &ev, file));
         if let Some(nt) = ev.text.content.get(&file) {
             if let Some(b) = &nt.bytes {
-                for saved in [b.clone(), [b.as_slice(), b"x\n"].concat(), b"new\n".to_vec()] {
+                for saved in [
+                    b.clone(),
+                    [b.as_slice(), b"x\n"].concat(),
+                    b"new\n".to_vec(),
+                ] {
                     prop_assert_eq!(
                         r.author_text_edit(file, &saved, blobs),
                         author_text_edit(&map, &ev, blobs, file, &saved)
@@ -684,7 +688,12 @@ fn replica_same(r: &Replica, ops: &[Op], blobs: &Blobs, file: NodeId) -> Result<
             }
         }
         for c in &ev.conflicts {
-            if let Conflict::Content { loser_blob, winner_blob, .. } = c {
+            if let Conflict::Content {
+                loser_blob,
+                winner_blob,
+                ..
+            } = c
+            {
                 for id in [loser_blob, winner_blob] {
                     if let Some(want) = ev.text.blobs.get(id) {
                         prop_assert_eq!(r.derived_blob(id), Some(want.clone()));

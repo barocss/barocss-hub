@@ -18,6 +18,7 @@ pub mod store;
 pub mod sync;
 #[cfg(test)]
 mod text_tests;
+pub mod textmode;
 pub mod trust;
 pub mod watch;
 pub mod wd;
@@ -28,8 +29,8 @@ use hub_core::checkpoint::{
 };
 use hub_core::projection::{project, short_id, Projection};
 use hub_core::tree::{
-    evaluate, is_ancestor_or_self, valid_name, BlobId, Conflict, Kind, NodeId, Op, Payload,
-    Replica, ReplicaId, State, ROOT,
+    evaluate_with, is_ancestor_or_self, valid_name, BlobId, Conflict, Evaluation, Kind, NodeId, Op,
+    Payload, Replica, ReplicaId, State, ROOT,
 };
 use hub_core::version::{Store, Version};
 use std::collections::{BTreeMap, BTreeSet};
@@ -765,19 +766,58 @@ impl Repo {
                 return c;
             }
         }
-        evaluate(self.store.values()).conflicts
+        evaluate_with(self.store.values(), &self.disk_blobs()).conflicts
     }
 
     /// State after appending `ops` (greater than every stored op), for
     /// planning before the append: the replica's tail preview, else a full
     /// `evaluate` (Issue #32).
-    fn state_with(&self, ops: &[Op]) -> State {
+    /// Issue #56: also writes the derived text blobs of that state (and
+    /// of the current head) that `.hub/blobs` lacks, so the plan can
+    /// materialize merged text.
+    fn state_with(&mut self, ops: &[Op]) -> Result<State, Error> {
+        self.persist_derived()?;
         if !oracle() {
             if let Some(st) = self.replica.state_with_tail(ops) {
-                return st;
+                return Ok(st);
+            }
+            // A tail with `TextEdit`s needs the text pass with the epoch
+            // seeds: plan on a copy of the replica.
+            if ops
+                .iter()
+                .any(|o| matches!(o.payload, Payload::TextEdit(_)))
+            {
+                let mut r = self.replica.clone();
+                r.receive_all_with(ops.iter().cloned(), &self.disk_blobs());
+                if r.pending_len() == 0 && r.text_seed_error().is_none() {
+                    persist_derived(&mut r, &self.dir)?;
+                    return Ok(r.state().clone());
+                }
             }
         }
-        evaluate(self.store.values().chain(ops.iter())).state
+        let ev = evaluate_with(self.store.values().chain(ops.iter()), &self.disk_blobs());
+        persist_eval_blobs(&ev, &self.dir)?;
+        Ok(ev.state)
+    }
+
+    /// Epoch seeds and other blob bytes read from `.hub/blobs` on demand.
+    pub(crate) fn disk_blobs(&self) -> DiskBlobs {
+        DiskBlobs(self.dir.join("blobs"))
+    }
+
+    /// Issue #56: write every derived text blob the replica holds (text
+    /// heads, text-op content-conflict losers) that `.hub/blobs` lacks,
+    /// so checkout, `cat` and `cat-blob` read them like any blob. Derived
+    /// blobs are a pure function of the op set and the seeds, so they are
+    /// a cache: written on demand, content-addressed, never a placeholder.
+    pub fn persist_derived(&mut self) -> Result<usize, Error> {
+        persist_derived(&mut self.replica, &self.dir)
+    }
+
+    /// The evaluation of version `v` with epoch seeds from disk (Issue
+    /// #56: text content is derived, never the `NoBlobs` placeholder).
+    pub fn eval_at(&self, v: &Version) -> Evaluation {
+        evaluate_with(v.resolve(&self.store), &self.disk_blobs())
     }
 
     /// Whether the repository is format v2 (Issue #54).
@@ -1009,6 +1049,58 @@ impl hub_core::text::BlobSource for DiskBlobs {
             .ok()
             .map(std::borrow::Cow::Owned)
     }
+}
+
+/// Lines a `TextEdit` adds and removes (Issue #56, `log`/`show`):
+/// removed is `None` when its epoch's text is not loaded.
+pub(crate) fn text_summary(repo: &Repo, t: &hub_core::text::TextEdit) -> (usize, Option<usize>) {
+    let removed = repo.replica.text_doc(t.node, t.epoch).and_then(|d| {
+        let mut b = Vec::new();
+        for (e, n) in &t.del {
+            b.extend_from_slice(d.range_bytes(*e, *n)?);
+        }
+        Some(hub_core::text::split_lines(&b).len())
+    });
+    (t.lines_added(), removed)
+}
+
+/// [`Repo::persist_derived`] for any replica of the repository at `dir`.
+pub(crate) fn persist_derived(r: &mut Replica, dir: &Path) -> Result<usize, Error> {
+    let ids = r.derived_blob_ids();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let blobs = blobs::Blobs::open(dir)?;
+    let src = DiskBlobs(dir.join("blobs"));
+    let mut batch = blobs.batch();
+    let mut done = BTreeSet::new();
+    for (node, epoch, id) in ids {
+        if id == BlobId::empty() || !done.insert(id) || blobs.contains(&id) {
+            continue;
+        }
+        r.load_text_doc(node, epoch, &src)
+            .map_err(|b| seed_error(dir, b))?;
+        if let Some(b) = r.derived_blob(&id) {
+            batch.add(&b).map_err(blob_error)?;
+        }
+    }
+    batch.commit().map_err(blob_error)
+}
+
+/// Write the derived blobs of an evaluation (`ev.text.blobs`) that
+/// `.hub/blobs` lacks (Issue #56).
+pub(crate) fn persist_eval_blobs(ev: &Evaluation, dir: &Path) -> Result<usize, Error> {
+    if ev.text.blobs.is_empty() {
+        return Ok(0);
+    }
+    let blobs = blobs::Blobs::open(dir)?;
+    let mut batch = blobs.batch();
+    for (id, b) in &ev.text.blobs {
+        if !blobs.contains(id) {
+            batch.add(b).map_err(blob_error)?;
+        }
+    }
+    batch.commit().map_err(blob_error)
 }
 
 /// The error for a snapshot-referenced seed blob that is gone (#54).
@@ -1325,7 +1417,7 @@ fn mutate(
         return Err(not_at_head(repo, &idx));
     }
     let op = repo.prepare(payload);
-    let state = repo.state_with(std::slice::from_ref(&op));
+    let state = repo.state_with(std::slice::from_ref(&op))?;
     let proj = project(&state);
     let mut ws = Vec::new();
     let (w, ignored) = wd::scan_all(&root, &idx, &mut ws)?;
@@ -1410,22 +1502,6 @@ pub(crate) fn record(
         return Ok(None);
     }
     let old = |p: &str| idx.entries[p].0;
-    // Ops are built first and appended only after the working-directory
-    // plan succeeds (as in `mutate`), each depending on the previous one:
-    // exactly what successive `Repo::mint` calls would produce.
-    let mut ops: Vec<Op> = Vec::new();
-    let mut mint = |payload: Payload| -> Result<Op, Error> {
-        let op = match ops.last() {
-            None => repo.prepare_on(idx.base.iter().copied().collect(), payload),
-            Some(prev) => Op {
-                id: NodeId::new(prev.id.counter + 1, prev.id.replica.0),
-                deps: BTreeSet::from([prev.id]),
-                payload,
-            },
-        };
-        ops.push(op.clone());
-        Ok(op)
-    };
     let mut created: BTreeMap<String, NodeId> = BTreeMap::new();
     let parent_of = |created: &BTreeMap<String, NodeId>, path: &str| -> (NodeId, String) {
         let (d, n) = path.rsplit_once('/').unwrap_or(("", path));
@@ -1440,6 +1516,12 @@ pub(crate) fn record(
     // leave an op that names a missing blob (or a half-recorded change).
     // Group commit (Issue #29): one barrier for all of them.
     let mut stored: BTreeMap<&str, BlobId> = BTreeMap::new();
+    // Issue #56 (Text-CRDT 7.1): bytes of modified files that classify as
+    // text, the candidates for a `TextEdit`.
+    let (attrs, attr_warns) = textmode::Attributes::load(&root)?;
+    print_warnings(warn, &attr_warns)?;
+    let bytes_mode = textmode::bytes_mode_reason(&repo.dir)?;
+    let mut text_saves: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
     let mut batch = blobs.batch();
     for c in &changes {
         if let Change::Added(p) | Change::Modified(p) = c {
@@ -1447,10 +1529,117 @@ pub(crate) fn record(
                 let bytes = fs::read(root.join(p))?;
                 let b = batch.add(&bytes).map_err(blob_error)?;
                 stored.insert(p, b);
+                if matches!(c, Change::Modified(_))
+                    && bytes_mode.is_none()
+                    && textmode::is_text(&bytes, attrs.mode(p))
+                {
+                    text_saves.insert(p, bytes);
+                }
             }
         }
     }
     batch.commit().map_err(blob_error)?;
+    if let (Some(why), false) = (&bytes_mode, changes.is_empty()) {
+        if changes.iter().any(|c| matches!(c, Change::Modified(_))) {
+            writeln!(warn, "warning: {why}")?;
+        }
+    }
+    // The `TextEdit` of each text save (7.5.1): base = the index base
+    // `V_wd`; `None` = author a `SetContent` (flip, unavailable epoch).
+    // A save equal to the base text writes no op (7.5.2).
+    let mut text_edits: BTreeMap<&str, Option<hub_core::text::TextEdit>> = BTreeMap::new();
+    if !text_saves.is_empty() {
+        let at_head = idx.base == repo.head_frontier();
+        let base_ev = if at_head {
+            None
+        } else {
+            let v = Version::downclose(&repo.store, idx.base.iter().copied())
+                .map_err(|_| Error::new(Code::Corrupt, "the index base is not in the log"))?;
+            let ops: BTreeMap<NodeId, Op> =
+                v.resolve(&repo.store).map(|o| (o.id, o.clone())).collect();
+            let ev = evaluate_with(ops.values(), &repo.disk_blobs());
+            Some((ops, ev))
+        };
+        for (p, saved) in &text_saves {
+            let node = old(p);
+            let mode = attrs.mode(p);
+            let src = repo.disk_blobs();
+            // Base text at V_wd and the authored edit.
+            let (base, edit): (Option<Vec<u8>>, _) = match &base_ev {
+                None => {
+                    let Some((epoch, eblob)) = repo.replica.content_epoch(node) else {
+                        continue;
+                    };
+                    repo.replica
+                        .load_text_doc(node, epoch, &src)
+                        .map_err(|b| seed_error(&repo.dir, b))?;
+                    let base = match repo.replica.text_doc(node, epoch) {
+                        Some(d) => Some(d.materialize_head()),
+                        None => blobs.get(&eblob).ok(),
+                    };
+                    let edit = repo.replica.author_text_edit(node, saved, &src);
+                    (base, edit)
+                }
+                Some((ops, ev)) => {
+                    let base = match ev.text.content.get(&node) {
+                        Some(nt) => nt.bytes.clone(),
+                        None => hub_core::text::winning_epoch(ops, ev, node)
+                            .and_then(|(_, b)| blobs.get(&b).ok()),
+                    };
+                    let edit = hub_core::text::author_text_edit(ops, ev, &src, node, saved);
+                    (base, edit)
+                }
+            };
+            let Some(base) = base else { continue };
+            if !textmode::is_text(&base, mode) {
+                // Flip binary -> text: a `SetContent` starts a text epoch.
+                continue;
+            }
+            if base == **saved {
+                text_edits.insert(p, None);
+                continue;
+            }
+            let idx_blob = match idx.entries[*p].1 {
+                Entry::File { blob, .. } => blob,
+                _ => BlobId::empty(),
+            };
+            if BlobId::of(&base) != idx_blob {
+                writeln!(
+                    warn,
+                    "warning: {p}: the index does not match the recorded text; diffed against \
+                     the recorded text instead (concurrent edits may be duplicated)"
+                )?;
+            }
+            if let Some(e) = edit {
+                text_edits.insert(p, Some(e));
+            }
+        }
+    }
+    // Ops are built first and appended only after the working-directory
+    // plan succeeds (as in `mutate`), each depending on the previous one:
+    // exactly what successive `Repo::mint` calls would produce.
+    let mut ops: Vec<Op> = Vec::new();
+    let slot = |ops: &[Op]| -> (NodeId, BTreeSet<NodeId>) {
+        match ops.last() {
+            None => {
+                let o = repo.prepare_on(
+                    idx.base.iter().copied().collect(),
+                    Payload::Delete { node: ROOT },
+                );
+                (o.id, o.deps)
+            }
+            Some(prev) => (
+                NodeId::new(prev.id.counter + 1, prev.id.replica.0),
+                BTreeSet::from([prev.id]),
+            ),
+        }
+    };
+    let mint = |ops: &mut Vec<Op>, payload: Payload| -> Result<Op, Error> {
+        let (id, deps) = slot(ops);
+        let op = Op { id, deps, payload };
+        ops.push(op.clone());
+        Ok(op)
+    };
     let put = |path: &str| -> Result<BlobId, Error> { Ok(stored[path]) };
     // 1. Creates, parents first (a path sorts before its descendants).
     for c in &changes {
@@ -1458,12 +1647,12 @@ pub(crate) fn record(
         let (parent, name) = parent_of(&created, p);
         let is_dir = matches!(w[p], Entry::Dir);
         let kind = if is_dir { Kind::Directory } else { Kind::File };
-        let op = mint(Payload::Create { kind, parent, name })?;
+        let op = mint(&mut ops, Payload::Create { kind, parent, name })?;
         created.insert(p.clone(), op.id);
         if !is_dir {
             let blob = put(p)?;
             if blob != BlobId::empty() {
-                mint(Payload::SetContent { node: op.id, blob })?;
+                mint(&mut ops, Payload::SetContent { node: op.id, blob })?;
             }
         }
     }
@@ -1471,17 +1660,43 @@ pub(crate) fn record(
     for c in &changes {
         let Change::Renamed(a, b) = c else { continue };
         let (new_parent, new_name) = parent_of(&created, b);
-        mint(Payload::Move {
-            node: old(a),
-            new_parent,
-            new_name,
-        })?;
+        mint(
+            &mut ops,
+            Payload::Move {
+                node: old(a),
+                new_parent,
+                new_name,
+            },
+        )?;
     }
-    // 3. Content edits.
+    // 3. Content edits: a `TextEdit` (chained if large, #54) for a text
+    // save, else a `SetContent`.
     for c in &changes {
         let Change::Modified(p) = c else { continue };
-        let blob = put(p)?;
-        mint(Payload::SetContent { node: old(p), blob })?;
+        match text_edits.remove(p.as_str()) {
+            Some(None) => {}
+            Some(Some(edit)) => {
+                let (first, deps) = slot(&ops);
+                let chain = hub_core::text::split_text_edit(
+                    first,
+                    deps,
+                    edit,
+                    &|o| store::encode_op(o).len(),
+                    store::TEXT_OP_MAX,
+                )
+                .ok_or_else(|| {
+                    Error::new(
+                        Code::Limit,
+                        format!("{p}: a text edit piece exceeds the record limit"),
+                    )
+                })?;
+                ops.extend(chain);
+            }
+            None => {
+                let blob = put(p)?;
+                mint(&mut ops, Payload::SetContent { node: old(p), blob })?;
+            }
+        }
     }
     // 4. Deletes, top-most only (a Delete trashes the whole subtree).
     let deleted: BTreeSet<&str> = changes
@@ -1494,7 +1709,7 @@ pub(crate) fn record(
     for p in &deleted {
         let covered = p.match_indices('/').any(|(i, _)| deleted.contains(&p[..i]));
         if !covered {
-            mint(Payload::Delete { node: old(p) })?;
+            mint(&mut ops, Payload::Delete { node: old(p) })?;
         }
     }
     let renamed: BTreeMap<&str, NodeId> = changes
@@ -1537,7 +1752,7 @@ pub(crate) fn record(
         };
         mid.entries.insert(p.clone(), (node, e));
     }
-    let state = repo.state_with(&ops);
+    let state = repo.state_with(&ops)?;
     let proj = project(&state);
     let frontier = if oracle() {
         let mut all = repo.store.clone();
@@ -1712,7 +1927,9 @@ pub(crate) fn checkout(
         },
         (None, None) => repo.head(),
     };
-    let ev = evaluate(v.resolve(&repo.store));
+    let ev = repo.eval_at(&v);
+    // Issue #56: merged text heads (and text losers) are derived blobs.
+    persist_eval_blobs(&ev, &repo.dir)?;
     let proj = project(&ev.state);
     let idx = match load_index(repo, warn) {
         Ok(i) => i,
@@ -2130,8 +2347,11 @@ pub fn run(
             }
         }
         ["cat", id, p] => {
-            let (v, node, blob) = json::cat_target(&repo, id, p)?;
-            let bytes = repo.blobs()?.get(&blob).map_err(blob_error)?;
+            let (v, node, blob, derived) = json::cat_target(&repo, id, p)?;
+            let bytes = match derived {
+                Some(b) => b,
+                None => repo.blobs()?.get(&blob).map_err(blob_error)?,
+            };
             if json {
                 json::emit(
                     out,
@@ -2476,7 +2696,7 @@ pub fn run(
             };
             let st = match &f {
                 None => repo.state().clone(),
-                Some(v) => evaluate(v.resolve(&repo.store)).state,
+                Some(v) => repo.eval_at(v).state,
             };
             let p = project(&st);
             writeln!(out, "version {}", vid.hex())?;
@@ -2834,6 +3054,17 @@ mod perf32_tests {
 
     /// A v0 copy of `a`, migrated by its first command, prints the same.
     fn migrated_same(a: &Path, views: &[Vec<String>]) -> Result<(), TestCaseError> {
+        // Issue #56: a repository with text ops is format v2; the v0 -> v1
+        // migration input cannot hold `T` records (v2 is tested in
+        // text_t2.rs / text_t3.rs).
+        let log = fs::read_to_string(a.join(".hub/ops.log")).unwrap();
+        if log.lines().any(|l| {
+            l.split('\t')
+                .next()
+                .is_some_and(|b| b.split(' ').nth(3) == Some("T"))
+        }) {
+            return Ok(());
+        }
         let m = a.parent().unwrap().join("m");
         let _ = fs::remove_dir_all(&m);
         copy_dir(a, &m);

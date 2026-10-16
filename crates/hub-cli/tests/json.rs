@@ -456,10 +456,11 @@ fn sync_state_pin_watch_and_conflicts() {
     );
     ok(&b, &["commit", "-m", "early"]);
 
-    // Concurrent edits of the same file: a content conflict.
-    fs::write(a.join("f.txt"), b"from a\n").unwrap();
+    // Concurrent edits of the same file: a content conflict (binary
+    // saves, Issue #56: concurrent text saves merge instead).
+    fs::write(a.join("f.txt"), b"from a\0\n").unwrap();
     ok(&a, &["record"]);
-    fs::write(b.join("f.txt"), b"from b\n").unwrap();
+    fs::write(b.join("f.txt"), b"from b\0\n").unwrap();
     ok(&b, &["record"]);
     ok(&b, &["sync", a.to_str().unwrap()]);
     let st = js(&b, &["status"]);
@@ -474,7 +475,7 @@ fn sync_state_pin_watch_and_conflicts() {
         .collect();
     let mut sorted = blobs.clone();
     sorted.sort();
-    assert_eq!(sorted, [b"from a\n".to_vec(), b"from b\n".to_vec()]);
+    assert_eq!(sorted, [b"from a\0\n".to_vec(), b"from b\0\n".to_vec()]);
     assert_ne!(c.get("winner").str(), c.get("loser").str());
     // The file's history lists both concurrent edits.
     let h = js(&b, &["log", "--path", "f.txt"]);

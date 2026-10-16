@@ -835,11 +835,34 @@ pub fn sync(
 ) -> Result<Synced, Error> {
     let res = resolve(cwd, arg)?;
     check_trust(&res, trust, cwd)?;
-    let Resolved { url, exec, .. } = res;
-    match &url {
+    let Resolved {
+        url,
+        exec,
+        name,
+        configured,
+    } = res;
+    let r = match &url {
         Url::File(p) => sync::sync_local(cwd, p, sync::env_stop(), warn),
         Url::Ssh { .. } => sync_ssh(cwd, &url, exec.as_deref(), batch, warn),
+    };
+    // Issue #56 (Text-CRDT 7.9): remember whether a configured remote
+    // speaks `text`, so `record` can stay in bytes mode for it offline.
+    if configured {
+        let seen = match &r {
+            Ok(s) => Some(s.report.peer_text),
+            Err(e) if e.code() == Code::UpgradeRequired && !e.is_remote() => Some(false),
+            _ => None,
+        };
+        if let (Some(t), Ok(hub)) = (seen, find_hub(cwd)) {
+            if let Err(e) = crate::textmode::remember_remote(&hub, &name, t) {
+                writeln!(
+                    warn,
+                    "warning: could not cache the features of remote {name}: {e}"
+                )?;
+            }
+        }
     }
+    r
 }
 
 /// `barocss-hub sync [<remote|url>]` (human output).

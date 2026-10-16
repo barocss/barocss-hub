@@ -35,7 +35,7 @@ use std::path::Path;
 
 use hub_core::checkpoint::{Checkpoint, VersionId, VersionIndex};
 use hub_core::projection::{project, Projection};
-use hub_core::tree::{evaluate, BlobId, Conflict, Kind, NodeId, Payload, State, ROOT};
+use hub_core::tree::{BlobId, Conflict, Kind, NodeId, Payload, State, ROOT};
 
 use crate::wd::{self, Entry};
 use crate::{store, sync, watch, Error, Repo};
@@ -526,7 +526,7 @@ fn show_doc(repo: &Repo, v: &str) -> Result<J, Error> {
     let ix = repo.index();
     let ver = crate::resolve(repo, &ix, v)?;
     let vid = hub_core::checkpoint::version_id(&repo.store, &ver);
-    let st = evaluate(ver.resolve(&repo.store)).state;
+    let st = repo.eval_at(&ver).state;
     let p = project(&st);
     let msgs: Vec<&str> = repo
         .checkpoints
@@ -740,7 +740,7 @@ fn path_history(repo: &Repo, p: &str) -> Result<History, Error> {
             .entry(c.id())
             .or_insert_with(|| {
                 let v = c.version(&repo.store).ok()?;
-                let st = evaluate(v.resolve(&repo.store)).state;
+                let st = repo.eval_at(&v).state;
                 let pj = project(&st);
                 let path = pj.paths.get(&node)?.clone();
                 let b = (st[&node].kind == Kind::File)
@@ -817,6 +817,16 @@ fn path_history_doc(repo: &Repo, p: &str) -> Result<J, Error> {
                     vec![("kind", J::s("set-content")), ("blob", blob(*b))]
                 }
                 Payload::Delete { node } if *node == h.node => vec![("kind", J::s("delete"))],
+                // Issue #56: a text edit with its line summary.
+                Payload::TextEdit(t) if t.node == h.node => {
+                    let (added, removed) = crate::text_summary(repo, t);
+                    vec![
+                        ("kind", J::s("text-edit")),
+                        ("epoch", id(t.epoch)),
+                        ("lines_added", J::n(added)),
+                        ("lines_removed", J::opt(removed.map(J::n))),
+                    ]
+                }
                 _ => return None,
             };
             let mut v = vec![("op", id(o.id))];
@@ -971,25 +981,25 @@ pub(crate) fn commit_doc(repo: &Repo, ix: &VersionIndex, c: &Checkpoint) -> J {
 }
 
 /// Resolve `cat <version> <path>` to (version id, node, blob).
+/// Issue #56: the bytes too, for a derived text blob (a merged text head
+/// is not in `.hub/blobs` until a checkout writes it).
 pub(crate) fn cat_target(
     repo: &Repo,
     v: &str,
     p: &str,
-) -> Result<(VersionId, NodeId, BlobId), Error> {
+) -> Result<(VersionId, NodeId, BlobId, Option<Vec<u8>>), Error> {
     let ix = repo.index();
     let ver = crate::resolve(repo, &ix, v)?;
     let vid = hub_core::checkpoint::version_id(&repo.store, &ver);
-    let st = evaluate(ver.resolve(&repo.store)).state;
-    let pj = project(&st);
+    let mut ev = repo.eval_at(&ver);
+    let st = &ev.state;
+    let pj = project(st);
     let node = crate::lookup(&pj, p)?;
     if st[&node].kind != Kind::File {
         return crate::errc(Code::NotAFile, format!("not a file: '{p}'"));
     }
-    Ok((
-        vid,
-        node,
-        pj.blobs.get(&node).copied().unwrap_or_else(BlobId::empty),
-    ))
+    let b = pj.blobs.get(&node).copied().unwrap_or_else(BlobId::empty);
+    Ok((vid, node, b, ev.text.blobs.remove(&b)))
 }
 
 pub(crate) fn parse_blob(t: &str) -> Result<BlobId, Error> {

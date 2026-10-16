@@ -115,6 +115,10 @@ pub struct Report {
     /// The remote speaks `rejected-ops`, so `rejected` is authoritative
     /// (false: a pre-#45 server, or nothing was pushed to a read-only one).
     pub rejected_reported: bool,
+    /// The remote's Hello carries feature `text` (Issue #56: cached per
+    /// configured remote so `record` knows offline whether it may author
+    /// `TextEdit`s, Text-CRDT 7.9).
+    pub peer_text: bool,
 }
 
 fn lock_wait() -> Duration {
@@ -1185,6 +1189,7 @@ fn client_inner(conn: &mut Conn, side: &mut Side) -> Result<Report, Error> {
     let mut rep = Report {
         read_only: ro,
         remote_replica: Some(peer),
+        peer_text: h.has(wire::F_TEXT),
         ..Report::default()
     };
     // Pull.

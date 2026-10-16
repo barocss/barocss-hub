@@ -106,7 +106,8 @@ fn save_patterns_under_record_edit_the_same_node() {
             assert!(d.join(".x.txt.swp").exists());
             assert_eq!(js(&d, &["record"]).get("recorded"), &V::Bool(false));
         }
-        // The node's history holds only its create and content edits.
+        // The node's history holds only its create and content edits
+        // (Issue #56: a text save is a `TextEdit`).
         let h = js(&d, &["log", "--path", "x.txt"]);
         let kinds: Vec<&str> = h
             .get("ops")
@@ -114,7 +115,7 @@ fn save_patterns_under_record_edit_the_same_node() {
             .iter()
             .map(|o| o.get("kind").str())
             .collect();
-        assert_eq!(kinds, ["set-content", "set-content", "create"], "{editor}");
+        assert_eq!(kinds, ["text-edit", "set-content", "create"], "{editor}");
     }
 }
 

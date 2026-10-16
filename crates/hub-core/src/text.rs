@@ -64,6 +64,12 @@ pub struct TextEdit {
 }
 
 impl TextEdit {
+    /// Lines the edit inserts: `\n`s in the inserted runs, plus one for a
+    /// run that ends without one (Issue #56 `log`/`show` summary).
+    pub fn lines_added(&self) -> usize {
+        self.ins.iter().map(|i| split_lines(&i.bytes).len()).sum()
+    }
+
     /// Total inserted bytes (the op's element offsets are `0..ins_len`).
     pub fn ins_len(&self) -> u64 {
         self.ins.iter().map(|i| i.bytes.len() as u64).sum()
@@ -563,6 +569,13 @@ impl TextDoc {
 
     fn bytes_of(&self, op: OpId) -> Option<&[u8]> {
         self.op_ix.get(&op).map(|&ix| self.op_slice(ix))
+    }
+
+    /// Bytes of a `del` range `(first element, byte length)` (Issue #56:
+    /// `log`/`show` summaries); `None` if not an integrated range.
+    pub fn range_bytes(&self, first: ElemId, len: u32) -> Option<&[u8]> {
+        self.bytes_of(first.op)?
+            .get(first.off as usize..first.off as usize + len as usize)
     }
 
     /// `e` is an element of this epoch: a character start of an

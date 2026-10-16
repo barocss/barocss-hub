@@ -141,6 +141,9 @@ fn views(d: &Path, env: &[(&str, &str)]) -> Vec<String> {
 fn setup(tag: &str) -> PathBuf {
     let d = tmp(tag);
     ok(&d, &["init"]);
+    // Issue #56: format v1 fixture: saves stay `SetContent`s (a `TextEdit`
+    // would upgrade the repository to v2).
+    write(&d, ".hubattributes", b"* binary\n");
     for r in 0..3 {
         for i in 0..4 {
             write(&d, &format!("d{i}/f{r}"), format!("{r}.{i}\n").as_bytes());
