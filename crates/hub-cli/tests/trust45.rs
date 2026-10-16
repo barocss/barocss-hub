@@ -549,13 +549,38 @@ fn terminal_prompt_asks_on_first_contact() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        use std::io::Write;
+        use std::io::{Read, Write};
+        // Until-waits (#57): answer once the prompt is on the pty, then
+        // keep stdin open until the CLI exits (no fixed sleeps).
         let mut i = ch.stdin.take().unwrap();
-        std::thread::sleep(Duration::from_millis(500));
+        let mut so = ch.stdout.take().unwrap();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let b2 = buf.clone();
+        let reader = std::thread::spawn(move || {
+            let mut k = [0u8; 4096];
+            while let Ok(n) = so.read(&mut k) {
+                if n == 0 {
+                    break;
+                }
+                b2.lock().unwrap().extend_from_slice(&k[..n]);
+            }
+        });
+        let until = |what: &mut dyn FnMut() -> bool| {
+            let end = std::time::Instant::now() + Duration::from_secs(30);
+            while !what() {
+                assert!(std::time::Instant::now() < end, "until-wait timed out");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        until(&mut || String::from_utf8_lossy(&buf.lock().unwrap()).contains("[y/N]"));
         let _ = i.write_all(answer.as_bytes());
-        std::thread::sleep(Duration::from_millis(1500));
+        let _ = i.flush();
+        until(&mut || ch.try_wait().unwrap().is_some());
         drop(i);
-        ch.wait_with_output().unwrap()
+        reader.join().unwrap();
+        let mut o = ch.wait_with_output().unwrap();
+        o.stdout = buf.lock().unwrap().clone();
+        o
     };
     let o = run("n\n");
     let out = String::from_utf8_lossy(&o.stdout).into_owned();
