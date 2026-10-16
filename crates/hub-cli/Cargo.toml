@@ -22,8 +22,14 @@ blake3 = { version = "=1.8.2", optional = true }
 
 [features]
 lthash = ["dep:blake3"]
+# Issue #57: compiles in the `HUB_TEST_*` environment hooks (crash points,
+# logs, limits, timeouts). Test-only: enabled for this crate's own tests via
+# the self dev-dependency below; release/dist builds never enable it.
+test-hooks = []
 
 [dev-dependencies]
 proptest = "1"
 # Issue #31: the eager checkpoint decode oracle (test-only).
 hub-core = { package = "barocss-hub-core", path = "../hub-core", features = ["oracle"] }
+# Issue #57: tests (and the binary they run) get the HUB_TEST_* hooks.
+barocss-hub-cli = { path = ".", features = ["test-hooks"] }

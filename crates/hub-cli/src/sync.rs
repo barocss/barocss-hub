@@ -505,8 +505,7 @@ pub fn sync_cmd(
 
 /// The test crash hook from the environment ([`CRASH_ENV`]).
 pub(crate) fn env_stop() -> Option<Interrupt> {
-    std::env::var(CRASH_ENV)
-        .ok()
+    hook_var!(CRASH_ENV)
         .and_then(|v| v.parse().ok())
         .map(Interrupt::Abort)
 }
@@ -734,7 +733,7 @@ pub fn sync_local(
         (Err(e), Err(s)) if e.code() == Code::Io && s.code() != Code::Io => return Err(s),
         (rc, _) => rc?,
     };
-    if let Some(p) = std::env::var_os(STATS_LOG_ENV) {
+    if let Some(p) = hook_os!(STATS_LOG_ENV) {
         let mut f = fs::OpenOptions::new().create(true).append(true).open(p)?;
         for (name, s) in [("this", &ca), ("peer", &cb)] {
             writeln!(f, "blobs-in {name} {} {}", s.blob_bytes_in, s.blobs_in)?;

@@ -76,7 +76,7 @@ pub const TRUST_MOVED: &str = "trust-moved";
 /// Abort if [`CRASH_STAGE_ENV`] names `stage` and this is its k-th hit.
 pub fn crash_point(stage: &str) {
     static HITS: AtomicUsize = AtomicUsize::new(0);
-    let Some(v) = std::env::var_os(CRASH_STAGE_ENV) else {
+    let Some(v) = hook_os!(CRASH_STAGE_ENV) else {
         return;
     };
     let v = v.to_string_lossy();
@@ -128,7 +128,7 @@ pub const FLUSH_LOG_ENV: &str = "HUB_TEST_FLUSH_LOG";
 /// the directory; on macOS a plain fsync, made durable by the following
 /// [`barrier`].
 pub fn flush_dir(path: &std::path::Path, f: &File) -> io::Result<()> {
-    if let Some(log) = std::env::var_os(FLUSH_LOG_ENV) {
+    if let Some(log) = hook_os!(FLUSH_LOG_ENV) {
         use std::io::Write;
         let mut l = std::fs::OpenOptions::new()
             .create(true)

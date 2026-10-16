@@ -95,14 +95,13 @@ pub const F_READ_ONLY: &str = "read-only";
 
 /// Step timeout (no complete frame) and `Hello` timeout (§5.2.5).
 pub fn step_timeout() -> Duration {
-    test_ms("HUB_TEST_WIRE_TIMEOUT_MS").unwrap_or(Duration::from_secs(60))
+    test_timeout().unwrap_or(Duration::from_secs(60))
 }
 pub fn hello_timeout() -> Duration {
-    test_ms("HUB_TEST_WIRE_TIMEOUT_MS").unwrap_or(Duration::from_secs(15))
+    test_timeout().unwrap_or(Duration::from_secs(15))
 }
-fn test_ms(k: &str) -> Option<Duration> {
-    std::env::var(k)
-        .ok()
+fn test_timeout() -> Option<Duration> {
+    hook_var!("HUB_TEST_WIRE_TIMEOUT_MS")
         .and_then(|v| v.parse().ok())
         .map(Duration::from_millis)
 }
@@ -155,7 +154,7 @@ pub struct Hello {
 impl Hello {
     pub fn new(replica: ReplicaId, read_only: bool) -> Hello {
         let mut features: Vec<String> = FEATURES.iter().map(|s| s.to_string()).collect();
-        if std::env::var_os("HUB_TEST_NO_TEXT_FEATURE").is_some_and(|v| v == "1") {
+        if hook_os!("HUB_TEST_NO_TEXT_FEATURE").is_some_and(|v| v == "1") {
             features.retain(|f| f != F_TEXT);
         }
         if read_only {

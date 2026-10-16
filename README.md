@@ -127,3 +127,34 @@ Only `HUB_PROPTEST_SEED` is read. proptest's global `PROPTEST_RNG_SEED` is
 ignored by this test, so exporting it elsewhere never disables the floor
 below. Under an override the 20% interruption floor is reported
 but not enforced.
+
+## Test hooks (`HUB_TEST_*`, Issue #57)
+
+The test suites drive the binary through `HUB_TEST_*` environment variables.
+All of them compile in only with the test-only cargo feature `test-hooks`
+of `barocss-hub-cli`. `cargo test` turns it on (the crate's self
+dev-dependency), in debug and in release. `cargo build`, `cargo install`
+and the dist build do not, so a shipped binary neither reads nor contains
+any hook.
+
+- crash points: `HUB_TEST_CRASH_STAGE`, `HUB_TEST_CRASH_IN_SYNC`,
+  `HUB_TEST_CRASH_IN_CHECKOUT`, `HUB_TEST_CRASH_IN_BLOB_PUT`
+- logs: `HUB_TEST_FLUSH_LOG`, `HUB_TEST_SYNC_STATS`, `HUB_TEST_BLOB_BARRIER_LOG`
+- limits and timing: `HUB_TEST_MAX_BLOB_SIZE`, `HUB_TEST_SESSION_MS`,
+  `HUB_TEST_WIRE_TIMEOUT_MS`
+- platform: `HUB_TEST_FORCE_CASE_INSENSITIVE`
+- protocol: `HUB_TEST_NO_TEXT_FEATURE` (hello without the text feature, #54)
+- also debug builds only (a release test binary ignores them):
+  `HUB_TEST_NO_REJECTION_DEDUP`, `HUB_TEST_RESCUE_EDIT_AFTER_SYNC`
+
+`HUB_TEST_FULL_PROPTEST` and `HUB_TEST_OLD_BIN` are read only by the tests.
+
+A new hook must be read through `hook_os!`/`hook_var!`
+(`crates/hub-cli/src/testhook.rs`); the unit test `hook_reads_are_gated`
+fails on a direct `env::var` of a hook. `tests/nohooks.rs` builds the
+binary without the feature, checks it has no `HUB_TEST_` bytes and runs it
+with every hook set. Before shipping a binary, run
+
+    scripts/check-no-test-hooks.sh [path/to/barocss-hub]
+
+(no argument: builds the release binary as dist does and checks it).
