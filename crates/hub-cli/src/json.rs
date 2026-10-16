@@ -1013,13 +1013,13 @@ pub(crate) fn commit_doc(repo: &Repo, ix: &VersionIndex, c: &Checkpoint) -> J {
 }
 
 /// Resolve `cat <version> <path>` to (version id, node, blob).
+/// `cat` target: version, node, blob and, for a derived text blob, its
+/// bytes.
+pub(crate) type CatTarget = (VersionId, NodeId, BlobId, Option<Vec<u8>>);
+
 /// Issue #56: the bytes too, for a derived text blob (a merged text head
 /// is not in `.hub/blobs` until a checkout writes it).
-pub(crate) fn cat_target(
-    repo: &Repo,
-    v: &str,
-    p: &str,
-) -> Result<(VersionId, NodeId, BlobId, Option<Vec<u8>>), Error> {
+pub(crate) fn cat_target(repo: &Repo, v: &str, p: &str) -> Result<CatTarget, Error> {
     let ix = repo.index();
     let ver = crate::resolve(repo, &ix, v)?;
     let vid = hub_core::checkpoint::version_id(&repo.store, &ver);

@@ -191,6 +191,12 @@ impl Blobs {
         self.get(id).is_ok()
     }
 
+    /// True if a file for blob `id` exists (unverified, one `stat`; Issue
+    /// #56: the derived-blob cache check; every read still verifies).
+    pub fn exists(&self, id: &BlobId) -> bool {
+        *id == BlobId::empty() || fs::symlink_metadata(self.path(id)).is_ok()
+    }
+
     /// Ids of all visible blob files (unverified).
     pub fn list(&self) -> io::Result<Vec<BlobId>> {
         let mut out = Vec::new();

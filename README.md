@@ -40,6 +40,47 @@ branches exist, the way out is:
 
 The refusal message prints the same steps.
 
+## Text files: merge, `.hubattributes`, notices (Issue #56, D-053, D-056)
+
+A file is **text** when it is valid UTF-8 without NUL bytes, at most 8 MiB, and
+no line is longer than 64 KiB (a leading BOM counts as its own line). Each save
+of a text file is recorded as a line-level `TextEdit` against the version the
+working directory was checked out at, so concurrent edits of one file merge:
+different lines both stay; the same line edited on two replicas keeps both new
+lines and raises a `concurrent-edit` notice. Line endings (`\r\n`, mixed) and
+the BOM are kept byte for byte. Binary files keep whole-file last-writer-wins
+with a `content` conflict, as before; a save that flips a file between text and
+binary is a whole-file save (`SetContent`) and conflicts with concurrent text
+edits.
+
+`checkout` (of head) and `watch` merge over unrecorded text edits (D-056): the
+dirty file is first recorded as a `TextEdit` (durable before anything is
+written), then the merged text is written with an atomic replace. If the head
+version of a dirty file is binary, or the dirty content is not text, or any
+other unrecorded change exists (a binary file, an add, a delete, a rename),
+`checkout` refuses as before; `--force` discards.
+
+`.hubattributes` (a tracked file at the working-directory root, `.hubignore`
+pattern syntax, last match wins) overrides the classification:
+
+```
+*.min.js binary
+docs/**/*.txt text
+```
+
+`text` still requires UTF-8 without NUL bytes, and lifts the size and line caps
+up to 64 MiB; `binary` always records whole files.
+
+Notices are informational and never block: `status` prints
+`notice: concurrent edits merged in <path> lines a-b (by <replicas>)`,
+`status --json` has `notices: [{kind, node, path, ops, lines, authors}]`, and
+`watch --json` emits `{"event":"notice", ...}` when one appears. A notice
+clears once someone edits the file after the merge.
+
+Mixed remotes: a configured remote whose last sync showed no wire feature
+`text` (cached in `.hub/remote-text`) keeps this repository authoring whole-file
+saves, so that remote is never wedged with `upgrade-required`; `record` warns.
+
 ## Exit status (D-045, Issue #45)
 
 | Status | Meaning |

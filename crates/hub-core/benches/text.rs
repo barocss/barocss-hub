@@ -19,6 +19,13 @@
 //!   decode (open with a snapshot, B2 target ≤ 1 s) and one more edit
 //!   on the reopened replica (the record step's core cost, ≤ 1 s).
 //!   `-- b2 [files] [edits]`.
+//! * B4 (Issue #56): `hub-diff-line/1` of an 8 MiB file (64-byte lines)
+//!   with 1% of its lines changed, spread uniformly (the typical case)
+//!   and in one block; plus the worst case the cost bound allows (every
+//!   line changed, D > 20 000: the Myers search runs to the bound, then
+//!   delete all / insert all). The record step's diff, from the doc's
+//!   visible runs to the `TextEdit`. Targets: ≤ 200 ms typical, ≤ 1 s
+//!   worst. `-- b4`.
 
 use std::collections::BTreeSet;
 use std::time::Instant;
@@ -649,6 +656,74 @@ fn case_b2(nfiles: usize, nedits: usize) -> bool {
     ok
 }
 
+/// One B4 measurement: the record step's diff (visible runs, then
+/// `diff_line` with the anchor mapping), best of 3.
+fn b4_diff(doc: &TextDoc, saved: &[u8]) -> (f64, usize) {
+    let all = |_: OpId| true;
+    let mut best = f64::MAX;
+    let mut n = 0;
+    for _ in 0..3 {
+        let t0 = Instant::now();
+        let base = doc.visible_runs(&all);
+        let (del, ins) = diff_line(&base, saved, &|l| doc.successor_at(l, &all)).unwrap();
+        best = best.min(t0.elapsed().as_secs_f64());
+        n = del.len() + ins.len();
+    }
+    (best, n)
+}
+
+fn case_b4() -> bool {
+    let mut rng = Rng::new(56);
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+    let mut total = 0;
+    while total + 64 <= 8 << 20 {
+        let mut l: Vec<u8> = Vec::with_capacity(64);
+        while l.len() < 63 {
+            l.extend_from_slice(WORDS[rng.below(8) as usize].as_bytes());
+        }
+        l.truncate(63);
+        l.push(b'\n');
+        total += 64;
+        lines.push(l);
+    }
+    let base: Vec<u8> = lines.concat();
+    let doc = TextDoc::new(NodeId::new(2, 1), &base);
+    let n = lines.len();
+    let change = |idx: &mut dyn Iterator<Item = usize>| {
+        let mut v = lines.clone();
+        for i in idx {
+            v[i] = format!("{:>62}\n", format!("changed line {i}")).into_bytes();
+        }
+        v.concat()
+    };
+    let k = n / 100;
+    let spread = change(&mut (0..k).map(|j| j * 100 + 7));
+    let mut r2 = Rng::new(57);
+    let random: BTreeSet<usize> = (0..k).map(|_| r2.below(n as u64) as usize).collect();
+    let rand = change(&mut random.iter().copied());
+    let block = change(&mut (n / 2..n / 2 + k));
+    let all_changed = change(&mut (0..n));
+    println!("B4: 8 MiB ({n} lines of 64 B), {k} lines changed (1%)");
+    let mut ok = true;
+    for (name, saved, target) in [
+        ("1% every 100th line", &spread, 0.2),
+        ("1% random lines", &rand, 0.2),
+        ("1% one block", &block, 0.2),
+        ("worst: every line (D > 20 000)", &all_changed, 1.0),
+    ] {
+        let (t, parts) = b4_diff(&doc, saved);
+        let hit = t <= target;
+        ok &= hit;
+        println!(
+            "  B4 {name}: {:.0} ms (target {:.0} ms){}, {parts} del/ins entries",
+            t * 1e3,
+            target * 1e3,
+            if hit { "" } else { " MISSED" }
+        );
+    }
+    ok
+}
+
 fn main() {
     let args: Vec<String> = std::env::args()
         .skip(1)
@@ -670,6 +745,9 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1_000_000);
         ok &= case_b2(f, e);
+    }
+    if which == "all" || which == "b4" {
+        ok &= case_b4();
     }
     if !ok {
         eprintln!("text bench: a target was missed or a check failed (see above)");

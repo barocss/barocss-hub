@@ -823,6 +823,7 @@ impl Repo {
             {
                 let mut r = self.replica.clone();
                 r.receive_all_with(ops.iter().cloned(), &self.disk_blobs());
+
                 if r.pending_len() == 0 && r.text_seed_error().is_none() {
                     persist_derived(&mut r, &self.dir)?;
                     return Ok(r.state().clone());
@@ -1109,7 +1110,7 @@ pub(crate) fn persist_derived(r: &mut Replica, dir: &Path) -> Result<usize, Erro
     let mut batch = blobs.batch();
     let mut done = BTreeSet::new();
     for (node, epoch, id) in ids {
-        if id == BlobId::empty() || !done.insert(id) || blobs.contains(&id) {
+        if id == BlobId::empty() || !done.insert(id) || blobs.exists(&id) {
             continue;
         }
         r.load_text_doc(node, epoch, &src)
@@ -1130,7 +1131,7 @@ pub(crate) fn persist_eval_blobs(ev: &Evaluation, dir: &Path) -> Result<usize, E
     let blobs = blobs::Blobs::open(dir)?;
     let mut batch = blobs.batch();
     for (id, b) in &ev.text.blobs {
-        if !blobs.contains(id) {
+        if !blobs.exists(id) {
             batch.add(b).map_err(blob_error)?;
         }
     }
@@ -1623,11 +1624,13 @@ pub(crate) fn record(
                     repo.replica
                         .load_text_doc(node, epoch, &src)
                         .map_err(|b| seed_error(&repo.dir, b))?;
+
                     let base = match repo.replica.text_doc(node, epoch) {
                         Some(d) => Some(d.materialize_head()),
                         None => blobs.get(&eblob).ok(),
                     };
                     let edit = repo.replica.author_text_edit(node, saved, &src);
+
                     (base, edit)
                 }
                 Some((ops, ev)) => {
@@ -1802,7 +1805,38 @@ pub(crate) fn record(
         };
         mid.entries.insert(p.clone(), (node, e));
     }
-    let state = repo.state_with(&ops)?;
+    // Issue #56: recorded at head, a text save's result is exactly the
+    // saved bytes (no concurrent op in the tail), so plan with the
+    // equivalent whole-file content (no replica copy, B2 scale).
+    let state = if idx.base == repo.head_frontier() {
+        let plan_ops: Vec<Op> = ops
+            .iter()
+            .map(|o| match &o.payload {
+                Payload::TextEdit(t) => {
+                    let p = idx
+                        .entries
+                        .iter()
+                        .find(|(_, (n, _))| *n == t.node)
+                        .map(|(p, _)| p.as_str());
+                    match p.and_then(|p| stored.get(p)) {
+                        Some(b) => Op {
+                            id: o.id,
+                            deps: o.deps.clone(),
+                            payload: Payload::SetContent {
+                                node: t.node,
+                                blob: *b,
+                            },
+                        },
+                        None => o.clone(),
+                    }
+                }
+                _ => o.clone(),
+            })
+            .collect();
+        repo.state_with(&plan_ops)?
+    } else {
+        repo.state_with(&ops)?
+    };
     let proj = project(&state);
     let frontier = if oracle() {
         let mut all = repo.store.clone();
@@ -2015,10 +2049,20 @@ pub(crate) fn checkout(
         v
     };
     let ix = repo.index();
-    let ev = repo.eval_at(&v);
     // Issue #56: merged text heads (and text losers) are derived blobs.
-    persist_eval_blobs(&ev, &repo.dir)?;
-    let proj = project(&ev.state);
+    // Head comes from the replayed replica (no full evaluate); another
+    // version is evaluated with the seeds.
+    let mut vf = v.frontier(&repo.store);
+    vf.sort();
+    let state = if !oracle() && vf == repo.head_frontier() {
+        repo.persist_derived()?;
+        repo.state().clone()
+    } else {
+        let ev = repo.eval_at(&v);
+        persist_eval_blobs(&ev, &repo.dir)?;
+        ev.state
+    };
+    let proj = project(&state);
     let idx = match load_index(repo, warn) {
         Ok(i) => i,
         Err(e) if force => {
@@ -2032,7 +2076,7 @@ pub(crate) fn checkout(
     let frontier = v.frontier(&repo.store);
     let plan = wd::plan(
         &Target {
-            state: &ev.state,
+            state: &state,
             proj: &proj,
             frontier: frontier.clone(),
         },
@@ -2216,6 +2260,17 @@ Commands:
                        then one sync confirms it unless --offline)
   help, --help, -h     show this help
   --version, -V        print the version
+
+Text files (Issue #56): a file that is UTF-8 without NUL bytes, at most 8 MiB,
+with lines of at most 64 KiB is text. Its saves are recorded as line edits that
+merge with concurrent edits (checkout and watch first record a dirty text file,
+then write the merge; binary files keep whole-file conflicts). `.hubattributes`
+at the root overrides the choice, one `<pattern> text|binary` per line in
+`.hubignore` syntax (last match wins; `text` still needs UTF-8 without NUL, up
+to 64 MiB). Overlapping concurrent edits are merged with a notice: `status`
+prints `notice: concurrent edits merged in <path> lines a-b`, `status --json`
+lists `notices`, `watch --json` emits a `notice` event. While a configured
+remote lacks wire feature `text` (seen at its last sync), saves stay whole-file.
 
 --json (any command): one JSON document on stdout (schema 1; `watch --json`:
 JSON Lines events); errors as JSON on stderr, exit status 1. Exit status 3: `sync` finished but
@@ -2430,6 +2485,7 @@ pub fn run(
         LockMode::Shared
     };
     let mut repo = Repo::discover_with(cwd, mode)?;
+
     for w in &repo.warnings {
         writeln!(warn, "warning: {w}")?;
     }

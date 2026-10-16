@@ -13,6 +13,11 @@ name = "hub_cli"
 name = "barocss-hub"
 path = "src/main.rs"
 
+# Issue #56: full CLI open at B2 scale (not run by `cargo test`).
+[[bench]]
+name = "b2_cli"
+harness = false
+
 [dependencies]
 hub-core = { package = "barocss-hub-core", path = "../hub-core" }
 sha2 = "0.10"
