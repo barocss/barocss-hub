@@ -1374,9 +1374,11 @@ fn rejections_are_reported_once_per_remote() {
         assert_eq!(code(&o), Some(0), "{}", err(&o));
         assert!(!err(&o).contains("rejected"), "{}", err(&o));
     }
-    // Mutation check: without the dedup the repeat exits 3 again.
+    // Mutation check: without the dedup the repeat exits 3 again. The hook
+    // is debug-only (#49/#55): a release binary ignores it and stays quiet.
     let o = run_env(&["sync"], &r2, &[("HUB_TEST_NO_REJECTION_DEDUP", "1")]);
-    assert_eq!(code(&o), Some(3));
+    let want = if cfg!(debug_assertions) { 3 } else { 0 };
+    assert_eq!(code(&o), Some(want), "{}", err(&o));
     // `warnings` lists it, marked, in human and --json form.
     let w = ok(&d, &["warnings"]);
     assert!(w.contains("reported rejection (suppressed): op 2."), "{w}");
@@ -1515,6 +1517,12 @@ fn watch_emits_each_rejection_once() {
     assert_eq!(watch(false), 1);
     // Already remembered: a new watcher stays quiet...
     assert_eq!(watch(false), 0);
-    // ...and without the dedup every cycle repeats it.
-    assert!(watch(true) >= 2);
+    // ...and without the dedup every cycle repeats it. The hook is
+    // debug-only (#49/#55): a release watcher ignores it and stays quiet.
+    let n = watch(true);
+    if cfg!(debug_assertions) {
+        assert!(n >= 2, "{n}");
+    } else {
+        assert_eq!(n, 0);
+    }
 }

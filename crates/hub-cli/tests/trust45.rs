@@ -117,6 +117,77 @@ fn planted(e: &Env) -> (PathBuf, PathBuf, String) {
     (a, srv, url)
 }
 
+/// A running `watch --json` (#55): its stdout lines arrive on a channel,
+/// and the process is killed on drop, so a failing assertion never leaks
+/// a `barocss-hub watch`.
+struct Watch {
+    child: std::process::Child,
+    rx: std::sync::mpsc::Receiver<String>,
+    lines: Vec<String>,
+}
+
+impl Watch {
+    fn spawn(mut c: Command) -> Watch {
+        let mut child = c.stdout(Stdio::piped()).spawn().unwrap();
+        let out = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for l in BufReader::new(out).lines().map_while(Result::ok) {
+                let _ = tx.send(l);
+            }
+        });
+        Watch {
+            child,
+            rx,
+            lines: Vec::new(),
+        }
+    }
+
+    /// Collect lines until one matches `pred` (true) or `deadline` passes.
+    fn until(&mut self, deadline: Duration, pred: impl Fn(&str) -> bool) -> bool {
+        let t0 = Instant::now();
+        while t0.elapsed() < deadline {
+            if let Ok(l) = self.rx.recv_timeout(Duration::from_millis(50)) {
+                let hit = pred(&l);
+                self.lines.push(l);
+                if hit {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Collect whatever arrives during `d` (a lower bound for a negative
+    /// check: load can only lengthen what it observes, never fail it).
+    fn soak(&mut self, d: Duration) {
+        let _ = self.until(d, |_| false);
+    }
+
+    fn count(&self, needle: &str) -> usize {
+        self.lines.iter().filter(|l| l.contains(needle)).count()
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+const UNTRUSTED: &str = "\"event\":\"untrusted-remote\"";
+const WATCH_ARGS: &[&str] = &[
+    "watch",
+    "--json",
+    "--poll",
+    "50",
+    "--debounce",
+    "50",
+    "--sync",
+    "150",
+];
+
 #[test]
 fn planted_remote_is_refused_without_a_terminal_and_never_contacted() {
     let e = Env::new("refuse");
@@ -370,36 +441,16 @@ fn watch_skips_untrusted_file_remote() {
     )
     .unwrap();
     let tv = tree(&victim);
-    let w = e
-        .cmd(
-            &a,
-            &[
-                "watch",
-                "--json",
-                "--poll",
-                "50",
-                "--debounce",
-                "50",
-                "--sync",
-                "150",
-            ],
-        )
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(1500));
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg(w.id().to_string())
-        .status();
-    let out = w.wait_with_output().unwrap();
-    let s = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(
-        s.matches("\"event\":\"untrusted-remote\"").count(),
-        1,
-        "{s}"
+    let mut w = Watch::spawn(e.cmd(&a, WATCH_ARGS));
+    assert!(
+        w.until(Duration::from_secs(30), |l| l.contains(UNTRUSTED)),
+        "{:#?}",
+        w.lines
     );
-    assert!(!s.contains("\"event\":\"error\""), "{s}");
+    // Ten sync cycles later it has not repeated.
+    w.soak(Duration::from_millis(1500));
+    assert_eq!(w.count(UNTRUSTED), 1, "{:#?}", w.lines);
+    assert_eq!(w.count("\"event\":\"error\""), 0, "{:#?}", w.lines);
     assert_eq!(tree(&victim), tv);
 }
 
@@ -523,64 +574,23 @@ fn terminal_prompt_asks_on_first_contact() {
 fn watch_skips_untrusted_remote_with_one_event() {
     let e = Env::new("watch");
     let (a, _, _) = planted(&e);
-    let mut w = e
-        .cmd(
-            &a,
-            &[
-                "watch",
-                "--json",
-                "--poll",
-                "50",
-                "--debounce",
-                "50",
-                "--sync",
-                "150",
-            ],
-        )
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let out = w.stdout.take().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        for l in BufReader::new(out).lines().map_while(Result::ok) {
-            let _ = tx.send(l);
-        }
-    });
-    let mut lines = Vec::new();
-    let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_millis(2000) {
-        if let Ok(l) = rx.recv_timeout(Duration::from_millis(100)) {
-            lines.push(l);
-        }
-    }
-    let untrusted = lines
-        .iter()
-        .filter(|l| l.contains("\"event\":\"untrusted-remote\""))
-        .count();
-    assert_eq!(untrusted, 1, "{lines:#?}");
+    let mut w = Watch::spawn(e.cmd(&a, WATCH_ARGS));
     assert!(
-        !lines.iter().any(|l| l.contains("\"event\":\"error\"")),
-        "{lines:#?}"
+        w.until(Duration::from_secs(30), |l| l.contains(UNTRUSTED)),
+        "{:#?}",
+        w.lines
     );
-    assert!(lines[0].contains("\"sync\":true"), "{}", lines[0]);
+    w.soak(Duration::from_millis(1500));
+    assert_eq!(w.count(UNTRUSTED), 1, "{:#?}", w.lines);
+    assert_eq!(w.count("\"event\":\"error\""), 0, "{:#?}", w.lines);
+    assert!(w.lines[0].contains("\"sync\":true"), "{}", w.lines[0]);
     assert_eq!(e.contacts(), 0);
     // Trusted from another terminal: the running watcher syncs.
     e.ok(&a, &["remote", "trust", "origin"]);
-    let t0 = Instant::now();
-    let mut synced = false;
-    while t0.elapsed() < Duration::from_secs(15) && !synced {
-        if let Ok(l) = rx.recv_timeout(Duration::from_millis(100)) {
-            synced = l.contains("\"event\":\"synced\"");
-            lines.push(l);
-        }
-    }
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg(w.id().to_string())
-        .status();
-    let _ = w.wait();
-    assert!(synced, "{lines:#?}");
+    let synced = w.until(Duration::from_secs(30), |l| {
+        l.contains("\"event\":\"synced\"")
+    });
+    assert!(synced, "{:#?}", w.lines);
     assert!(e.contacts() >= 1);
 }
 
