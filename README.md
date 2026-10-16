@@ -158,3 +158,4 @@ with every hook set. Before shipping a binary, run
     scripts/check-no-test-hooks.sh [path/to/barocss-hub]
 
 (no argument: builds the release binary as dist does and checks it).
+`cargo test --workspace --release` is expected to pass.

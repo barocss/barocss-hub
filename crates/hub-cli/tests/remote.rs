@@ -1065,6 +1065,13 @@ fn rescue_online_checks_out_only_an_unchanged_tree() {
     let mut env = e.env();
     env.push(("HUB_TEST_RESCUE_EDIT_AFTER_SYNC", "late"));
     let j = ok_env(&c, &["reid", "--rescue", "--json"], &env);
+    if !cfg!(debug_assertions) {
+        // The hook is debug-only (#49/#55): a release binary ignores it,
+        // edits nothing, and checks out head as usual.
+        assert!(j.contains("\"checkout\":{\"done\":true"), "{j}");
+        assert!(!c.join("late").exists());
+        return;
+    }
     assert!(j.contains("\"checkout\":{\"done\":false"), "{j}");
     assert_eq!(
         fs::read(c.join("late")).unwrap(),
