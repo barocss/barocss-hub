@@ -1479,6 +1479,173 @@ impl Replica {
         &self.text.valid
     }
 
+    /// Load the lazy doc of one epoch (Issue #56: authoring and
+    /// materialization touch only the docs they need). `Err(blob)` if its
+    /// seed is missing or damaged.
+    pub fn load_text_doc(
+        &mut self,
+        node: NodeId,
+        epoch: OpId,
+        blobs: &dyn crate::text::BlobSource,
+    ) -> Result<(), BlobId> {
+        match self.text.docs.get_mut(&(node, epoch)) {
+            Some(slot) => crate::text::load_slot(slot, blobs),
+            None => Ok(()),
+        }
+    }
+
+    /// The winning epoch of `node` at the applied head and its blob
+    /// (7.4.3), as [`crate::text::winning_epoch`] of
+    /// `evaluate(self.ops())`: the text winner, else the greatest Applied
+    /// `SetContent`, else the node's `Create` (empty) for a live file.
+    pub fn content_epoch(&self, node: NodeId) -> Option<(OpId, BlobId)> {
+        if let Some(&(epoch, _)) = self.text.content.get(&node) {
+            return Some((epoch, self.epoch_blob_in(node, epoch)?));
+        }
+        for (o, _, out) in self.log.iter().rev() {
+            if let Payload::SetContent { node: n, blob } = &o.payload {
+                if *n == node && *out == Outcome::Applied {
+                    return Some((o.id, *blob));
+                }
+            }
+        }
+        (self.logged(node).is_some() && self.state().get(&node).is_some_and(|n| n.kind == Kind::File))
+            .then(|| (node, BlobId::empty()))
+    }
+
+    /// Content heads of `node` at the applied head (7.4.1 `seen`), as
+    /// [`crate::text::content_heads`] of `evaluate(self.ops())`.
+    pub fn content_heads(&self, node: NodeId) -> BTreeSet<OpId> {
+        let cs: Vec<OpId> = self
+            .log
+            .iter()
+            .filter(|(o, _, out)| match &o.payload {
+                Payload::SetContent { node: n, .. } => *n == node && *out == Outcome::Applied,
+                Payload::TextEdit(t) => t.node == node && self.text.valid.contains(&o.id),
+                _ => false,
+            })
+            .map(|(o, _, _)| o.id)
+            .collect();
+        let Some(&min) = cs.first() else {
+            return BTreeSet::new();
+        };
+        // Everything strictly before some content op: walk deps down to
+        // the smallest content op (a dep is `<` its op, so nothing below
+        // `min` can reach a content op).
+        let mut below: BTreeSet<OpId> = BTreeSet::new();
+        let mut stack: Vec<OpId> = Vec::new();
+        for c in &cs {
+            if let Some((o, _, _)) = self.logged(*c) {
+                stack.extend(o.deps.iter().copied().filter(|d| *d >= min));
+            }
+        }
+        while let Some(x) = stack.pop() {
+            if !below.insert(x) {
+                continue;
+            }
+            if let Some((o, _, _)) = self.logged(x) {
+                stack.extend(o.deps.iter().copied().filter(|d| *d >= min));
+            }
+        }
+        cs.into_iter().filter(|c| !below.contains(c)).collect()
+    }
+
+    /// Author a save of `node` against the applied head (7.5.1, Issue #56):
+    /// [`crate::text::author_text_edit`] with `base_ops` = every applied
+    /// op, without a full evaluation. The epoch's doc must be loaded
+    /// ([`Replica::load_text_doc`]); `None` for a no-op save, an
+    /// unavailable or non-UTF-8 epoch text, or a pending op.
+    pub fn author_text_edit(
+        &self,
+        node: NodeId,
+        saved: &[u8],
+        blobs: &dyn crate::text::BlobSource,
+    ) -> Option<crate::text::TextEdit> {
+        if !self.pending.is_empty() {
+            return None;
+        }
+        let (epoch, blob) = self.content_epoch(node)?;
+        let fresh;
+        let doc = match self.text.docs.get(&(node, epoch)) {
+            Some(crate::text::DocSlot::Doc(d)) => &**d,
+            Some(_) => return None,
+            None => {
+                let b = crate::text::fetch(blobs, &blob)?;
+                std::str::from_utf8(&b).ok()?;
+                fresh = crate::text::TextDoc::new(epoch, &b);
+                &fresh
+            }
+        };
+        let all = |_: OpId| true;
+        let base = doc.visible_runs(&all);
+        let (del, ins) = crate::text::diff_line(&base, saved, &|l| doc.successor_at(l, &all))?;
+        Some(crate::text::TextEdit {
+            node,
+            epoch,
+            seen: self.content_heads(node),
+            del,
+            ins,
+        })
+    }
+
+    /// Bytes of a derived text blob this replica holds (Issue #56): a text
+    /// node's head content, or the loser blob of a text content conflict
+    /// (its epoch materialized at the loser's causal past). `None` if
+    /// `id` is neither or its doc is not loaded.
+    pub fn derived_blob(&self, id: &BlobId) -> Option<Vec<u8>> {
+        for (node, (epoch, blob)) in &self.text.content {
+            if blob == id {
+                if let Some(d) = self.text_doc(*node, *epoch) {
+                    return Some(d.materialize_head());
+                }
+            }
+        }
+        for cs in self.text.conflicts.values() {
+            for c in cs {
+                let Conflict::Content {
+                    node,
+                    loser,
+                    loser_blob,
+                    ..
+                } = c
+                else {
+                    continue;
+                };
+                if loser_blob != id {
+                    continue;
+                }
+                let Some((
+                    Op {
+                        payload: Payload::TextEdit(t),
+                        ..
+                    },
+                    _,
+                    _,
+                )) = self.logged(*loser)
+                else {
+                    continue;
+                };
+                let Some(d) = self.text_doc(*node, t.epoch) else {
+                    continue;
+                };
+                let mut past: HashSet<OpId> = HashSet::new();
+                let mut stack = vec![*loser];
+                while let Some(x) = stack.pop() {
+                    if past.insert(x) {
+                        if let Some((o, _, _)) = self.logged(x) {
+                            stack.extend(o.deps.iter().copied());
+                        }
+                    }
+                }
+                let b = d.materialize(&|o| past.contains(&o));
+                if BlobId::of(&b) == *id {
+                    return Some(b);
+                }
+            }
+        }
+        None
+    }
+
     fn logged(&self, id: OpId) -> Option<&(Op, Undo, Outcome)> {
         self.log
             .binary_search_by_key(&id, |(o, _, _)| o.id)

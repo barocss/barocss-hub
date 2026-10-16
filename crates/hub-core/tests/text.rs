@@ -640,7 +640,7 @@ fn text_generator_coverage_floor() {
 }
 
 /// Issue #54: everything the replica derives equals `evaluate_with`.
-fn replica_same(r: &Replica, ops: &[Op], blobs: &Blobs) -> Result<(), TestCaseError> {
+fn replica_same(r: &Replica, ops: &[Op], blobs: &Blobs, file: NodeId) -> Result<(), TestCaseError> {
     let ev = evaluate_with(ops.iter(), blobs);
     let map = map_of(ops);
     prop_assert_eq!(r.state(), &ev.state);
@@ -667,6 +667,35 @@ fn replica_same(r: &Replica, ops: &[Op], blobs: &Blobs) -> Result<(), TestCaseEr
             let rd = r.text_doc(*node, *epoch);
             prop_assert!(rd.is_some(), "doc {:?}", (node, epoch));
             prop_assert_eq!(rd.unwrap().elements(), d.elements());
+        }
+    }
+    // Issue #56: head-only authoring helpers equal the evaluate-based ones.
+    if r.pending_len() == 0 {
+        prop_assert_eq!(r.content_epoch(file), winning_epoch(&map, &ev, file));
+        prop_assert_eq!(r.content_heads(file), content_heads(&map, &ev, file));
+        if let Some(nt) = ev.text.content.get(&file) {
+            if let Some(b) = &nt.bytes {
+                for saved in [b.clone(), [b.as_slice(), b"x\n"].concat(), b"new\n".to_vec()] {
+                    prop_assert_eq!(
+                        r.author_text_edit(file, &saved, blobs),
+                        author_text_edit(&map, &ev, blobs, file, &saved)
+                    );
+                }
+            }
+        }
+        for c in &ev.conflicts {
+            if let Conflict::Content { loser_blob, winner_blob, .. } = c {
+                for id in [loser_blob, winner_blob] {
+                    if let Some(want) = ev.text.blobs.get(id) {
+                        prop_assert_eq!(r.derived_blob(id), Some(want.clone()));
+                    }
+                }
+            }
+        }
+        for (n, nt) in &ev.text.content {
+            if let (Some(b), Some(_)) = (&nt.bytes, ev.text.doc(*n, nt.epoch)) {
+                prop_assert_eq!(r.derived_blob(&nt.blob), Some(b.clone()));
+            }
         }
     }
     Ok(())
@@ -708,13 +737,13 @@ proptest! {
                 }
             }
             r.receive_all_with(batch, blobs);
-            replica_same(&r, &got, blobs)?;
+            replica_same(&r, &got, blobs, sim.file)?;
             if rng.below(3) == 0 {
                 let snap = r.encode_snapshot().expect("closed replica");
                 let back = Replica::decode_snapshot(&snap).map_err(TestCaseError::fail)?;
                 prop_assert_eq!(back.encode_snapshot().unwrap(), snap);
                 r = back;
-                replica_same(&r, &got, blobs)?;
+                replica_same(&r, &got, blobs, sim.file)?;
             }
         }
     }
