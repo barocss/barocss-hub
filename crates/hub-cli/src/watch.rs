@@ -334,7 +334,14 @@ struct Step {
     recorded: Option<crate::Recorded>,
     checked_out: Option<crate::CheckedOut>,
     head: Option<hub_core::checkpoint::VersionId>,
+    /// `concurrent-edit` notices that appeared since the last step (Issue
+    /// #56, Text-CRDT 7.8): the JSON fields and the human line.
+    notices: Vec<(J, String)>,
 }
+
+/// Notices already reported by this watcher.
+static NOTICES_SEEN: std::sync::Mutex<Option<std::collections::BTreeSet<hub_core::text::Notice>>> =
+    std::sync::Mutex::new(None);
 
 /// One locked step: resume, record (allow behind), else checkout head.
 fn step(hub: &Path, out: &mut dyn Write, warn: &mut dyn Write) -> Result<Step, Error> {
@@ -344,6 +351,25 @@ fn step(hub: &Path, out: &mut dyn Write, warn: &mut dyn Write) -> Result<Step, E
         s.head = Some(hub_core::checkpoint::VersionId::of_frontier(
             &repo.head_frontier(),
         ));
+        let now = repo.notices();
+        let mut seen = NOTICES_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh: std::collections::BTreeSet<_> = match &*seen {
+            Some(old) => now.difference(old).cloned().collect(),
+            None => now.clone(),
+        };
+        if !fresh.is_empty() {
+            let proj = hub_core::projection::project(repo.state());
+            let lines = repo.notice_lines(&proj);
+            let all: Vec<_> = now.iter().cloned().collect();
+            if let J::Arr(objs) = crate::json::notices(&proj, &now) {
+                for ((n, o), l) in all.iter().zip(objs).zip(lines) {
+                    if fresh.contains(n) {
+                        s.notices.push((o, l));
+                    }
+                }
+            }
+        }
+        *seen = Some(now);
     }
     // Issue #33: refresh `.hub/snapshot` when due.
     if let Some(w) = repo.maybe_snapshot() {
@@ -521,6 +547,15 @@ fn step_events(io: &mut Io, s: &Step) -> Result<(), Error> {
         let mut f = crate::json::checkout_fields(c);
         f.push(("reason", J::s("incoming")));
         io.event("checked-out", f)?;
+    }
+    for (o, line) in &s.notices {
+        if io.json {
+            let J::Obj(f) = o else { continue };
+            let f: Vec<(&str, J)> = f.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            io.event("notice", f)?;
+        } else {
+            writeln!(io.out, "{line}")?;
+        }
     }
     Ok(())
 }

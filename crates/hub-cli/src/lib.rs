@@ -769,6 +769,40 @@ impl Repo {
         evaluate_with(self.store.values(), &self.disk_blobs()).conflicts
     }
 
+    /// `concurrent-edit` notices of the head (Text-CRDT 7.8, Issue #56).
+    pub fn notices(&self) -> BTreeSet<hub_core::text::Notice> {
+        if oracle() {
+            return evaluate_with(self.store.values(), &self.disk_blobs())
+                .text
+                .notices;
+        }
+        self.replica.text_notices()
+    }
+
+    /// Human notice lines (`status`, `watch`).
+    pub fn notice_lines(&self, proj: &Projection) -> Vec<String> {
+        self.notices()
+            .iter()
+            .map(|n| match n {
+                hub_core::text::Notice::ConcurrentEdit { node, ops, lines } => {
+                    let mut by: Vec<String> = ops
+                        .iter()
+                        .map(|o| format!("{:032x}", o.replica.0)[..8].to_string())
+                        .collect();
+                    by.sort();
+                    by.dedup();
+                    format!(
+                        "notice: concurrent edits merged in {} lines {}-{} (by {})",
+                        proj.paths.get(node).map_or("?", |p| p.as_str()),
+                        lines.0,
+                        lines.1,
+                        by.join(", ")
+                    )
+                }
+            })
+            .collect()
+    }
+
     /// State after appending `ops` (greater than every stored op), for
     /// planning before the append: the replica's tail preview, else a full
     /// `evaluate` (Issue #32).
@@ -2486,12 +2520,25 @@ pub fn run(
         }
         ["cat-blob", b] => {
             let blob = json::parse_blob(b)?;
-            let bytes = repo.blobs()?.get(&blob).map_err(|e| match e {
-                blobs::BlobError::Missing(_) => {
-                    Error::new(Code::NoSuchBlob, format!("no such blob: {b}"))
+            let bytes = match repo.blobs()?.get(&blob) {
+                Ok(b) => b,
+                // Issue #56: a derived text blob (a merged head or a text
+                // loser named by `status`) not written yet.
+                Err(blobs::BlobError::Missing(_)) => {
+                    let src = repo.disk_blobs();
+                    let ids = repo.replica.derived_blob_ids();
+                    let mut got = None;
+                    for (node, epoch, id) in ids {
+                        if id == blob {
+                            let _ = repo.replica.load_text_doc(node, epoch, &src);
+                            got = repo.replica.derived_blob(&blob);
+                            break;
+                        }
+                    }
+                    got.ok_or_else(|| Error::new(Code::NoSuchBlob, format!("no such blob: {b}")))?
                 }
-                e => blob_error(e),
-            })?;
+                Err(e) => return Err(blob_error(e)),
+            };
             if json {
                 json::emit(out, json::blob_doc(blob, &bytes))?;
             } else {
@@ -2539,6 +2586,9 @@ pub fn run(
                 for c in cs {
                     writeln!(out, "  {c}")?;
                 }
+            }
+            for l in repo.notice_lines(&proj) {
+                writeln!(out, "{l}")?;
             }
             let (sw, npend) = sync::warnings_view(&repo)?;
             if !sw.is_empty() {

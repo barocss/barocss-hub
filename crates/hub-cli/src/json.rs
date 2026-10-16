@@ -302,6 +302,37 @@ fn entries(state: &State, proj: &Projection, under: NodeId) -> J {
     )
 }
 
+/// Text-CRDT 7.8 `concurrent-edit` notices (Issue #56): informational,
+/// never blocking, not conflicts.
+pub(crate) fn notices(
+    proj: &Projection,
+    ns: &std::collections::BTreeSet<hub_core::text::Notice>,
+) -> J {
+    J::Arr(
+        ns.iter()
+            .map(|n| match n {
+                hub_core::text::Notice::ConcurrentEdit { node, ops, lines } => J::obj(vec![
+                    ("kind", J::s("concurrent-edit")),
+                    ("node", id(*node)),
+                    ("path", J::opt(proj.paths.get(node).map(J::s))),
+                    ("ops", J::Arr(ops.iter().map(|o| id(*o)).collect())),
+                    ("lines", J::Arr(vec![J::n(lines.0), J::n(lines.1)])),
+                    (
+                        "authors",
+                        J::strs(
+                            ops.iter()
+                                .map(|o| format!("{:032x}", o.replica.0))
+                                .collect::<std::collections::BTreeSet<_>>()
+                                .into_iter()
+                                .collect::<Vec<_>>(),
+                        ),
+                    ),
+                ]),
+            })
+            .collect(),
+    )
+}
+
 fn conflicts(proj: &Projection, cs: &std::collections::BTreeSet<Conflict>) -> J {
     let path = |n: NodeId| J::opt(proj.paths.get(&n).map(J::s));
     let mut v = Vec::new();
@@ -678,6 +709,7 @@ fn status_doc(repo: &Repo, proj: &Projection, warn: &mut dyn Write) -> Result<J,
                 ]),
             ),
             ("conflicts", conflicts(proj, &repo.conflicts())),
+            ("notices", notices(proj, &repo.notices())),
             ("sync_warnings", sync_warnings(&sw)),
             ("pending_ops", J::n(npend)),
             ("remotes", remotes_j),
