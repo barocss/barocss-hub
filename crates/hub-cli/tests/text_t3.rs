@@ -659,3 +659,65 @@ fn watch_merge_survives_kill_at_every_step() {
         assert!(crashed.contains(m), "{m} never hit: {crashed:?}");
     }
 }
+
+/// 7.8: `watch --json` emits a `notice` event (once) for a notice it has
+/// not reported, with the `status --json` keys.
+#[test]
+fn watch_emits_notice_event() {
+    let net = Net::new("wnotice", "file", 2);
+    net.seed("f.txt", b"a\nb\nc\n");
+    fs::write(net.r(0).join("f.txt"), b"a\nB0\nc\n").unwrap();
+    fs::write(net.r(1).join("f.txt"), b"a\nB1\nc\n").unwrap();
+    ok(net.r(0), &["record"]);
+    ok(net.r(1), &["record"]);
+    net.sync(0);
+    net.sync(1);
+    let w = Watcher::start(net.r(1), 100, &[]);
+    wait_for("notice event", || !w.of("notice").is_empty());
+    wait_for("merged", || {
+        js(net.r(1), &["status"]).get("workdir").get("state").str() == "at-head"
+    });
+    let evs = w.stop();
+    let ns: Vec<&V> = evs
+        .iter()
+        .filter(|e| e.get("event").str() == "notice")
+        .collect();
+    assert_eq!(ns.len(), 1, "{ns:?}");
+    assert_eq!(ns[0].get("kind").str(), "concurrent-edit");
+    assert_eq!(ns[0].get("path").str(), "f.txt");
+    assert_eq!(ns[0].get("ops").arr().len(), 2);
+}
+
+/// 7.9 last bullet: a pre-upgrade `content` conflict (two concurrent
+/// whole-file saves) resolved with "keep mine" (the loser's text saved
+/// again) is a `TextEdit` on the winner's epoch, and the conflict clears.
+#[test]
+fn keep_mine_on_a_bytes_conflict_is_a_text_edit_on_the_winner_epoch() {
+    let net = Net::new("keepmine", "file", 2);
+    fs::write(net.r(0).join(".hubattributes"), b"f.txt binary\n").unwrap();
+    net.seed("f.txt", b"base\n");
+    fs::write(net.r(0).join("f.txt"), b"zero\n").unwrap();
+    fs::write(net.r(1).join("f.txt"), b"one\n").unwrap();
+    ok(net.r(0), &["record"]);
+    ok(net.r(1), &["record"]);
+    net.converge();
+    assert!(conflict_kinds(net.r(1)).contains(&"content".to_string()));
+    let cs = js(net.r(1), &["status"]).get("conflicts").arr().to_vec();
+    let c = cs
+        .iter()
+        .find(|c| c.get("kind").str() == "content")
+        .unwrap();
+    let loser = ok(net.r(1), &["cat-blob", c.get("loser_blob").str()]);
+    // Upgrade: the override goes away (text again); keep the loser's text.
+    fs::remove_file(net.r(1).join(".hubattributes")).unwrap();
+    fs::write(net.r(1).join("f.txt"), &loser).unwrap();
+    ok(net.r(1), &["record"]);
+    assert_eq!(kinds(net.r(1), "f.txt")[0], "text-edit");
+    net.converge();
+    assert!(
+        conflict_kinds(net.r(0)).is_empty(),
+        "{:?}",
+        conflict_kinds(net.r(0))
+    );
+    assert_eq!(net.same("f.txt"), loser.as_bytes());
+}
