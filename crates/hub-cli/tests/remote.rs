@@ -694,6 +694,18 @@ fn all_bytes(d: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 /// The #46 repro up to the copy's refused sync. `edit` runs in the copy
 /// before its diverging record. Returns (env, server, original, copy).
 fn diverged(tag: &str, via: &str, edit: impl Fn(&Path)) -> (Env, PathBuf, PathBuf, PathBuf) {
+    diverged_with(tag, via, true, edit)
+}
+
+/// [`diverged`]; `bytes`: `f` is forced binary by `.hubattributes`, so
+/// its concurrent saves stay whole-blob LWW (the #49 expectations); else
+/// they are `TextEdit`s that merge (Issue #56).
+fn diverged_with(
+    tag: &str,
+    via: &str,
+    bytes: bool,
+    edit: impl Fn(&Path),
+) -> (Env, PathBuf, PathBuf, PathBuf) {
     let e = Env::new(tag);
     let srv = e.bare("srv.hub");
     let a = e.repo("a");
@@ -708,6 +720,9 @@ fn diverged(tag: &str, via: &str, edit: impl Fn(&Path)) -> (Env, PathBuf, PathBu
     fs::write(a.join("f"), "base\n").unwrap();
     fs::write(a.join("g"), "gee\n").unwrap();
     fs::write(a.join("h"), "aitch\n").unwrap();
+    if bytes {
+        fs::write(a.join(".hubattributes"), "f binary\n").unwrap();
+    }
     ok(&a, &["record"]);
     e.sync(&a, "origin");
     let c = e.t.join("c");
@@ -717,9 +732,9 @@ fn diverged(tag: &str, via: &str, edit: impl Fn(&Path)) -> (Env, PathBuf, PathBu
         .unwrap();
     assert!(st.success());
     ok(&c, &["remote", "trust", "origin"]);
-    fs::write(a.join("f"), "A").unwrap();
+    fs::write(a.join("f"), if bytes { "A" } else { "A\n" }).unwrap();
     ok(&a, &["record"]);
-    fs::write(c.join("f"), "BB").unwrap();
+    fs::write(c.join("f"), if bytes { "BB" } else { "BB\n" }).unwrap();
     edit(&c);
     ok(&c, &["record"]);
     e.sync(&a, "origin");
@@ -922,6 +937,27 @@ fn rescue_reproduces_deletes_and_moves() {
     );
     assert_eq!(t["h2"], b"aitch\n");
     assert_eq!(t["new"], b"n\n");
+}
+
+/// Issue #56 (Text-CRDT 7.4.4): a text file is re-authored as a
+/// `TextEdit` against the store minus R, so the rescued save merges with
+/// the concurrent server edit instead of overwriting it; offline too.
+#[test]
+fn rescue_reauthors_text_as_text_edit() {
+    let (e, srv, _a, c) = diverged_with("res56-text", "file", false, |_| {});
+    ok_env(&c, &["reid", "--rescue", "--offline"], &e.env());
+    let h = ok(&c, &["log", "--path", "f", "--json"]);
+    assert!(h.contains("\"kind\":\"text-edit\""), "{h}");
+    let o = hub_env(&c, &["sync"], &e.env());
+    assert_eq!(o.status.code(), Some(0));
+    let t = server_tree(&e, &srv, "check");
+    assert!(
+        t["f"] == b"A\nBB\n" || t["f"] == b"BB\nA\n",
+        "{:?}",
+        String::from_utf8_lossy(&t["f"])
+    );
+    ok(&c, &["checkout"]);
+    assert_eq!(fs::read(c.join("f")).unwrap(), t["f"]);
 }
 
 /// `--dry-run` (human and JSON) changes nothing.

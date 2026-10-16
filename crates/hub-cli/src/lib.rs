@@ -1371,6 +1371,22 @@ fn not_at_head(repo: &Repo, idx: &Index) -> Error {
 /// as unrecorded (never clean), so no checkout deletes or overwrites it
 /// without `--force`.
 fn load_index(repo: &Repo, warn: &mut dyn Write) -> Result<Index, Error> {
+    // Issue #56: a record that authored `TextEdit`s wrote `index.next`
+    // (the index of the version it recorded) before appending: its ops
+    // are durable iff they are in the log. Promote it, or drop it. Never
+    // re-authoring an already recorded text save is what makes a rerun
+    // after kill -9 idempotent (D-056).
+    let next = Index::next_path(&repo.dir);
+    if fs::symlink_metadata(&next).is_ok() {
+        let n = Index::load_from(&next);
+        match n {
+            Ok(n) if !n.base.is_empty() && n.base.iter().all(|id| repo.store.contains_key(id)) => {
+                fs::rename(&next, Index::path(&repo.dir))?;
+                fs::File::open(&repo.dir)?.sync_all()?;
+            }
+            _ => fs::remove_file(&next)?,
+        }
+    }
     let idx = Index::load(&repo.dir)?;
     if idx.base.iter().any(|id| !repo.store.contains_key(id)) {
         writeln!(
@@ -1792,7 +1808,36 @@ pub(crate) fn record(
             ignored,
         },
     )?;
+    // Issue #56 (D-056, #33 bar): a text save must never be authored
+    // twice, so the index of the recorded version goes in place as the
+    // ops become durable (`index.next`, promoted by `load_index` after a
+    // crash). Then the plan materializes the (merged) head as usual.
+    let text = ops
+        .iter()
+        .any(|o| matches!(o.payload, Payload::TextEdit(_)));
+    if text {
+        let deps: BTreeSet<NodeId> = ops.iter().flat_map(|o| o.deps.iter().copied()).collect();
+        let mut base: Vec<NodeId> = idx
+            .base
+            .iter()
+            .copied()
+            .chain(ops.iter().map(|o| o.id))
+            .filter(|i| !deps.contains(i))
+            .collect();
+        base.sort();
+        base.dedup();
+        let mut next = mid.clone();
+        next.base = base;
+        next.save_to(&Index::next_path(&repo.dir))?;
+        durable::crash_point(durable::RECORD_INDEX_NEXT);
+    }
     repo.append_ops(ops)?;
+    if text {
+        durable::crash_point(durable::RECORD_OPS_APPENDED);
+        fs::rename(Index::next_path(&repo.dir), Index::path(&repo.dir))?;
+        fs::File::open(&repo.dir)?.sync_all()?;
+        durable::crash_point(durable::RECORD_INDEX_PROMOTED);
+    }
     print_warnings(warn, &wd::apply(plan, &root, &repo.dir)?)?;
     writeln!(out, "recorded {} change(s):", changes.len())?;
     for l in wd::render_changes(&changes, &idx, &w) {
@@ -1927,6 +1972,15 @@ pub(crate) fn checkout(
         },
         (None, None) => repo.head(),
     };
+    // D-056 (Issue #56): checking out head over dirty text files records
+    // them first (as `TextEdit`s against the working directory's version,
+    // durable before anything is written), then materializes the merge.
+    let v = if id.is_none() && !force && merge_dirty_text(repo, out, warn)? {
+        repo.head()
+    } else {
+        v
+    };
+    let ix = repo.index();
     let ev = repo.eval_at(&v);
     // Issue #56: merged text heads (and text losers) are derived blobs.
     persist_eval_blobs(&ev, &repo.dir)?;
@@ -1998,6 +2052,75 @@ pub(crate) fn checkout(
         removed,
         at_head,
     })
+}
+
+/// D-056: if every unrecorded working-directory change is a modified
+/// text file whose head content is text too, record them (watch's
+/// behind-record: `TextEdit`s with deps = the index base) and return true.
+/// Otherwise (any bytes file, add, delete, rename, a pinned or interrupted
+/// checkout, bytes mode) record nothing: checkout then refuses dirty files
+/// as before (#19/#26, the flip exception).
+fn merge_dirty_text(
+    repo: &mut Repo,
+    out: &mut dyn Write,
+    warn: &mut dyn Write,
+) -> Result<bool, Error> {
+    // Record's own report goes nowhere: checkout prints (or emits) its own.
+    if wd::interrupted(&repo.dir)?.is_some() || crate::watch::pinned(&repo.dir)?.is_some() {
+        return Ok(false);
+    }
+    if textmode::bytes_mode_reason(&repo.dir)?.is_some() {
+        return Ok(false);
+    }
+    let root = repo.root();
+    let mut sink = Vec::new();
+    let idx = load_index(repo, &mut sink)?;
+    if idx.base.is_empty() || idx.base == repo.head_frontier() {
+        return Ok(false);
+    }
+    let mut ws = Vec::new();
+    let (mut w, ignored) = wd::scan_all(&root, &idx, &mut ws)?;
+    w.retain(|p, _| !ignored.contains(p));
+    if !wd::blocked(&idx, &w).is_empty() {
+        return Ok(false);
+    }
+    let changes = wd::diff(&idx, &w);
+    if changes.is_empty() {
+        return Ok(false);
+    }
+    let (attrs, _) = textmode::Attributes::load(&root)?;
+    repo.persist_derived()?;
+    let blobs = repo.blobs()?;
+    let proj = project(repo.state());
+    for c in &changes {
+        let Change::Modified(p) = c else {
+            return Ok(false);
+        };
+        let mode = attrs.mode(p);
+        let node = idx.entries[p].0;
+        let head_blob = proj.blobs.get(&node).copied().unwrap_or_else(BlobId::empty);
+        let Ok(head) = blobs.get(&head_blob) else {
+            return Ok(false);
+        };
+        let Ok(dirty) = fs::read(root.join(p)) else {
+            return Ok(false);
+        };
+        if !textmode::is_text(&head, mode) || !textmode::is_text(&dirty, mode) {
+            return Ok(false);
+        }
+    }
+    let mut quiet = Vec::new();
+    let r = record(repo, None, true, &mut quiet, warn)?;
+    let _ = out;
+    if let Some(r) = &r {
+        let paths: Vec<&str> = r.changes.iter().map(|c| c.path.as_str()).collect();
+        writeln!(
+            warn,
+            "note: recorded unrecorded text edits before checking out, then merged them: {}",
+            paths.join(", ")
+        )?;
+    }
+    Ok(r.is_some())
 }
 
 pub const HELP: &str = "\

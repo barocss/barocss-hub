@@ -69,6 +69,15 @@ pub const FILES_BARRIERED: &str = "files-barriered";
 /// barriered, index not saved.
 pub const FILES_RENAMED: &str = "files-renamed";
 
+/// Record of `TextEdit`s (Issue #56, D-056): `index.next` written, ops
+/// not appended yet.
+pub const RECORD_INDEX_NEXT: &str = "record-index-next";
+/// Record of `TextEdit`s: ops durable, `index.next` not promoted yet.
+pub const RECORD_OPS_APPENDED: &str = "record-ops-appended";
+/// Record of `TextEdit`s: `index.next` promoted, working files not yet
+/// materialized (the merged head of a behind record).
+pub const RECORD_INDEX_PROMOTED: &str = "record-index-promoted";
+
 /// Trust store (#46): merged store renamed into place and its directory
 /// synced, the legacy macOS file not yet removed.
 pub const TRUST_MOVED: &str = "trust-moved";

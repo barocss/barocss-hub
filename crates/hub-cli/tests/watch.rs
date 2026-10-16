@@ -287,16 +287,18 @@ fn two_watchers_quiesce() {
 
 #[test]
 fn concurrent_same_file_edits_conflict_and_converge() {
+    // Binary content (NUL): whole-blob saves conflict (Issue #56: text
+    // saves merge, see `concurrent_text_edits_merge_under_watch`).
     let (t, a, b) = pair("conflict");
-    fs::write(a.join("f"), b"base").unwrap();
+    fs::write(a.join("f"), b"base\0").unwrap();
     let _wa = Watcher::start(&a, &[]);
     let _wb = Watcher::start(&b, &[]);
     wait_for("base in B", || {
-        read(&b.join("f")).as_deref() == Some(b"base")
+        read(&b.join("f")).as_deref() == Some(b"base\0")
     });
     wait_for("clean", || clean(&a) && clean(&b));
-    fs::write(a.join("f"), b"edit A").unwrap();
-    fs::write(b.join("f"), b"edit B").unwrap();
+    fs::write(a.join("f"), b"edit A\0").unwrap();
+    fs::write(b.join("f"), b"edit B\0").unwrap();
     report(
         "conflict converge",
         wait_for("same bytes, conflict in both", || {
@@ -310,29 +312,30 @@ fn concurrent_same_file_edits_conflict_and_converge() {
     // Neither edit is lost: both blobs are named by the conflict.
     for d in [&a, &b] {
         let s = ok(d, &["status"]);
-        assert!(s.contains(&hex_sha256(b"edit A")[..8]), "{s}");
-        assert!(s.contains(&hex_sha256(b"edit B")[..8]), "{s}");
+        assert!(s.contains(&hex_sha256(b"edit A\0")[..8]), "{s}");
+        assert!(s.contains(&hex_sha256(b"edit B\0")[..8]), "{s}");
     }
     let _ = fs::remove_dir_all(t);
 }
 
 #[test]
 fn unrecorded_edit_is_never_clobbered_by_incoming_ops() {
+    // Binary content (NUL), see above.
     let (t, a, b) = pair("noclobber");
-    fs::write(a.join("f"), b"base").unwrap();
+    fs::write(a.join("f"), b"base\0").unwrap();
     {
         let _wa = Watcher::start(&a, &[]);
         let _wb = Watcher::start(&b, &[]);
         wait_for("base in B", || {
-            read(&b.join("f")).as_deref() == Some(b"base")
+            read(&b.join("f")).as_deref() == Some(b"base\0")
         });
         wait_for("clean", || clean(&a) && clean(&b));
     }
     // A's watcher is down; A edits locally (unrecorded) while B's edit is
     // delivered into A's log.
-    fs::write(a.join("f"), b"unrecorded A").unwrap();
+    fs::write(a.join("f"), b"unrecorded A\0").unwrap();
     fs::write(a.join("new"), b"only in A").unwrap();
-    fs::write(b.join("f"), b"B edit").unwrap();
+    fs::write(b.join("f"), b"B edit\0").unwrap();
     ok(&b, &["record"]);
     ok(&b, &["sync", "../a"]);
     assert!(ok(&a, &["status"]).contains("behind head"));
@@ -351,10 +354,69 @@ fn unrecorded_edit_is_never_clobbered_by_incoming_ops() {
     // conflict names both blobs, and A's bytes are among the head bytes or
     // the conflict loser.
     let st = ok(&a, &["status"]);
-    let blob_a = hex_sha256(b"unrecorded A");
-    let blob_b = hex_sha256(b"B edit");
+    let blob_a = hex_sha256(b"unrecorded A\0");
+    let blob_b = hex_sha256(b"B edit\0");
     assert!(st.contains(&blob_a[..8]), "{st}");
     assert!(st.contains(&blob_b[..8]), "{st}");
+    let _ = fs::remove_dir_all(t);
+}
+
+/// Issue #56 (D-056): concurrent edits of different lines of a text file
+/// under two watchers merge with no conflict; the merge is written to
+/// both working directories.
+#[test]
+fn concurrent_text_edits_merge_under_watch() {
+    let (t, a, b) = pair("textmerge");
+    fs::write(a.join("f"), b"one\ntwo\nthree\n").unwrap();
+    let _wa = Watcher::start(&a, &[]);
+    let _wb = Watcher::start(&b, &[]);
+    wait_for("base in B", || {
+        read(&b.join("f")).as_deref() == Some(b"one\ntwo\nthree\n")
+    });
+    wait_for("clean", || clean(&a) && clean(&b));
+    fs::write(a.join("f"), b"ONE\ntwo\nthree\n").unwrap();
+    fs::write(b.join("f"), b"one\ntwo\nTHREE\n").unwrap();
+    wait_for("merged in both", || {
+        read(&a.join("f")).as_deref() == Some(b"ONE\ntwo\nTHREE\n")
+            && read(&b.join("f")).as_deref() == Some(b"ONE\ntwo\nTHREE\n")
+            && clean(&a)
+            && clean(&b)
+    });
+    for d in [&a, &b] {
+        assert!(ok(d, &["status"]).contains("conflicts: none"));
+    }
+    let _ = fs::remove_dir_all(t);
+}
+
+/// Issue #56 (D-056): an unrecorded text edit is recorded as a
+/// `TextEdit` against the working directory's version, then the merge
+/// with the delivered remote edit is materialized: nothing is lost.
+#[test]
+fn unrecorded_text_edit_merges_with_incoming_ops() {
+    let (t, a, b) = pair("textnoclobber");
+    fs::write(a.join("f"), b"base\n").unwrap();
+    {
+        let _wa = Watcher::start(&a, &[]);
+        let _wb = Watcher::start(&b, &[]);
+        wait_for("base in B", || {
+            read(&b.join("f")).as_deref() == Some(b"base\n")
+        });
+        wait_for("clean", || clean(&a) && clean(&b));
+    }
+    fs::write(a.join("f"), b"base\nA line\n").unwrap();
+    fs::write(b.join("f"), b"B line\nbase\n").unwrap();
+    ok(&b, &["record"]);
+    ok(&b, &["sync", "../a"]);
+    assert!(ok(&a, &["status"]).contains("behind head"));
+    let _wa = Watcher::start(&a, &[]);
+    let _wb = Watcher::start(&b, &[]);
+    wait_for("merged", || {
+        read(&a.join("f")).as_deref() == Some(b"B line\nbase\nA line\n")
+            && read(&b.join("f")).as_deref() == Some(b"B line\nbase\nA line\n")
+            && clean(&a)
+            && clean(&b)
+    });
+    assert!(ok(&a, &["status"]).contains("conflicts: none"));
     let _ = fs::remove_dir_all(t);
 }
 

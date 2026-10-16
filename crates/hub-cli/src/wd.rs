@@ -118,8 +118,20 @@ impl Index {
         hub_dir.join("index")
     }
 
+    /// Issue #56: the index a record that authors `TextEdit`s installs
+    /// once its ops are durable (two-phase: written before the append,
+    /// promoted after it). See `crate::load_index`.
+    pub fn next_path(hub_dir: &Path) -> PathBuf {
+        hub_dir.join("index.next")
+    }
+
     pub fn load(hub_dir: &Path) -> Result<Index, Error> {
-        let p = Self::path(hub_dir);
+        Self::load_from(&Self::path(hub_dir))
+    }
+
+    /// [`Index::load`] of the index file at `p`.
+    pub fn load_from(p: &Path) -> Result<Index, Error> {
+        let p = p.to_path_buf();
         let text = match fs::read_to_string(&p) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Index::default()),
@@ -187,6 +199,11 @@ impl Index {
     /// an edit landing in the same coarse mtime tick as hub's stat can never
     /// be trusted as clean.
     pub fn save(&self, hub_dir: &Path) -> Result<(), Error> {
+        self.save_to(&Self::path(hub_dir))
+    }
+
+    /// [`Index::save`] to the file `p` (durable atomic replace).
+    pub fn save_to(&self, p: &Path) -> Result<(), Error> {
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -218,7 +235,7 @@ impl Index {
                 }
             }
         }
-        store::write_atomic(&Self::path(hub_dir), s.as_bytes())?;
+        store::write_atomic(p, s.as_bytes())?;
         Ok(())
     }
 }

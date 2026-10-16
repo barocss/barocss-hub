@@ -930,8 +930,9 @@ fn p5_blob_resume_transfers_only_the_rest() {
     let r2 = run_session(&t, None);
     r2.client.unwrap();
     // Only the bytes after the kept prefix travel again.
-    // (plus the few bytes of the small text blobs, 5 in total).
-    assert_eq!(r2.server_blob_bytes, 700_000 - kept + 5);
+    // (plus the 2 bytes of `a.txt`'s first content; its edit is a
+    // `TextEdit` since Issue #56, which carries its bytes in the op).
+    assert_eq!(r2.server_blob_bytes, 700_000 - kept + 2);
     assert_eq!(head(&t.join("a")), head(&reft.join("a")));
 }
 

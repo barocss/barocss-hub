@@ -110,8 +110,13 @@ fn all_bytes(d: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 }
 
 /// `.hub/` bytes without files every run rewrites by design.
+/// Everything under `.hub/` except `remote-text`, the Issue #56 cache of
+/// each remote's last seen Hello feature `text` (local, not repository
+/// data; an `upgrade-required` sync updates it on purpose).
 fn hub_bytes(d: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    all_bytes(&d.join(".hub"))
+    let mut m = all_bytes(&d.join(".hub"));
+    m.remove(&d.join(".hub/remote-text"));
+    m
 }
 
 fn header(d: &Path) -> String {
@@ -291,6 +296,10 @@ fn ssh_sync_converges_and_old_hello_gets_upgrade_required() {
         "old-hello server persisted something"
     );
     assert_eq!(hub_bytes(&a), a0, "client persisted something");
+    assert_eq!(
+        fs::read_to_string(a.join(".hub/remote-text")).unwrap(),
+        "no-text origin\n"
+    );
     assert_eq!(header(&srv), "barocss-hub/replica/v1");
     // A text-aware server takes it (and becomes v2).
     ok(&a, &["sync"], &env);

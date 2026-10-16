@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hub_core::projection::project;
 use hub_core::sync::{self as core, RejectReason};
-use hub_core::tree::{evaluate, Op, OpId, ReplicaId};
+use hub_core::tree::{evaluate_with, Op, OpId, ReplicaId};
 
 use crate::json::{self, J};
 use crate::store::{self, LockMode, RepoLock};
@@ -264,7 +264,8 @@ fn differing(repo: &Repo, r: &BTreeSet<OpId>) -> Result<Vec<(String, String)>, E
         .map(|o| o.id)
         .filter(|i| !deps.contains(i))
         .collect();
-    let state = evaluate(kept.iter().copied()).state;
+    // Issue #56: text heads derived with the seeds (never `NoBlobs`).
+    let state = evaluate_with(kept.iter().copied(), &repo.disk_blobs()).state;
     let proj = project(&state);
     let idx = wd::index_for(
         &Target {
