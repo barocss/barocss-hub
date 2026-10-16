@@ -28,6 +28,7 @@ version = "0.0.0"
 name = "barocss-hub-cli"
 version = "0.0.0"
 dependencies = [
+ "barocss-hub-cli",
  "barocss-hub-core",
  "blake3",
  "proptest",

@@ -1172,8 +1172,7 @@ pub fn serve_cmd(cwd: &Path, args: &[&str]) -> Result<(), Error> {
             return Err(e);
         }
     };
-    let wall = std::env::var("HUB_TEST_SESSION_MS")
-        .ok()
+    let wall = hook_var!("HUB_TEST_SESSION_MS")
         .and_then(|v| v.parse().ok())
         .map(std::time::Duration::from_millis)
         .unwrap_or(std::time::Duration::from_secs(3600));

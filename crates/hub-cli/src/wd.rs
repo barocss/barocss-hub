@@ -518,7 +518,7 @@ pub const FORCE_CI_ENV: &str = "HUB_TEST_FORCE_CASE_INSENSITIVE";
 
 /// Probe whether the filesystem holding `hub_dir` folds ASCII case.
 pub fn case_insensitive(hub_dir: &Path) -> io::Result<bool> {
-    if std::env::var_os(FORCE_CI_ENV).is_some() {
+    if hook_os!(FORCE_CI_ENV).is_some() {
         return Ok(true);
     }
     let lower = hub_dir.join(".case-probe");
@@ -1063,7 +1063,7 @@ pub fn apply(p: Plan, root: &Path, hub_dir: &Path) -> Result<Vec<String>, Error>
         )
         .as_bytes(),
     )?;
-    let stage = std::env::var(CRASH_ENV).ok();
+    let stage = hook_var!(CRASH_ENV);
     let crash = stage
         .as_deref()
         .is_some_and(|v| v != CRASH_AFTER_INDEX && v != CRASH_AFTER_PIN);

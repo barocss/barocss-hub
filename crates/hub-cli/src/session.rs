@@ -235,8 +235,7 @@ impl Side {
             read_only,
             stop: None,
             appended: Arc::new(AtomicUsize::new(0)),
-            max_blob: std::env::var("HUB_TEST_MAX_BLOB_SIZE")
-                .ok()
+            max_blob: hook_var!("HUB_TEST_MAX_BLOB_SIZE")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(wire::MAX_BLOB_SIZE),
             blob_bytes_in: 0,

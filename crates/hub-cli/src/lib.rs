@@ -3,6 +3,8 @@
 //! [`Repo`] owns storage and replay; [`run`] implements the commands so they
 //! can be tested without spawning a process. `main.rs` is a thin wrapper.
 
+#[macro_use]
+mod testhook;
 pub mod blobs;
 pub mod digest;
 pub mod durable;

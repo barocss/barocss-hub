@@ -162,7 +162,7 @@ thread_local! {
     /// Honored only in debug/test builds (#50 follow-up): a release build
     /// ignores `HUB_TEST_NO_REJECTION_DEDUP`.
     static DEDUP: std::cell::Cell<bool> = std::cell::Cell::new(
-        !cfg!(debug_assertions) || std::env::var_os("HUB_TEST_NO_REJECTION_DEDUP").is_none()
+        !cfg!(debug_assertions) || hook_os!("HUB_TEST_NO_REJECTION_DEDUP").is_none()
     );
 }
 

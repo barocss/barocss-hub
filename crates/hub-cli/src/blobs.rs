@@ -117,7 +117,7 @@ impl Blobs {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let mut f = File::create(&tmp)?;
-        if std::env::var_os(CRASH_ENV).is_some() {
+        if hook_os!(CRASH_ENV).is_some() {
             f.write_all(&bytes[..bytes.len() / 2])?;
             f.sync_all()?;
             std::process::abort();
@@ -159,7 +159,7 @@ impl Blobs {
     /// Write `bytes` to `id`'s final name and [`durable::flush`] it.
     fn write_final_flushed(&self, id: &BlobId, bytes: &[u8]) -> io::Result<File> {
         let mut f = File::create(self.path(id))?;
-        if std::env::var_os(CRASH_ENV).is_some() {
+        if hook_os!(CRASH_ENV).is_some() {
             f.write_all(&bytes[..bytes.len() / 2])?;
             f.sync_all()?;
             std::process::abort();
@@ -263,7 +263,7 @@ pub struct BlobBatch<'a> {
 pub const BARRIER_LOG_ENV: &str = "HUB_TEST_BLOB_BARRIER_LOG";
 
 fn log_barrier(dir: &Path, n: usize) -> io::Result<()> {
-    if let Some(p) = std::env::var_os(BARRIER_LOG_ENV) {
+    if let Some(p) = hook_os!(BARRIER_LOG_ENV) {
         let mut f = fs::OpenOptions::new().create(true).append(true).open(p)?;
         writeln!(f, "blob-barrier {} {n}", dir.display())?;
     }

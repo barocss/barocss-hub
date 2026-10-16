@@ -858,7 +858,7 @@ fn auto_checkout(
     json: bool,
 ) -> Result<J, Error> {
     #[cfg(debug_assertions)]
-    if let Some(p) = std::env::var_os("HUB_TEST_RESCUE_EDIT_AFTER_SYNC") {
+    if let Some(p) = hook_os!("HUB_TEST_RESCUE_EDIT_AFTER_SYNC") {
         fs::write(hub.parent().unwrap().join(p), b"edited after the rescue\n")?;
     }
     let mut repo = Repo::open_dir_with(hub.to_path_buf(), LockMode::Exclusive)?;
